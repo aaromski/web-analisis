@@ -1,0 +1,207 @@
+# Parley Lab · Bitácora de progreso
+
+Proyecto: web app de análisis pre-partido y proyección de parleys.
+Última actualización: 2026-10-29.
+Alcance autorizado: solo `web-analisis`; la carpeta `../api` se consume por HTTP y permanece intacta (solo lectura).
+
+## 1. Requerimiento y criterios de aceptación
+
+- Consumir exclusivamente la Aggregator API de `../api` (`/api/v1/matches/{match_id}/stats` y búsqueda por equipos).
+- Nueve mercados objetivo: 1X2, doble oportunidad, altas/bajas, hándicap asiático/europeo, primer gol, impar/par, HT/FT, marcador exacto y BTTS; córners como mercado extendido.
+- Líneas dinámicas por umbral de confianza: partir de una línea base y publicar la línea más ambiciosa que mantenga el umbral.
+- Motores híbridos: Poisson bivariado con corrección Dixon-Coles y blend de xG, goles, forma y predicción externa.
+- UI minimalista de dos vistas (buscador y panel) con línea óptima, probabilidad, confianza y riesgo.
+- Botón «Análisis IA» con Gemini, clave solo en servidor, estados de carga/error y markdown saneado.
+- Sin commits, despliegues ni cambios en otras carpetas. `GEMINI_API_KEY` nunca se expone ni se registra.
+
+## 2. Fases, responsables y estado
+
+| Fase | Responsable | Entregable | Estado | Validación |
+| --- | --- | --- | --- | --- |
+| 1. Descubrimiento y arquitectura | PM/Orquestador + Arquitecto de datos | Contrato de la API, `docs/MOTOR_LINEAS.md` | Completada | Contrato v1.2.0 revisado; endpoints probados con `curl` |
+| 1b. UX/UI | Diseñador de prototipos | `docs/PROTOTIPO_UX.md` | Completada | 14 criterios de aceptación documentados; revisados contra el motor |
+| 2. Motor y backend | Backend/DB + PM | `src/lib/engine/*`, rutas `/api/analyze`, `/api/ai`, `/api/health` | Completada | 20 tests unitarios; `tsc` limpio; `next build` correcto |
+| 3. Frontend | Frontend + PM | `src/app`, `src/components`, tokens CSS | Completada | Recorridos en navegador real; revisión visual 1440/1024/390 px |
+| 4. QA | QA/PO + PM | Matriz de escenarios y correcciones | Completada | Ver §5 |
+| 5. Auditoría | Auditor de código | Veredicto final | Completada | APROBADO CON OBSERVACIONES; ver §8 |
+| 6. Cierre | PM | README y esta bitácora | Completada | Pendiente de auditoría final |
+
+## 3. Decisiones técnicas
+
+1. **Motor puro y determinista.** `src/lib/engine` no depende de React ni de red: recibe el JSON canónico y devuelve `AnalysisResult`. La UI solo formatea; nunca recalcula probabilidades ni cuotas.
+2. **Calibración.** `threshold = clamp(0.74 + 0.08·(1−calidad) + 0.02·desacuerdo, 0.68, 0.86)`. Se publica la línea Over más alta (y Under más baja) que supera el umbral; en hándicap, la línea negativa más exigente que lo cumple. Si ninguna lo alcanza, se marca `calibrated: false` y se muestra «Sin línea sobre umbral».
+3. **Línea base vs. línea publicada.** La base (`nearestHalfLine(λ total)`) y la línea de mercado se muestran en el detalle para transparentar el trade-off; el ejemplo del brief (Over 3.5 → Over 1.5 al 84,9 %) queda visible en el partido de prueba.
+4. **Partidos no proyectables.** `finished` y `live` se rechazan con `MATCH_NOT_PROJECTABLE` (HTTP 422) y detalles de marcador/equipos/fecha. Calibrar después del pitido produce datos engañosos.
+5. **Combinada con correlación exacta.** La probabilidad conjunta se suma sobre la matriz de marcadores (no se multiplican probabilidades). Máximo 3 selecciones, mercados distintos, p entre 0,66 y 0,93 y conjunta ≥ 0,45.
+6. **Gemini.** Endpoint `v1` (el `v1beta` colgaba con modelos 3.x), modelo por defecto `gemini-3.6-flash` (≈25 s por informe) con respaldo automático `gemini-3.5-flash-lite` si el modelo no existe o está saturado. La clave se lee de `.env.local` en el servidor y se envía en `x-goog-api-key`.
+7. **Liga como slug.** La API exige `^[a-z0-9._-]+$` (`ita.1`, `eng.1`), así que el formulario pide el slug, no el nombre visible. Se acepta fecha `dd/mm/aaaa` y se convierte a ISO antes de consultar.
+8. **Estados de la UI desde la URL.** La URL es la fuente de verdad (`/?id=…` o `/?home=…&away=…`). Recargar reproduce el análisis; «Nueva búsqueda» limpia la consulta.
+9. **Caché y límites en memoria.** Análisis con TTL de 3 min y 60 entradas; IA limitada a 6 peticiones por IP cada 5 min. Suficiente para uso local; no apto para multi-instancia sin un almacén compartido.
+
+## 4. Entregables
+
+- `docs/MOTOR_LINEAS.md`: contrato del motor (λ, matriz, calibración, mercados, confianza).
+- `docs/PROTOTIPO_UX.md`: arquitectura de información, flujos, wireframes, tokens, textos y criterios.
+- `src/lib/engine/`: `poisson`, `markets`, `calibration`, `odds`, `quality`, `lambdas`, `context`, `parlay`, `analyze`.
+- `src/lib/server/`: cliente de la API, servicio con caché, Gemini, validación, errores y respuestas HTTP.
+- `src/app/api/{analyze,ai,health}`: rutas Node.js con `no-store`.
+- `src/app/`: layout, página y estilos globales con los tokens del prototipo.
+- `src/components/`: buscador, cabecera, resumen, tarjetas de mercado con curva, combinada, contexto, panel IA, errores y esqueletos.
+- `tests/`: 20 pruebas del motor con fixtures reales y sintéticos.
+
+## 5. QA ejecutado
+
+**Automatizado**
+
+- `npm run typecheck` → sin errores.
+- `npm test` → 20/20 en 1,5 s (matriz, calibración, combinada, HT/FT, partidos finalizados, respuesta vacía).
+- `npm run build` → compilación de producción correcta; `/` estática de 57,9 kB y rutas API dinámicas.
+
+**API y motor en vivo (Serie A, Milan vs Inter, `espn:401874795`)**
+
+- `GET /api/health` → API alcanzable, contrato 1.2.0 y Gemini configurado.
+- `POST /api/analyze` → 10 mercados, λ 1,51/1,77, umbral 76,2 %, Over 1.5 al 84,9 %, hándicap Inter +1.25 al 80,3 %, combinada Over 1.5 + 12 al 64,8 %.
+- `POST /api/ai` → 200; informe en español de ~4.100 caracteres, 5 secciones, sin LaTeX residual.
+
+**Navegador (Chrome headless + CDP)**
+
+- Validación del buscador vacío: dos errores, foco en el primer campo inválido y URL intacta.
+- Envío válido: URL actualizada antes de la respuesta, esqueleto de carga y dashboard completo.
+- Tarjeta expandida: `aria-expanded`, curva con umbral y punto elegido, tabla conmutable de 7 líneas.
+- IA: inactiva → cargando → éxito con markdown (5 `h2`) y pie con modelo y latencia.
+- Partido finalizado (`espn:401874965`): estado «Este partido ya finalizó», marcador 0–0, foco en el titular.
+- Partido inexistente: estado «No encontramos ese partido» y acceso directo a «Buscar por ID».
+- Datos insuficientes (stub local con estadísticas vacías): banda ámbar «Análisis limitado», calidad Baja 6, 9 mercados sin córners.
+- Sin desbordamiento horizontal a 390 px (`scrollWidth = 390`); 1024 y 1440 px revisados visualmente.
+
+## 6. Correcciones relevantes
+
+- TS2367 al comparar el estado del partido: se normaliza con `normalizeStatus` antes de tipar la salida.
+- `gemini-2.5-flash` retirado para cuentas nuevas: se migró a `v1` + `gemini-3.6-flash` con respaldo y reintento ante 404/503.
+- El atributo `hidden` no ocultaba el detalle de las tarjetas por conflicto de especificidad CSS; se añadió `.market-detail[hidden]`.
+- LaTeX (`$\lambda$`) en el informe: se prohíbe en el prompt y se normaliza en el servidor.
+- En móvil, el equipo visitante quedaba alineado a la derecha por `row-reverse`; se corrigió a flujo normal y se redujo la cifra 1X2 para evitar cortes.
+- El gráfico de calibración solapaba etiquetas; se movió el umbral a la izquierda y la etiqueta elegida bajo el punto.
+- La tarjeta expandida duplicaba minigráfico y gráfico completo; el minigráfico se oculta al expandir.
+
+## 7. Limitaciones conocidas
+
+- No hay listado ni autocompletado de partidos: se resuelve por equipos + fecha/liga o por ID. La búsqueda por equipos sin fecha/liga puede devolver 404 según la API.
+- Las cuatro etapas de carga son una lista indicativa: el backend responde en una sola petición y no expone progreso parcial.
+- El informe IA tarda 15–40 s y depende de la cuota de Gemini.
+- Caché y rate limit viven en memoria del proceso.
+- No se ha desplegado ni se han creado commits; queda a la espera de autorización.
+
+## 8. Auditoría
+
+**Fecha:** 2026-10-29. **Auditor:** Líder Técnico y Auditor de Calidad. **Alcance:** revisión independiente de `web-analisis` (motor, API interna, UI, contratos, configuración y documentación); `../api` solo se leyó por HTTP. **Veredicto:** APROBADO CON OBSERVACIONES (sin hallazgos bloqueantes ni altos).
+
+### 8.1 Comprobaciones ejecutadas
+
+- `npm run typecheck` sin errores; `npm test` 20/20; `npm run build` correcto (rutas API dinámicas, `/` estática).
+- En vivo contra la API 1.2.0 local: `POST /api/analyze` 200 con `espn:401874795` (10 mercados, combinada de 2 patas); partido finalizado `espn:401874965` → 422 `MATCH_NOT_PROJECTABLE` con marcador/equipos; cuerpo `{}` → 400; ID con `../` → 400; `GET /api/health` 200.
+- Secretos: `GEMINI_API_KEY` solo se lee en `src/lib/server/gemini.ts`; no hay variables `NEXT_PUBLIC_`; búsqueda del patrón de clave y de `GEMINI_API_KEY` en `.next/static` sin coincidencias. No se abrió `.env.local` ni se mostró su contenido.
+- Contrato: rutas, estados (`scheduled/finished/live/unknown`), códigos 404/400 y campos opcionales alineados con `../api/docs/CONTRATO_API.md` y `../api/src/routes/stats.ts`.
+- XSS/markdown: `react-markdown` sin `rehype-raw`; HTML crudo no se renderiza y las URLs pasan por el saneado por defecto. No se invocó `/api/ai` para no consumir cuota de Gemini.
+- SQL: el proyecto no contiene scripts SQL ni `supabase_schema.sql`; no aplica validación con parser.
+
+### 8.2 Hallazgos medios
+
+1. **Carrera del informe IA.** `src/components/ParleyApp.tsx:225-252` no cancela ni identifica la petición; el reset de `:147-152` no impide que una respuesta tardía llame a `setAiReport` cuando el usuario ya cambió de partido. Impacto: se muestra el informe de otro partido bajo la cabecera nueva. Corrección: `AbortController` + token de `searchKey`/`envelope` antes de aplicar el resultado (o mover el estado IA al `Dashboard`).
+2. **Etiqueta «Calibrada» en mercados no calibrados.** `src/lib/engine/analyze.ts:125` hace `calibrated: true` por defecto y los mercados discretos fijan `threshold: 0.5` (`:236`, `:295`, `:418`, `:445`, `:476`, `:499`, `:532`); `src/components/MarketCard.tsx:253-260` muestra «Umbral 50 %» y «Calibrada» en 1X2, BTTS, HT/FT, etc. Impacto: atribuye una calibración inexistente. Corrección: no publicar umbral ni estado de calibración cuando `curve` está vacío, o marcar `calibrated: false`.
+3. **Rate limit espoofeable y mapa sin purga.** `src/app/api/ai/route.ts:11-15,18` confía en la primera IP de `x-forwarded-for`, controlada por el cliente; `src/lib/server/cache.ts:43-62` nunca elimina entradas caducadas. Impacto: rotando el header se evita el límite 6/5 min y se pueden acumular claves hasta agotar memoria/cuota. Corrección: IP de proxy confiable o límite por sesión, purga periódica/cota del mapa y exigir `application/json`.
+4. **Patas anidadas en la combinada.** `src/lib/engine/parlay.ts:26-40` permite «Resultado local» y «1X» a la vez; la conjunta queda igual a la pata más estrecha y se presenta como 2–3 selecciones. Impacto: diversificación aparente y cuota conjunta engañosa. Corrección: descartar candidatos implicados/superconjunto de una pata ya elegida.
+
+### 8.3 Hallazgos bajos
+
+5. **Cuartos de hándicap.** `src/lib/engine/poisson.ts:125-152` promedia las coberturas de las dos semilíneas; no equivale a la probabilidad de cuota justa del cuarto (ej.: -0,25 con 34,9 % win y 30,3 % draw: 42,4 % vs 41,1 %). Desviación ~1 pp; documentar o calcular por EV.
+6. **Primer gol vs. matriz DC.** `src/lib/engine/markets.ts:48-59` calcula «Sin goles» con Poisson independiente: 3,76 % frente al 4,77 % de 0-0 de la matriz corregida en el derbi. Corrección: derivar el reparto de la matriz.
+7. **Exposición de infraestructura.** `src/app/api/health/route.ts:14` devuelve `baseUrl` y `src/lib/server/stats-client.ts:67` incluye la URL interna en el error; contradice `.env.example:1-3`. Además, health responde 200 con `ok:false`. Corrección: no publicar la URL, mensaje genérico y 503 si la dependencia no responde.
+8. **Sin cabeceras de seguridad.** `next.config.ts:3-6` no define CSP, `X-Content-Type-Options` ni `Referrer-Policy`. El markdown actual es seguro, pero falta defensa en profundidad.
+9. **Deriva documental.** `docs/MOTOR_LINEAS.md:58` dice 60/40 (código 65/35), `:149` calidad 0,65 (código 0,6) y `:159` conjunta 0,38 (código 0,45); `.env.example` omite `GEMINI_API_BASE_URL`; los textos UX «Saltar al contenido» y «Cambiar búsqueda» difieren de `docs/PROTOTIPO_UX.md`.
+10. **Verificación incompleta.** `tests/` solo cubre el motor; no hay pruebas de `parseMatchInput`, `errorResponse`, rate limit ni render de markdown; no hay ESLint configurado. `npm audit`: 1 alta + 1 moderada (postcss transitivo de Next), de build y no explotable con CSS de usuario; el arreglo exige Next 16.
+
+### 8.4 Pendientes de seguimiento
+
+- Corregir 8.2.1–8.2.4 y revalidar (cambio de partido durante la IA, etiquetas, límite con XFF falso, combinada resultado+DC).
+- Añadir pruebas de servidor/seguridad y ESLint; actualizar la documentación de 8.3.9.
+- No se validó el respaldo `gemini-3.5-flash-lite` ni la cuota real de Gemini para no consumirla; no hay parser SQL local. Ambas comprobaciones quedan pendientes, no bloquean.
+- Nota operativa: el build de producción se ejecutó en el proyecto y el servidor de desarrollo local (3100) se reinició después; no hubo cambios de código, commits ni despliegues, y `../api` no se modificó.
+
+## 9. Correcciones tras la auditoría (2026-10-29)
+
+**Responsable:** Project Manager & Orquestador. Se corrigieron los cuatro hallazgos medios y los bajos de exposición, cabeceras, deriva documental y pruebas.
+
+### 9.1 Hallazgos medios
+
+1. **Carrera del informe IA.** `src/components/ParleyApp.tsx`: `generateAi` crea un `AbortController` por petición, aborta la anterior y compara el `searchKey` capturado con el actual antes de aplicar `setAiReport`. Al cambiar de partido, un efecto cancela el informe en vuelo. Verificado en código y con typecheck.
+2. **Etiquetas de calibración.** `src/components/MarketCard.tsx`: los chips «Umbral», «Base», «Calibrada/No calibrada» y el aviso «Sin línea sobre umbral» solo se muestran cuando el mercado tiene `curve`. Los mercados discretos indican «Selección del modelo» y «Sin línea dinámica». Verificado en navegador: 1X2 y Doble oportunidad ya no muestran umbral; Altas/Bajas y Hándicap conservan «Umbral 76 % · Calibrada».
+3. **Rate limit y caché.** `src/app/api/ai/route.ts`: se añadió un tope global de 30 solicitudes/5 min además del límite por IP (6/5 min) para que un `x-forwarded-for` falsificado no agote la cuota; se documenta que el límite por IP es best-effort. `src/lib/server/cache.ts`: la caché purga entradas caducadas antes de evictar y el mapa de rate limit se poda al superar 512 claves. Ambas rutas POST exigen `Content-Type: application/json` (415 en caso contrario) mediante `requireJson`.
+4. **Patas anidadas.** `src/lib/engine/parlay.ts`: `nestedLeg` compara la probabilidad conjunta con cada pata y descarta selecciones implicadas o superconjuntos (p. ej. «Resultado local» + «1X»). Prueba unitaria añadida.
+
+### 9.2 Hallazgos bajos atendidos
+
+- `src/lib/engine/markets.ts`: «Sin goles» usa la celda 0-0 de la matriz Dixon-Coles; en el derbi pasa de 3,76 % a 4,77 %, coherente con «Marcador exacto».
+- `GET /api/health` ya no publica `baseUrl`, devuelve 503 cuando la API no responde y el error de conexión es genérico; `stats-client` tampoco incluye la URL interna.
+- `next.config.ts`: CSP, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `X-Frame-Options` y `Permissions-Policy`. En desarrollo la CSP permite `unsafe-eval` para HMR.
+- `docs/MOTOR_LINEAS.md`: corregidos 65/35, calidad 0,6, conjunta 0,45, rango real del hándicap (-3,0…+2,0) y nota de patas anidadas. `.env.example` documenta `GEMINI_API_BASE_URL`.
+- Pruebas nuevas: `tests/server/cache.test.ts` (purga TTL, cota y rate limit), `validation.test.ts`, `http.test.ts` (415), `markdown.test.ts` (cercas/LaTeX) y casos de combinada anidada y coherencia del primer gol. Total 30 pruebas.
+
+### 9.3 Verificación tras las correcciones
+
+- `npm run typecheck` sin errores; `npm test` 30/30; `npm run build` correcto con CSP activa.
+- Producción en 3100 contra la API real: `/api/health` 200 sin `baseUrl`; `Content-Type: text/plain` en `/api/analyze` → 415; análisis `espn:401874795` con 10 mercados, combinada `Over 1.5 + 12` al 64,8 % y primer gol «sin goles» 4,77 %.
+- Instancia temporal en 3101 con `STATS_API_BASE_URL` inalcanzable: `/api/health` 503 con mensaje genérico y `/api/analyze` 503.
+- Informe IA real con `gemini-3.6-flash`: 4.041 caracteres, 5 secciones `h2`, 17,6 s, sin LaTeX ni dólares.
+- Navegador (producción, CSP activa): página hidratada, sin errores de consola, 10 mercados y combinada visibles; mercados discretos sin etiqueta de calibración.
+- No se modificó `../api`; no hubo commits ni despliegues.
+
+### 9.4 Pendiente
+
+- ESLint no está configurado (el proyecto no lo incluía) y `npm audit` mantiene 1 aviso alto y 1 moderado transitivos de Next/postcss, no explotables con CSS propio y resueltos solo con Next 16. No se añadieron dependencias para no ampliar el alcance.
+- Queda solicitar el veredicto final del Auditor sobre estas correcciones.
+
+## 10. Re-auditoría
+
+**Fecha:** 2026-10-29. **Auditor:** Líder Técnico y Auditor de Calidad. **Alcance:** verificación independiente de las correcciones de §9 (carrera del informe IA, etiquetas de calibración, rate limit/caché/content-type, patas anidadas y hallazgos bajos), sin modificar código de producto; `../api` solo por HTTP de lectura. **Veredicto:** APROBADO CON OBSERVACIONES. No hay hallazgos críticos ni altos; los 4 medios de §8.2 se consideran cerrados y quedan 4 observaciones bajas no bloqueantes.
+
+### 10.1 Correcciones verificadas
+
+1. **Carrera del informe IA (`src/components/ParleyApp.tsx:237-274`).** `generateAi` aborta el controlador previo, crea uno por petición y descarta el resultado si `controller.signal.aborted` o si `searchKeyRef.current !== key` (`:255`, `:267-268`); el efecto `:140-146` aborta al cambiar `searchKey` y el efecto `:148-203` limpia `aiState`/`aiReport`. Trazado manual: no queda ruta en la que una respuesta tardía aplique un informe bajo otra cabecera; el caso residual (respuesta resuelta entre commit y efectos pasivos) lo limpia el reset de `:162-164`.
+2. **Etiquetas engañosas (`src/components/MarketCard.tsx:62,67-73,107-111,150-159,253-263`).** Chips de umbral, base, calibrada y aviso de línea solo con `curve.length > 0`; los mercados discretos muestran «Selección del modelo» / «Sin línea dinámica». Confirmado en la respuesta real: `double_chance` llega con `curve: 0` y ya no publica umbral.
+3. **Rate limit y caché (`src/app/api/ai/route.ts:11-21,42-50`, `src/lib/server/cache.ts:19-47,60-87`).** Tope global de 30/5 min antes del de IP (6/5 min) y purga TTL antes de evacuar; comentario de XFF correcto.
+4. **Content-type (`src/lib/server/http.ts:29-37` en `src/app/api/analyze/route.ts:10-11` y `/api/ai`).** Verificado en producción: `text/plain` → 415 `UNSUPPORTED_MEDIA_TYPE` en ambas rutas; JSON inválido → 400.
+5. **Patas anidadas (`src/lib/engine/parlay.ts:16,23-28,46`).** `nestedLeg` compara la conjunta con cada pata y descarta implicadas/superconjuntos; prueba `tests/engine/parlay.test.ts:67` pasa.
+6. **«Sin goles» (`src/lib/engine/markets.ts:50-62`, llamada en `src/lib/engine/analyze.ts:402-406`).** La respuesta real devuelve 4,77 %, idéntico al 0-0 de la matriz.
+7. **Health y errores (`src/app/api/health/route.ts:10-29`, `src/lib/server/stats-client.ts:64-68,126-135`).** Con `STATS_API_BASE_URL` inalcanzable (instancia temporal en 3102): `/api/health` → 503 sin `baseUrl`, `/api/analyze` → 503 con mensaje genérico.
+8. **Cabeceras (`next.config.ts:5-35`).** En producción se sirven CSP sin `unsafe-eval`, `nosniff`, `Referrer-Policy`, `X-Frame-Options: DENY`, `Permissions-Policy`; sin `X-Powered-By`. No hay egress externo permitido por `connect-src 'self'`.
+9. **Documentación y pruebas.** `docs/MOTOR_LINEAS.md:58,151,159,163` corregidos (65/35, calidad 0,6, conjunta 0,45, nota de anidamiento) y rango de hándicap `-3.0 … +2.0` en `:115`; `.env.example` incluye `GEMINI_API_BASE_URL`, que `src/lib/server/gemini.ts:52` consume. Las 30 pruebas de `tests/` (10 de motor + 4 archivos de servidor) pasan.
+
+### 10.2 Comprobaciones ejecutadas
+
+- `npm run typecheck` → sin errores. `npm test` → 30/30 en 2,4 s. `npm run build` → correcto con el servidor de 3100 activo (sin necesidad de detenerlo): `/` estática 58 kB y `/api/{ai,analyze,health}` dinámicas.
+- Producción en 3100 contra la API real (3000 intacta y sin parar): `GET /api/health` 200 `ok:true`, contrato 1.2.0; `POST /api/analyze` 200 con 10 mercados, primer gol «sin goles» 4,77 %, combinada de 2 patas; partido finalizado → 422 `MATCH_NOT_PROJECTABLE`; ID `../health` → 400; `{}` → 400; `text/plain` → 415 en `/api/analyze` y `/api/ai`.
+- Instancia temporal propia en 3102 con upstream inalcanzable para probar el 503; detenida al terminar. 3000 y 3100 siguen escuchando; no se reinició ni modificó `../api`.
+- Secretos: sin `NEXT_PUBLIC_*`; búsqueda de `AIza…`, `GEMINI_API_KEY` y `generativelanguage` en `.next/static` y `.next/server` sin coincidencias; no se abrió `.env.local`.
+- SQL: el proyecto no contiene `*.sql` ni `supabase_schema.sql`; no aplica parser.
+- `npm audit` → 1 alto (postcss, transitivo) + 1 moderado (next, directo), coherente con §9.4.
+
+### 10.3 Observaciones residuales (bajas, no bloqueantes)
+
+1. `src/app/api/ai/route.ts:46-50`: el contador global se incrementa antes del límite por IP, así que un cliente ya bloqueado sigue consumiendo cupo global (30/5 min) y puede dejar sin IA a otros durante la ventana. Corrección: comprobar el límite por IP primero o incrementar el global solo si la petición va a ejecutarse.
+2. `src/lib/engine/analyze.ts:125` mantiene `calibrated: true` (y `threshold: 0.5`) en mercados discretos, y `src/lib/prompt.ts:50` lo envía como `calibrada` al modelo sin `umbral_pct`; la UI ya no lo muestra, pero el informe IA podría afirmar una calibración inexistente. Corrección sugerida: `calibrated: curve.length > 0 ? draft.calibrated : false`, ajustando el estilo de `.prob-value` si se quiere conservar el color.
+3. `next.config.ts:8-9`: CSP con `'unsafe-inline'` en `script-src` y `style-src` (necesario sin nonce/middleware); defensa en profundidad limitada. Asumible con markdown saneado.
+4. `README.md:45` sigue citando «20 pruebas» (son 30); ESLint sigue sin configurar y persiste el aviso de `npm audit` que exige Next 16.
+
+Nota externa (fuera de alcance, solo lectura): `GET http://localhost:3000/health` de `../api` publica `findings_document` con una ruta absoluta local; corresponde al equipo de la API, no a esta app.
+
+## 11. Cierre de observaciones residuales (2026-10-29)
+
+**Responsable:** Project Manager & Orquestador. Se atendieron las observaciones 1, 2 y 4 de §10.3; la 3 se acepta como decisión documentada.
+
+1. **Cupo global.** `src/app/api/ai/route.ts`: el límite por cliente (6/5 min) se evalúa antes del global (30/5 min); una petición que ya va a rechazarse no consume cupo compartido.
+2. **`calibrated` en mercados discretos.** `src/lib/engine/analyze.ts` usa `calibrated: draft.calibrated ?? false`; los mercados sin curva viajan como `calibrada: false` y sin `umbral_pct` en el digest de Gemini. `src/components/MarketCard.tsx` solo emite `data-calibrated` cuando hay curva, así que las cifras discretas conservan el color lima. Pruebas: `totals.calibrated === true`, `exact_score.calibrated === false`.
+3. **CSP con `'unsafe-inline'`.** Se mantiene: sin nonce/middleware no hay alternativa práctica en Next; el markdown se renderiza sin HTML crudo y el resto de directivas restringe origen, objetos y frames.
+4. **Documentación.** `README.md` indica 30 pruebas. ESLint y los avisos de `npm audit` siguen documentados como deuda de tooling/dependencias.
+
+**Verificación:** `npm run typecheck` limpio, `npm test` 30/30, `npm run build` correcto. En producción (3100): payload real con `calibrated:false` y `curve:0` en los siete mercados discretos, `true` en totales/hándicap/córners; navegador sin errores de consola y cifras discretas en lima. `../api` intacta; sin commits ni despliegues.

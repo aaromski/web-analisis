@@ -1,0 +1,30 @@
+{
+  "name": "parley-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Laboratorio de líneas y proyecciones para parleys de fútbol sobre la Aggregator API.",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "dev": "next dev -p 3100",
+    "build": "next build",
+    "start": "next start -p 3100",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"tests/**/*.test.ts\""
+  },
+  "dependencies": {
+    "next": "15.5.28",
+    "react": "19.1.10",
+    "react-dom": "19.1.10",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "@types/react": "19.1.17",
+    "@types/react-dom": "19.1.11",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  }
+}
