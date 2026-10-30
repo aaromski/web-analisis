@@ -1,12 +1,14 @@
 import type { AggregatedResponse, PreMatchPayload, PreMatchTeam, TeamPayload } from '../types/api';
 import type { TeamModel } from '../types/analysis';
+import { leagueBaseline, type LeagueBaseline } from './league';
 import { clamp, round } from './poisson';
 import { statNumber, teamSample } from './quality';
 
-const PRIOR_HOME = 1.45;
-const PRIOR_AWAY = 1.25;
-const PRIOR_ATTACK = 1.35;
-const PRIOR_DEFENSE = 1.35;
+/**
+ * Peso con el que cada fuerza se acerca a 1 (media de liga). Se aplica en
+ * espacio multiplicativo para no comprimir la supremacía entre equipos.
+ */
+const STRENGTH_SHRINK = 0.15;
 
 interface BlendValue {
   value: number;
@@ -15,22 +17,22 @@ interface BlendValue {
   fallback: boolean;
 }
 
-function blendAttack(team: TeamPayload | undefined): BlendValue {
+function blendAttack(team: TeamPayload | undefined, fallback: number): BlendValue {
   const xg = statNumber(team, 'xg');
   const goals = statNumber(team, 'goals_scored');
   if (xg !== null && goals !== null) return { value: 0.62 * xg + 0.38 * goals, usedXg: true, usedGoals: true, fallback: false };
   if (xg !== null) return { value: xg, usedXg: true, usedGoals: false, fallback: false };
   if (goals !== null) return { value: goals, usedXg: false, usedGoals: true, fallback: false };
-  return { value: PRIOR_ATTACK, usedXg: false, usedGoals: false, fallback: true };
+  return { value: fallback, usedXg: false, usedGoals: false, fallback: true };
 }
 
-function blendDefense(team: TeamPayload | undefined): BlendValue {
+function blendDefense(team: TeamPayload | undefined, fallback: number): BlendValue {
   const xga = statNumber(team, 'xga');
   const conceded = statNumber(team, 'goals_conceded');
   if (xga !== null && conceded !== null) return { value: 0.62 * xga + 0.38 * conceded, usedXg: true, usedGoals: true, fallback: false };
   if (xga !== null) return { value: xga, usedXg: true, usedGoals: false, fallback: false };
   if (conceded !== null) return { value: conceded, usedXg: false, usedGoals: true, fallback: false };
-  return { value: PRIOR_DEFENSE, usedXg: false, usedGoals: false, fallback: true };
+  return { value: fallback, usedXg: false, usedGoals: false, fallback: true };
 }
 
 interface FormNumbers {
@@ -99,12 +101,37 @@ function fromRecent(team: PreMatchTeam | undefined, side: 'home' | 'away'): Form
   return empty;
 }
 
+function shrinkStrength(value: number, weight: number): number {
+  const w = clamp(weight, 0, 0.5);
+  return (1 - w) * value + w;
+}
+
+function scaleToTotal(lambdaHome: number, lambdaAway: number, caveats: string[]): { home: number; away: number } {
+  let home = lambdaHome;
+  let away = lambdaAway;
+  const total = home + away;
+  if (total > 7) {
+    const factor = 7 / total;
+    home *= factor;
+    away *= factor;
+    caveats.push('El total proyectado se limitó a 7 goles.');
+  } else if (total < 0.8) {
+    const factor = 0.8 / total;
+    home *= factor;
+    away *= factor;
+    caveats.push('El total proyectado se elevó al mínimo de 0.8 goles.');
+  }
+  return { home, away };
+}
+
 export interface LambdaModel {
   home: TeamModel;
   away: TeamModel;
   lambdaHome: number;
   lambdaAway: number;
   lambdaTotal: number;
+  leagueId: string | null;
+  leagueTotal: number;
   sources: string[];
   caveats: string[];
   predictionBlended: boolean;
@@ -115,25 +142,31 @@ export function buildLambdas(response: AggregatedResponse): LambdaModel {
   const homeTeam = response.teams.home;
   const awayTeam = response.teams.away;
   const pre: PreMatchPayload | null | undefined = response.pre_match;
+  const league: LeagueBaseline = leagueBaseline(response.match?.league?.id);
+  const perTeam = Math.max(0.2, league.perTeam);
 
-  const attackHome = blendAttack(homeTeam);
-  const defenseHome = blendDefense(homeTeam);
-  const attackAway = blendAttack(awayTeam);
-  const defenseAway = blendDefense(awayTeam);
+  const attackHome = blendAttack(homeTeam, perTeam);
+  const defenseHome = blendDefense(homeTeam, perTeam);
+  const attackAway = blendAttack(awayTeam, perTeam);
+  const defenseAway = blendDefense(awayTeam, perTeam);
 
-  let lambdaHome = (attackHome.value + defenseAway.value) / 2;
-  let lambdaAway = (attackAway.value + defenseHome.value) / 2;
+  const homeSample = teamSample(homeTeam);
+  const awaySample = teamSample(awayTeam);
+  const extraHome = homeSample !== null && homeSample < 5 ? 0.2 * (1 - clamp(homeSample / 5, 0, 1)) : 0;
+  const extraAway = awaySample !== null && awaySample < 5 ? 0.2 * (1 - clamp(awaySample / 5, 0, 1)) : 0;
 
-  // Mezcla con la media de liga para estabilizar muestras cortas.
-  lambdaHome = 0.82 * lambdaHome + 0.18 * PRIOR_HOME;
-  lambdaAway = 0.82 * lambdaAway + 0.18 * PRIOR_AWAY;
+  // Fuerzas relativas a la media de la liga. Multiplicar evita que un ataque
+  // fuerte contra una defensa débil se diluya en un promedio aritmético.
+  const attackStrengthHome = shrinkStrength(attackHome.value / perTeam, STRENGTH_SHRINK + extraHome);
+  const defenseStrengthHome = shrinkStrength(defenseHome.value / perTeam, STRENGTH_SHRINK + extraHome);
+  const attackStrengthAway = shrinkStrength(attackAway.value / perTeam, STRENGTH_SHRINK + extraAway);
+  const defenseStrengthAway = shrinkStrength(defenseAway.value / perTeam, STRENGTH_SHRINK + extraAway);
 
-  // Localía.
-  lambdaHome *= 1.06;
-  lambdaAway *= 0.96;
+  let lambdaHome = attackStrengthHome * defenseStrengthAway * league.home;
+  let lambdaAway = attackStrengthAway * defenseStrengthHome * league.away;
 
   const caveats: string[] = [];
-  const sources: string[] = [];
+  const sources: string[] = [`Media de liga ${league.total.toFixed(2)} goles/partido`];
 
   if (attackHome.usedXg || attackAway.usedXg || defenseHome.usedXg || defenseAway.usedXg) {
     sources.push('xG/xGA de temporada');
@@ -142,7 +175,7 @@ export function buildLambdas(response: AggregatedResponse): LambdaModel {
     sources.push('Goles de temporada');
   }
   if (attackHome.fallback || attackAway.fallback || defenseHome.fallback || defenseAway.fallback) {
-    sources.push('Media de liga');
+    sources.push('Media de liga como relleno');
   }
 
   for (const [team, attack, defense] of [
@@ -156,16 +189,14 @@ export function buildLambdas(response: AggregatedResponse): LambdaModel {
     else if (!defense.usedXg) caveats.push(`${name}: sin xGA; la defensa se estima con goles concedidos.`);
   }
 
-  // Ajuste por muestra corta.
-  const homeSample = teamSample(homeTeam);
-  const awaySample = teamSample(awayTeam);
-  if (homeSample !== null && homeSample < 5) {
-    const weight = 0.2 * (1 - clamp(homeSample / 5, 0, 1));
-    lambdaHome = lambdaHome * (1 - weight) + PRIOR_HOME * weight;
-  }
-  if (awaySample !== null && awaySample < 5) {
-    const weight = 0.2 * (1 - clamp(awaySample / 5, 0, 1));
-    lambdaAway = lambdaAway * (1 - weight) + PRIOR_AWAY * weight;
+  for (const [name, sample, extra] of [
+    [homeTeam.name, homeSample, extraHome],
+    [awayTeam.name, awaySample, extraAway],
+  ] as const) {
+    if (extra > 0) {
+      const weight = Math.round((STRENGTH_SHRINK + extra) * 100);
+      caveats.push(`${name}: muestra corta (${sample ?? 0} partidos); las fuerzas se acercan un ${weight} % a la media de liga.`);
+    }
   }
 
   // Forma reciente: ataque propio y defensa propia (que afecta al rival).
@@ -174,21 +205,21 @@ export function buildLambdas(response: AggregatedResponse): LambdaModel {
   let formApplied = false;
 
   if (homeForm.goalsFor !== null) {
-    const ratio = homeForm.goalsFor / Math.max(lambdaHome, 0.2);
+    const ratio = homeForm.goalsFor / perTeam;
     lambdaHome *= clamp(1 + 0.15 * (ratio - 1), 0.85, 1.15);
     formApplied = true;
   }
   if (awayForm.goalsFor !== null) {
-    const ratio = awayForm.goalsFor / Math.max(lambdaAway, 0.2);
+    const ratio = awayForm.goalsFor / perTeam;
     lambdaAway *= clamp(1 + 0.15 * (ratio - 1), 0.85, 1.15);
     formApplied = true;
   }
   if (homeForm.goalsAgainst !== null) {
-    lambdaAway *= clamp(1 + 0.1 * (homeForm.goalsAgainst / PRIOR_DEFENSE - 1), 0.9, 1.1);
+    lambdaAway *= clamp(1 + 0.1 * (homeForm.goalsAgainst / perTeam - 1), 0.9, 1.1);
     formApplied = true;
   }
   if (awayForm.goalsAgainst !== null) {
-    lambdaHome *= clamp(1 + 0.1 * (awayForm.goalsAgainst / PRIOR_DEFENSE - 1), 0.9, 1.1);
+    lambdaHome *= clamp(1 + 0.1 * (awayForm.goalsAgainst / perTeam - 1), 0.9, 1.1);
     formApplied = true;
   }
   if (formApplied) sources.push('Forma reciente');
@@ -219,21 +250,9 @@ export function buildLambdas(response: AggregatedResponse): LambdaModel {
     caveats.push('λ ajustada al límite operativo del motor.');
   }
 
-  const totalBefore = lambdaHome + lambdaAway;
-  if (totalBefore > 7) {
-    const factor = 7 / totalBefore;
-    lambdaHome *= factor;
-    lambdaAway *= factor;
-    caveats.push('El total proyectado se limitó a 7 goles.');
-  } else if (totalBefore < 0.8) {
-    const factor = 0.8 / totalBefore;
-    lambdaHome *= factor;
-    lambdaAway *= factor;
-    caveats.push('El total proyectado se elevó al mínimo de 0.8 goles.');
-  }
-
-  lambdaHome = round(lambdaHome, 2);
-  lambdaAway = round(lambdaAway, 2);
+  const scaled = scaleToTotal(lambdaHome, lambdaAway, caveats);
+  lambdaHome = round(scaled.home, 2);
+  lambdaAway = round(scaled.away, 2);
 
   const homeModel: TeamModel = {
     name: homeTeam.name,
@@ -287,6 +306,8 @@ export function buildLambdas(response: AggregatedResponse): LambdaModel {
     lambdaHome,
     lambdaAway,
     lambdaTotal: round(lambdaHome + lambdaAway, 2),
+    leagueId: league.id,
+    leagueTotal: league.total,
     sources,
     caveats,
     predictionBlended,

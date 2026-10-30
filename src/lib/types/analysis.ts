@@ -70,6 +70,8 @@ export interface MarketResult {
   calibrated: boolean;
   available: boolean;
   marketProbability: number | null;
+  /** Probabilidad del modelo evaluada en la línea de mercado (misma apuesta). */
+  marketModelProbability: number | null;
   edge: number | null;
   curve: CalibrationPoint[];
   alternatives: MarketOption[];
@@ -166,16 +168,35 @@ export interface MatchContext {
   insights: string[];
 }
 
+export interface MarketAnchorMeta {
+  applied: boolean;
+  /** Peso del mercado en λ (0–1). */
+  weight: number;
+  source: 'moneyline+totals' | 'moneyline' | 'totals' | 'none';
+  marketTotal: number | null;
+  marketHome: number | null;
+  marketAway: number | null;
+}
+
 export interface ModelMeta {
   version: string;
   generatedAt: string;
   rho: number;
   maxGoals: number;
-  /** Umbral de confianza aplicado a las líneas dinámicas. */
+  /** Umbral de confianza por defecto aplicado a las líneas dinámicas. */
   threshold: number;
+  thresholds: {
+    default: number;
+    totals: number;
+    handicap: number;
+    corners: number;
+  };
   /** Línea base de goles usada antes de calibrar. */
   baseTotalLine: number;
+  /** Media de goles por partido de la liga usada como escala. */
+  leagueBaseline: number;
   marketAgreement: number;
+  marketAnchor: MarketAnchorMeta;
   lambdaSources: string[];
 }
 

@@ -5,6 +5,7 @@ import type {
   MarketOption,
   MarketResult,
 } from '../types/analysis';
+import { anchorLambdas } from './anchor';
 import {
   confidenceThreshold,
   computeConfidence,
@@ -42,7 +43,7 @@ import {
 } from './poisson';
 import { assessQuality, statNumber } from './quality';
 
-export const MODEL_VERSION = '1.0.0';
+export const MODEL_VERSION = '1.1.0';
 export const RHO = -0.1;
 export const MAX_GOALS = 12;
 
@@ -70,6 +71,7 @@ interface MarketCore {
   baseLine?: number | null;
   marketLine?: number | null;
   marketProbability?: number | null;
+  marketModelProbability?: number | null;
   edge?: number | null;
   curve?: MarketResult['curve'];
   alternatives?: MarketOption[];
@@ -119,6 +121,12 @@ function finalizeMarket(
         : draft.marketProbability === null
           ? null
           : round(draft.marketProbability, 4),
+    marketModelProbability:
+      draft.marketModelProbability === undefined
+        ? null
+        : draft.marketModelProbability === null
+          ? null
+          : round(draft.marketModelProbability, 4),
     edge: draft.edge === undefined ? null : draft.edge === null ? null : round(draft.edge, 4),
     curve,
     alternatives,
@@ -173,18 +181,47 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
 
   const lambdas = buildLambdas(response);
   const quality = assessQuality(response);
-  const matrix = buildScoreMatrix(lambdas.lambdaHome, lambdas.lambdaAway, {
+  const winMarket = extractWinMarket(pre);
+  const oddsWin = winMarket?.source === 'odds' ? winMarket : null;
+  const totalsMarket = extractTotalsMarket(pre);
+  const spreadMarket = extractSpreadMarket(pre);
+
+  let matrix = buildScoreMatrix(lambdas.lambdaHome, lambdas.lambdaAway, {
     rho: RHO,
     maxGoals: MAX_GOALS,
   });
+  let win = resultOutcomes(matrix);
 
-  const win = resultOutcomes(matrix);
-  const winMarket = extractWinMarket(pre);
-  const oddsWin = winMarket?.source === 'odds' ? winMarket : null;
+  // Ancla al mercado: corrige la compresión de la supremacía y fija la escala
+  // de goles con la expectativa agregada de las cuotas.
   const agreement = modelAgreement(win, winMarket);
-  const totalsMarket = extractTotalsMarket(pre);
-  const spreadMarket = extractSpreadMarket(pre);
+  const anchor = anchorLambdas({
+    lambdaHome: lambdas.lambdaHome,
+    lambdaAway: lambdas.lambdaAway,
+    winMarket: oddsWin,
+    totalsMarket,
+    quality: quality.score,
+    agreement,
+  });
+  if (anchor.applied) {
+    lambdas.lambdaHome = anchor.lambdaHome;
+    lambdas.lambdaAway = anchor.lambdaAway;
+    lambdas.lambdaTotal = round(anchor.lambdaHome + anchor.lambdaAway, 2);
+    lambdas.home.lambda = anchor.lambdaHome;
+    lambdas.away.lambda = anchor.lambdaAway;
+    lambdas.sources.push('Ancla de mercado');
+    if (anchor.note) lambdas.caveats.push(anchor.note);
+    matrix = buildScoreMatrix(lambdas.lambdaHome, lambdas.lambdaAway, {
+      rho: RHO,
+      maxGoals: MAX_GOALS,
+    });
+    win = resultOutcomes(matrix);
+  }
+
   const threshold = confidenceThreshold(quality.score, lambdas.lambdaTotal, totalsMarket.line);
+  const totalsThreshold = confidenceThreshold(quality.score, lambdas.lambdaTotal, totalsMarket.line, 0.72);
+  const handicapThreshold = confidenceThreshold(quality.score, lambdas.lambdaTotal, totalsMarket.line, 0.66);
+  const cornersThreshold = confidenceThreshold(quality.score, lambdas.lambdaTotal, totalsMarket.line, 0.7);
 
   const markets: MarketResult[] = [];
   const parlayCandidates: ParlayCandidate[] = [];
@@ -316,7 +353,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
   const totalsCalibration = calibrateTotals(
     matrix,
     lambdas.lambdaTotal,
-    threshold,
+    totalsThreshold,
     totalsMarket.line,
     totalsMarket.over,
     totalsMarket.under,
@@ -335,8 +372,9 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
         baseLine: totalsCalibration.baseLine,
         marketLine: totalsMarket.line,
         probability: totalsCalibration.probability,
-        threshold,
+        threshold: totalsThreshold,
         marketProbability: totalsCalibration.marketProbability,
+        marketModelProbability: totalsCalibration.marketModelProbability,
         edge: totalsCalibration.edge,
         curve: totalsCalibration.curve,
         alternatives: totalsCalibration.alternatives,
@@ -364,7 +402,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
   const handicapCalibration = calibrateHandicap(
     matrix,
     win,
-    threshold,
+    handicapThreshold,
     homeName,
     awayName,
     spreadMarket.line,
@@ -383,8 +421,9 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
         line: handicapCalibration.line,
         marketLine: spreadMarket.line,
         probability: handicapCalibration.probability,
-        threshold,
+        threshold: handicapThreshold,
         marketProbability: handicapCalibration.marketProbability,
+        marketModelProbability: handicapCalibration.marketModelProbability,
         edge: handicapCalibration.edge,
         curve: handicapCalibration.curve,
         alternatives: handicapCalibration.alternatives,
@@ -556,7 +595,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
   const cornersAvailable = cornersHome !== null && cornersAway !== null && cornersHome + cornersAway > 0;
   if (cornersAvailable) {
     const lambdaCorners = (cornersHome as number) + (cornersAway as number);
-    const cornersCalibration = calibrateCorners(lambdaCorners, threshold);
+    const cornersCalibration = calibrateCorners(lambdaCorners, cornersThreshold);
     const cornersSideLabel = cornersCalibration.selection === 'over' ? 'Over' : 'Under';
     markets.push(
       finalizeMarket(
@@ -570,7 +609,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
           baseLine: cornersCalibration.baseLine,
           marketLine: extractCornersLine(pre),
           probability: cornersCalibration.probability,
-          threshold,
+          threshold: cornersThreshold,
           curve: cornersCalibration.curve,
           alternatives: cornersCalibration.alternatives,
           calibrated: cornersCalibration.calibrated,
@@ -637,8 +676,23 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
       rho: RHO,
       maxGoals: MAX_GOALS,
       threshold,
+      thresholds: {
+        default: threshold,
+        totals: totalsThreshold,
+        handicap: handicapThreshold,
+        corners: cornersThreshold,
+      },
       baseTotalLine: nearestHalfLine(lambdas.lambdaTotal),
+      leagueBaseline: round(lambdas.leagueTotal, 2),
       marketAgreement: round(agreement, 3),
+      marketAnchor: {
+        applied: anchor.applied,
+        weight: anchor.weight,
+        source: anchor.source,
+        marketTotal: anchor.marketTotal,
+        marketHome: anchor.marketHome,
+        marketAway: anchor.marketAway,
+      },
       lambdaSources: lambdas.sources,
     },
   };

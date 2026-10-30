@@ -43,9 +43,12 @@ export default function SummaryStrip({ analysis }: Props) {
       </div>
 
       <div className="metric">
-        <span className="metric-label">Umbral de calibración</span>
-        <span className="metric-value">{formatPct(model.threshold, 0)}</span>
-        <span className="metric-sub">Línea base {formatLine(model.baseTotalLine)}</span>
+        <span className="metric-label">Umbral base</span>
+        <span className="metric-value">{formatPct(model.thresholds.default, 0)}</span>
+        <span className="metric-sub">
+          Totales {formatPct(model.thresholds.totals, 0)} · Hándicap {formatPct(model.thresholds.handicap, 0)} · Base{' '}
+          {formatLine(model.baseTotalLine)}
+        </span>
       </div>
     </section>
   );

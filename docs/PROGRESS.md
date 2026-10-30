@@ -1,7 +1,7 @@
 # Parley Lab · Bitácora de progreso
 
 Proyecto: web app de análisis pre-partido y proyección de parleys.
-Última actualización: 2026-10-29.
+Última actualización: 2026-10-30.
 Alcance autorizado: solo `web-analisis`; la carpeta `../api` se consume por HTTP y permanece intacta (solo lectura).
 
 ## 1. Requerimiento y criterios de aceptación
@@ -205,3 +205,51 @@ Nota externa (fuera de alcance, solo lectura): `GET http://localhost:3000/health
 4. **Documentación.** `README.md` indica 30 pruebas. ESLint y los avisos de `npm audit` siguen documentados como deuda de tooling/dependencias.
 
 **Verificación:** `npm run typecheck` limpio, `npm test` 30/30, `npm run build` correcto. En producción (3100): payload real con `calibrated:false` y `curve:0` en los siete mercados discretos, `true` en totales/hándicap/córners; navegador sin errores de consola y cifras discretas en lima. `../api` intacta; sin commits ni despliegues.
+
+## 12. Convención de signo del hándicap (2026-10-29)
+
+**Motivo:** el análisis podía publicar al favorito con línea positiva (por ejemplo `-0.25` y +0.25 mezclados según el partido). En un parley real el favorito siempre entrega goles y aparece con valores negativos; el no favorito recibe el espejo positivo.
+
+**Cambio:** `src/lib/engine/calibration.ts` limita las líneas del favorito a `-3.0 … -0.25` (`FAVORITE_HANDICAP_LINES`). Si ninguna alcanza el umbral se publica la menos exigente (`-0.25`) con `calibrated: false`; nunca se asigna una línea positiva ni una alternativa positiva. La curva y las alternativas quedan todas en negativo y la explicación ya no anticipa «riesgo alto», que sigue decidiéndolo el campo `risk`.
+
+**Verificación:** `npm test` 30/30 con la prueba reemplazada «el favorito nunca recibe una línea positiva» y aserciones nuevas sobre el derbi; `npm run build` correcto. En vivo (3100, `espn:401874795`): `Internazionale -0.25`, curva `-3.00 … -0.25`, sin alternativas positivas. `docs/MOTOR_LINEAS.md` actualizado.
+
+**Consecuencia:** con el umbral actual (≈76 %) el runline del favorito rara vez queda calibrado; se muestra como «Sin línea sobre umbral». Si se prefiere una pata jugable, la alternativa es recomendar el lado del no favorito con su línea positiva espejo.
+
+## 13. Recalibración del motor y arnés de medición (2026-10-30)
+
+**Motivo:** las probabilidades de la matriz completa se veían conservadoras y desajustadas frente al mercado. La causa principal era la λ aditiva: promediar ataque y defensa comprimía la supremacía y dejaba el total lejos de la expectativa de las cuotas (p. ej. Bayern 3,09 frente a 4,07 implícito).
+
+### 13.1 Cambios
+
+1. **Fase 1 — λ multiplicativa.** `src/lib/engine/lambdas.ts` calcula fuerzas relativas a la media de la liga (`attack/perTeam`, `defense/perTeam`), las encoge un 15 % hacia 1 (más con muestra corta) y multiplica: `λ_home = atk_home · def_away · league.home`. `src/lib/engine/league.ts` aporta el total por liga (15 ligas, 2,70 por defecto) y el reparto local 54,5 %. La forma reciente pasa a ratios contra la media por equipo y los ajustes siguen acotados.
+2. **Fase 2 — ancla de mercado.** `src/lib/engine/anchor.ts` invierte la Poisson 1D para obtener el total implícito, reparte la supremacía por bisección con el moneyline, ajusta λ por descenso de coordenadas si solo hay 1X2 y mezcla mercado y modelo con peso 50–85 % según calidad, acuerdo y discrepancia de total. Si no hay cuotas, no se aplica.
+3. **Fase 3 — umbrales por mercado y valor comparable.** `calibration.ts` acepta una base por mercado (0,74 referencia; 0,72 totales; 0,66 hándicap; 0,70 córners). El valor se mide **en la línea de mercado** para el lado recomendado y se expone como `marketModelProbability`; la UI muestra «Modelo en mercado» y una nota de valor a ±3 puntos.
+4. **Fase 4 — arnés.** `scripts/snapshot.ts` congela respuestas reales en `data/snapshots/` (ignorado por git); `scripts/measure.ts` calcula MAE 1X2, Δtotal, sesgo del favorito, Brier/log-loss cuando hay marcador, brecha de línea y cobertura de valor. Documentado en `docs/MEDICION.md`.
+
+### 13.2 Medición de referencia
+
+Tres partidos programados capturados el 2026-10-30 contra `https://api-flame-chi-53.vercel.app`:
+
+| Partido | Total mercado | Motor λ / Δ / MAE / sesgo | Anclado λ / Δ / MAE / sesgo | Peso |
+|---|---|---|---|---|
+| Bayern – Dortmund | 4,07 (línea 3,5) | 3,09 / −0,98 / 3,9 pp / −5,9 pp | 3,90 / −0,17 / 0,8 pp / −0,8 pp | 82 % |
+| Milan – Inter | 3,02 (línea 2,5) | 3,66 / +0,64 / 2,3 pp / +2,9 pp | 3,22 / +0,20 / 1,0 pp / +1,3 pp | 69 % |
+| Liverpool – Arsenal | 2,74 (línea 2,5) | 2,27 / −0,47 / 3,9 pp / +2,7 pp | 2,58 / −0,16 / 1,3 pp / +0,6 pp | 66 % |
+| **Agregado** | — | **|Δ| 0,70 · MAE 3,4 · sesgo 3,8** | **|Δ| 0,18 · MAE 1,0 · sesgo 0,9** | 66–82 % |
+
+Criterios (variante anclada): |Δtotal| ≤ 0,20 ✔ (0,18); |sesgo favorito| ≤ 2,5 pp ✔ (0,9); MAE 1X2 ≤ 2,5 pp ✔ (1,0). Cobertura de valor 12/30 mercados (1X2, doble oportunidad, altas/bajas y hándicap); los otros seis no tienen cuota comparable y no publican valor.
+
+### 13.3 Verificación final
+
+- `npm run typecheck` sin errores; `npm test` 40/40 en 2,6 s (motor, ancla, métricas, servidor); `npm run build` correcto (`/` estática 58,1 kB; `/api/{ai,analyze,health}` dinámicas).
+- `npm run audit`: los tres criterios se cumplen y la tabla de §13.2 se reproduce.
+- Producción local en 3200 (el 3100 lo ocupa ahora la API) contra la API desplegada: `/api/health` 200 `ok:true`, contrato 1.2.0; `POST /api/analyze` (`espn:401874795`) 200 con 10 mercados, λ 1,37/1,85 (3,22), umbrales 76,2/74,2/68,2/72,2 %, ancla 68,6 % (`moneyline+totals`), Over 1,5 al 84,15 %, modelo 62,43 % en la línea 2,5 (valor +4,36 pp), córners 11,5 calibrado, hándicap −0,25 sin calibrar y combinada de 2 patas al 64,5 %; partido finalizado → 422 `MATCH_NOT_PROJECTABLE`; `text/plain` → 415; `GET /` → 200. Servidor temporal detenido al terminar.
+- `../api` intacta; sin commits, pushes ni despliegues.
+
+### 13.4 Consecuencias y límites
+
+- La λ anclada hace que 1X2, totales y hándicap sean coherentes con la expectativa agregada del mercado; el valor real se busca en la forma de la matriz (correlaciones, cuartos, marcadores), no en batir el 1X2.
+- La línea recomendada **no** se fuerza a la de mercado: sigue siendo la más ambiciosa que sostiene el umbral. La tarjeta muestra ambas y la probabilidad del modelo en la línea de mercado.
+- Tres partidos detectan sesgos gruesos, no certifican calibración; no hay resultados observados todavía, así que Brier y log-loss quedan vacíos.
+- Sigue pendiente la acción del usuario en Vercel: añadir `STATS_API_BASE_URL` al proyecto web y redesplegar.

@@ -7,10 +7,10 @@ Escribe un informe en español, en markdown, para alguien que decide si arma un 
 1. Usa exclusivamente los datos del JSON. No inventes estadísticas, jugadores, cuotas, lesiones ni noticias.
 2. Distingue probabilidad de certeza. No prometas ganancias ni uses lenguaje de apuesta segura.
 3. Explica la lectura del partido: ritmo esperado, goles, favoritismo y qué dicen las cuotas o la predicción externa si existen.
-4. Justifica la línea calibrada de Altas/Bajas y la de Hándicap: menciona la línea base, el umbral de confianza, la probabilidad elegida y por qué se bajó o subió la línea. Si no está calibrada, dilo y explica el riesgo.
+4. Justifica la línea calibrada de Altas/Bajas y la de Hándicap: menciona la línea base, el umbral de confianza, la probabilidad elegida y por qué se bajó o subió la línea. Si no está calibrada, dilo y explica el riesgo. Cuando exista valor frente al mercado, cítalo en puntos porcentuales y aclara que se mide en la línea de mercado, no en la recomendada.
 5. Comenta 2-4 mercados con la mejor relación probabilidad/riesgo y 1-2 de alta varianza (HT/FT, marcador exacto, par/impar). No recomiendes todos.
 6. Evalúa la combinada sugerida: coherencia, correlación entre selecciones y probabilidad conjunta. Si no hay combinada, explica por qué.
-7. Señala los caveats de datos (cobertura, muestra, contexto parcial, cuotas ausentes) y cómo afectan la confianza.
+7. Señala los caveats de datos (cobertura, muestra, contexto parcial, cuotas ausentes) y cómo afectan la confianza. Si "ancla_mercado.applied" es verdadero, explica que λ se apoya parcialmente en las cuotas y que eso reduce la independencia del pronóstico.
 8. Cierra con una advertencia breve de juego responsable y recuerda que las probabilidades son estimaciones.
 
 Formato exacto (sin tablas gigantes, máximo ~700 palabras):
@@ -49,6 +49,10 @@ function compactMarket(market: MarketResult): Record<string, unknown> {
     riesgo: market.risk,
     calibrada: market.calibrated,
     valor_vs_mercado_pp: market.edge === null ? null : Math.round(market.edge * 1000) / 10,
+    modelo_en_linea_mercado_pct:
+      market.marketModelProbability === null ? null : percent(market.marketModelProbability),
+    cuota_implicita_mercado_pct:
+      market.marketProbability === null ? null : percent(market.marketProbability),
     explicacion: market.explanation,
     nota: market.note,
     curva: compactCurve(market),
@@ -92,8 +96,16 @@ export function buildAnalysisDigest(envelope: AnalysisEnvelope): Record<string, 
         visitante: percent(analysis.winProbabilities.away),
       },
       umbral_lineas_pct: percent(analysis.model.threshold),
+      umbrales_pct: {
+        base: percent(analysis.model.thresholds.default),
+        totales: percent(analysis.model.thresholds.totals),
+        handicap: percent(analysis.model.thresholds.handicap),
+        corners: percent(analysis.model.thresholds.corners),
+      },
       linea_base_total: analysis.model.baseTotalLine,
-      acuerdo_con_mercado: analysis.model.marketAgreement,
+      media_liga_goles: analysis.model.leagueBaseline,
+      acuerdo_motor_mercado: analysis.model.marketAgreement,
+      ancla_mercado: analysis.model.marketAnchor,
       fuentes_lambda: analysis.model.lambdaSources,
       version: analysis.model.version,
     },

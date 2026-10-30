@@ -42,7 +42,9 @@ npm run dev        # Next.js en 3100
 npm run build      # build de producción
 npm start          # servidor de producción en 3100
 npm run typecheck  # TypeScript estricto
-npm test           # 30 pruebas del motor y del servidor con node:test
+npm test           # 40 pruebas del motor, el arnés y el servidor con node:test
+npm run snapshot -- --home "AC Milan" --away "Internazionale" --date 2026-10-31 --league ita.1
+npm run audit      # métricas de los snapshots guardados en data/snapshots/
 ```
 
 ## Cómo se usa
@@ -67,19 +69,24 @@ src/
     globals.css         tokens, layout y componentes visuales
   components/          buscador, cabecera, resumen, mercados, curva, combinada, contexto, IA
   lib/
-    engine/            motor puro: poisson, mercados, calibración, λ, calidad, combinada
+    engine/            motor puro: poisson, mercados, calibración, λ, liga, ancla, calidad, combinada
     server/            cliente HTTP, caché, validación, errores y Gemini
     types/             contrato canónico de la API y contrato de salida del motor
     ui/                formato de porcentajes, cuotas, líneas y fechas
 docs/
   MOTOR_LINEAS.md      contrato del motor y decisiones de calibración
+  MEDICION.md          arnés de snapshots y criterios de precisión
   PROTOTIPO_UX.md      diseño UX/UI y criterios de aceptación
   PROGRESS.md          bitácora de fases, QA y auditoría
+scripts/
+  snapshot.ts          captura una respuesta real de la API
+  measure.ts           mide snapshots contra el mercado
+data/snapshots/        capturas locales (ignoradas por git)
 ```
 
 ### Motor en una frase
 
-λ por equipo = mezcla de xG y goles ajustada por localía y forma, con contracción a la media de liga y blend 65/35 con la predicción externa; matriz Poisson bivariada con corrección Dixon-Coles (`rho = -0.1`, hasta 12 goles); los mercados se derivan de la matriz y las líneas se calibran contra un umbral que sube cuando baja la calidad de datos.
+λ por equipo = fuerza multiplicativa relativa a la media de su liga (mezcla 62/38 de xG y goles, encogida hacia la media), ajustada por forma y blend 65/35 con la predicción externa; después se ancla al total y la supremacía implícitos en las cuotas cuando existen. Matriz Poisson bivariada con corrección Dixon-Coles (`rho = -0.1`, hasta 12 goles); los mercados se derivan de la matriz y las líneas se calibran con un umbral propio por mercado que sube cuando baja la calidad de datos.
 
 `confidence = 100 · (0,7·p + 0,18·calidad + 0,12·acuerdo con el mercado)`. Riesgo Bajo ≥ 74 con calidad ≥ 0,6; Medio ≥ 62; Alto por debajo.
 

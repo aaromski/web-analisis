@@ -56,12 +56,16 @@ test('handicap fuerte elige la línea negativa más exigente que cumple', () => 
   }
 });
 
-test('handicap de un favorito débil cae a línea positiva', () => {
+test('el favorito nunca recibe una línea positiva', () => {
   const matrix = buildScoreMatrix(1.1, 1.2);
   const win = resultOutcomes(matrix);
   const calibration = calibrateHandicap(matrix, win, 0.9, 'Local', 'Visitante', null, null, null);
-  assert.ok(calibration.line >= 0);
-  assert.ok(calibration.probability >= 0.9);
+  assert.equal(calibration.selection, 'away');
+  assert.equal(calibration.line, -0.25);
+  assert.equal(calibration.calibrated, false);
+  assert.ok(calibration.probability < 0.9);
+  for (const point of calibration.curve) assert.ok(point.line < 0);
+  for (const option of calibration.alternatives) assert.ok(!option.label.includes('+'));
 });
 
 test('córners calibra sobre Poisson 1D', () => {

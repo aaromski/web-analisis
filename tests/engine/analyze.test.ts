@@ -70,6 +70,12 @@ test('el motor analiza el derbi real y publica los 10 mercados', () => {
   assert.ok(noneOption);
   assert.ok(Math.abs(noneOption.probability - matrix.cells[0][0]) < 1e-4);
 
+  const handicap = analysis.markets.find((market) => market.key === 'handicap');
+  assert.ok(handicap);
+  assert.ok((handicap.line ?? 1) < 0, `el favorito no puede recibir ${handicap.line}`);
+  assert.ok(handicap.curve.every((point) => point.line < 0));
+  assert.ok(handicap.alternatives.every((option) => !option.label.includes('+')));
+
   const corners = analysis.markets.find((market) => market.key === 'corners');
   assert.ok(corners);
   assert.ok(Math.abs((corners.line ?? 0) * 2 - Math.round((corners.line ?? 0) * 2)) < 1e-9);

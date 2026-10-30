@@ -267,6 +267,9 @@ export default function MarketCard({ market, index }: Props) {
               {market.marketProbability !== null ? (
                 <span className="chip">Cuota implícita {formatPct(market.marketProbability)}</span>
               ) : null}
+              {market.marketModelProbability !== null ? (
+                <span className="chip">Modelo en mercado {formatPct(market.marketModelProbability)}</span>
+              ) : null}
             </div>
           </div>
         </div>

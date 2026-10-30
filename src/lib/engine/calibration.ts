@@ -4,19 +4,26 @@ import { clamp, handicapCover, poissonOver, poissonUnder, round, totalOver, tota
 
 export const TOTAL_LINES: number[] = Array.from({ length: 7 }, (_, index) => index + 0.5);
 export const CORNER_LINES: number[] = Array.from({ length: 9 }, (_, index) => index + 6.5);
-export const HANDICAP_LINES: number[] = Array.from({ length: 21 }, (_, index) => (index - 12) / 4);
+/**
+ * Líneas que puede tomar el favorito. En el mercado real el favorito siempre
+ * entrega goles (signo negativo); el no favorito recibe el espejo positivo.
+ */
+export const FAVORITE_HANDICAP_LINES: number[] = Array.from({ length: 12 }, (_, index) => (index - 12) / 4);
 
 /**
  * Umbral de confianza que debe superar una línea para publicarse. Más datos
- * dudosos o más desacuerdo con el mercado elevan el listón.
+ * dudosos o más desacuerdo con el mercado elevan el listón. `base` permite que
+ * cada mercado tenga su propio punto de partida (el favorito de un runline
+ * necesita menos cobertura que un Over/Under).
  */
 export function confidenceThreshold(
   quality: number,
   lambdaTotal: number,
   marketTotalLine: number | null,
+  base = 0.74,
 ): number {
   const disagreement = marketTotalLine !== null && Math.abs(lambdaTotal - marketTotalLine) > 0.35 ? 1 : 0;
-  return round(clamp(0.74 + 0.08 * (1 - quality) + 0.02 * disagreement, 0.68, 0.86), 3);
+  return round(clamp(base + 0.08 * (1 - quality) + 0.02 * disagreement, base - 0.06, base + 0.12), 3);
 }
 
 export function computeConfidence(probability: number, quality: number, agreement: number): number {
@@ -42,11 +49,31 @@ export function formatSignedLine(line: number): string {
   return `${sign}${Number.isInteger(abs) ? abs.toFixed(0) : abs.toFixed(2).replace(/0$/, '')}`;
 }
 
+function valueNote(
+  edge: number | null,
+  modelProbability: number | null,
+  marketProbability: number | null,
+  label: string,
+): string | null {
+  if (edge === null || modelProbability === null || marketProbability === null || label.length === 0) return null;
+  const modelPct = (modelProbability * 100).toFixed(1);
+  const marketPct = (marketProbability * 100).toFixed(1);
+  const points = Math.abs(edge * 100).toFixed(1);
+  if (edge >= 0.03) {
+    return `Valor en ${label}: el modelo da ${modelPct} % frente al ${marketPct} % del mercado (+${points} pts).`;
+  }
+  if (edge <= -0.03) {
+    return `Sin valor en ${label}: el modelo da ${modelPct} % frente al ${marketPct} % del mercado (−${points} pts).`;
+  }
+  return `Modelo y mercado alineados en ${label}: ${modelPct} % frente a ${marketPct} %.`;
+}
+
 export interface TotalsCalibration {
   selection: 'over' | 'under';
   line: number;
   probability: number;
   marketProbability: number | null;
+  marketModelProbability: number | null;
   edge: number | null;
   calibrated: boolean;
   curve: CalibrationPoint[];
@@ -104,13 +131,15 @@ export function calibrateTotals(
   }
 
   const probability = selection === 'over' ? (picked.over ?? 0) : (picked.under ?? 0);
-  const marketProbability =
-    marketLine !== null && Math.abs(marketLine - picked.line) < 1e-9
-      ? selection === 'over'
-        ? marketOver
-        : marketUnder
+  // El valor se mide siempre en la línea del mercado, aunque la recomendada
+  // esté en otra línea: así se compara el mismo producto que ofrece la casa.
+  const marketModelProbability =
+    marketLine === null ? null : selection === 'over' ? totalOver(matrix, marketLine) : totalUnder(matrix, marketLine);
+  const marketProbability = marketLine === null ? null : selection === 'over' ? marketOver : marketUnder;
+  const edge =
+    marketProbability !== null && marketProbability > 0 && marketModelProbability !== null
+      ? marketModelProbability - marketProbability
       : null;
-  const edge = marketProbability !== null ? probability - marketProbability : null;
 
   const curve: CalibrationPoint[] = points.map((point) => ({
     line: point.line,
@@ -149,18 +178,29 @@ export function calibrateTotals(
       : '';
   const explanation = calibrated
     ? `${baseText}Con umbral del ${(threshold * 100).toFixed(0)} %, la línea más ${selection === 'over' ? 'alta' : 'baja'} que sostiene la confianza es ${sideLabel} ${picked.line.toFixed(1)} (${(probability * 100).toFixed(0)} %).`
-    : `Ninguna línea alcanza el umbral del ${(threshold * 100).toFixed(0)} %. Se publica ${sideLabel} ${picked.line.toFixed(1)} (${(probability * 100).toFixed(0)} %) como la mejor disponible, con riesgo alto.`;
+    : `Ninguna línea alcanza el umbral del ${(threshold * 100).toFixed(0)} %. Se publica ${sideLabel} ${picked.line.toFixed(1)} (${(probability * 100).toFixed(0)} %) como la mejor disponible.`;
 
-  const note =
-    marketLine !== null && Math.abs(marketLine - picked.line) > 0.5
-      ? `La línea de mercado (${marketLine.toFixed(1)}) se aleja ${Math.abs(marketLine - picked.line).toFixed(1)} de la recomendada.`
-      : undefined;
+  const notes: string[] = [];
+  if (marketLine !== null && Math.abs(marketLine - picked.line) > 0.5) {
+    notes.push(
+      `La línea de mercado (${marketLine.toFixed(1)}) está a ${Math.abs(marketLine - picked.line).toFixed(1)} de la recomendada.`,
+    );
+  }
+  const value = valueNote(
+    edge,
+    marketModelProbability,
+    marketProbability,
+    marketLine === null ? '' : `la línea de mercado ${marketLine.toFixed(1)}`,
+  );
+  if (value) notes.push(value);
+  const note = notes.length > 0 ? notes.join(' ') : undefined;
 
   return {
     selection,
     line: picked.line,
     probability,
     marketProbability,
+    marketModelProbability,
     edge,
     calibrated,
     curve,
@@ -177,6 +217,7 @@ export interface HandicapCalibration {
   line: number;
   probability: number;
   marketProbability: number | null;
+  marketModelProbability: number | null;
   edge: number | null;
   calibrated: boolean;
   curve: CalibrationPoint[];
@@ -197,7 +238,7 @@ export function calibrateHandicap(
 ): HandicapCalibration {
   const selection: 'home' | 'away' = winProbabilities.home >= winProbabilities.away ? 'home' : 'away';
   const favoriteName = selection === 'home' ? homeName : awayName;
-  const points = HANDICAP_LINES.map((line) => ({
+  const points = FAVORITE_HANDICAP_LINES.map((line) => ({
     line,
     probability: handicapCover(matrix, selection, line),
   }));
@@ -211,15 +252,21 @@ export function calibrateHandicap(
     picked = passing[0];
   } else {
     calibrated = false;
-    picked = [...points].sort((a, b) => b.probability - a.probability)[0];
+    // El favorito nunca recibe hándicap positivo: se publica la menos exigente.
+    picked = points[points.length - 1];
   }
 
   const marketSideLine =
     marketLine === null ? null : selection === 'home' ? marketLine : -marketLine;
   const marketSideProbability = selection === 'home' ? marketHome : marketAway;
+  const marketModelProbability =
+    marketSideLine === null ? null : handicapCover(matrix, selection, marketSideLine);
   const marketProbability =
-    marketSideLine !== null && Math.abs(marketSideLine - picked.line) < 1e-9 ? marketSideProbability : null;
-  const edge = marketProbability !== null ? picked.probability - marketProbability : null;
+    marketSideProbability !== null && marketSideProbability > 0 ? marketSideProbability : null;
+  const edge =
+    marketProbability !== null && marketModelProbability !== null
+      ? marketModelProbability - marketProbability
+      : null;
 
   const curve: CalibrationPoint[] = points.map((point) => ({
     line: point.line,
@@ -230,7 +277,8 @@ export function calibrateHandicap(
 
   const alternatives: MarketOption[] = [];
   for (const line of [picked.line - 0.25, picked.line, picked.line + 0.25]) {
-    if (line < HANDICAP_LINES[0] - 1e-9 || line > HANDICAP_LINES[HANDICAP_LINES.length - 1] + 1e-9) continue;
+    if (line > -0.25 + 1e-9) continue;
+    if (line < FAVORITE_HANDICAP_LINES[0] - 1e-9) continue;
     const p = handicapCover(matrix, selection, line);
     alternatives.push({
       label: `${favoriteName} ${formatSignedLine(line)}`,
@@ -242,16 +290,23 @@ export function calibrateHandicap(
   }
 
   const lineText = formatSignedLine(picked.line);
+  const favoriteWinPct = ((selection === 'home' ? winProbabilities.home : winProbabilities.away) * 100).toFixed(0);
   const explanation = calibrated
-    ? `${favoriteName} es el favorito (${((selection === 'home' ? winProbabilities.home : winProbabilities.away) * 100).toFixed(0)} % de victoria). La línea más exigente que mantiene el umbral del ${(threshold * 100).toFixed(0)} % es ${lineText} (${(picked.probability * 100).toFixed(0)} % de cobertura).`
-    : `${favoriteName} no alcanza el umbral ni con la línea más favorable. Se publica ${lineText} (${(picked.probability * 100).toFixed(0)} %) con riesgo alto.`;
+    ? `${favoriteName} es el favorito (${favoriteWinPct} % de victoria). La línea más exigente que mantiene el umbral del ${(threshold * 100).toFixed(0)} % es ${lineText} (${(picked.probability * 100).toFixed(0)} % de cobertura).`
+    : `${favoriteName} es el favorito (${favoriteWinPct} % de victoria), pero ninguna línea negativa alcanza el umbral del ${(threshold * 100).toFixed(0)} %. Se publica la menos exigente, ${lineText} (${(picked.probability * 100).toFixed(0)} % de cobertura).`;
 
-  const note =
-    picked.line > 0
-      ? `El favorito necesita hándicap positivo (${lineText}): su ventaja no es suficiente para exigir una línea negativa.`
-      : marketLine !== null && Math.abs(marketLine - (selection === 'home' ? picked.line : -picked.line)) > 0.5
-        ? `La línea de mercado se aleja de la recomendada.`
-        : undefined;
+  const notes: string[] = [];
+  if (marketLine !== null && Math.abs(marketLine - (selection === 'home' ? picked.line : -picked.line)) > 0.5) {
+    notes.push('La línea de mercado se aleja de la recomendada.');
+  }
+  const value = valueNote(
+    edge,
+    marketModelProbability,
+    marketProbability,
+    marketSideLine === null ? '' : `la línea de mercado ${formatSignedLine(marketSideLine)}`,
+  );
+  if (value) notes.push(value);
+  const note = notes.length > 0 ? notes.join(' ') : undefined;
 
   return {
     selection,
@@ -259,6 +314,7 @@ export function calibrateHandicap(
     line: picked.line,
     probability: picked.probability,
     marketProbability,
+    marketModelProbability,
     edge,
     calibrated,
     curve,

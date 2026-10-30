@@ -12,3 +12,4 @@ coverage/
 Thumbs.db
 tsconfig.tsbuildinfo
 next-env.d.ts
+data/snapshots/
