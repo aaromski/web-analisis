@@ -207,6 +207,36 @@ export function convolveMatrices(first: ScoreMatrix, second: ScoreMatrix): Score
   });
 }
 
+/**
+ * Desplaza una matriz de goles restantes al marcador actual: la celda (i, j)
+ * pasa a representar el marcador absoluto (i + offsetHome, j + offsetAway).
+ * Así los mercados existentes operan sobre el resultado final.
+ */
+export function shiftMatrix(
+  matrix: ScoreMatrix,
+  offsetHome: number,
+  offsetAway: number,
+): ScoreMatrix {
+  const home = Math.max(0, Math.round(offsetHome));
+  const away = Math.max(0, Math.round(offsetAway));
+  if (home === 0 && away === 0) return matrix;
+  const maxGoals = matrix.maxGoals + home + away;
+  const cells: number[][] = Array.from({ length: maxGoals + 1 }, () =>
+    Array.from({ length: maxGoals + 1 }, () => 0),
+  );
+  for (let i = 0; i < matrix.cells.length; i += 1) {
+    for (let j = 0; j < matrix.cells[i].length; j += 1) {
+      cells[i + home][j + away] = matrix.cells[i][j];
+    }
+  }
+  return {
+    cells,
+    maxGoals,
+    lambdaHome: matrix.lambdaHome + home,
+    lambdaAway: matrix.lambdaAway + away,
+  };
+}
+
 /** Probabilidad de que un total Poisson 1D supere una línea semientera. */
 export function poissonOver(lambda: number, line: number): number {
   const safeLambda = Math.max(0, lambda);

@@ -2,10 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   aggregateMetrics,
+  applyIsotonic,
   brierScore,
+  expectedCalibrationError,
   favoriteError,
+  fitIsotonic,
   logLoss,
   outcomeFromScore,
+  reliabilityBins,
   totalDelta,
   winMeanAbsoluteError,
   type MatchMetrics,
@@ -84,4 +88,48 @@ test('el agregado ignora mercados ausentes y promedia solo valores presentes', (
   assert.ok(Math.abs((aggregate.meanBrier ?? 0) - 0.4) < 1e-9);
   assert.equal(aggregate.edgesComputed, 2);
   assert.equal(aggregate.markets, 19);
+});
+
+test('la fiabilidad agrupa por bins y el ECE penaliza el desvío', () => {
+  const samples = [
+    { probability: 0.8, hit: true },
+    { probability: 0.8, hit: false },
+    { probability: 0.2, hit: false },
+    { probability: 0.2, hit: true },
+  ];
+  const bins = reliabilityBins(samples);
+  assert.equal(bins.length, 2);
+  assert.ok(Math.abs(bins[0].observed - 0.5) < 1e-9);
+  const ece = expectedCalibrationError(samples);
+  assert.ok(ece !== null && Math.abs(ece - 0.3) < 1e-9);
+
+  const perfect = expectedCalibrationError([
+    { probability: 1, hit: true },
+    { probability: 0, hit: false },
+  ]);
+  assert.equal(perfect, 0);
+});
+
+test('la isotónica es monótona y corrige el exceso de confianza', () => {
+  const samples = [
+    { probability: 0.9, hit: false },
+    { probability: 0.9, hit: false },
+    { probability: 0.9, hit: false },
+    { probability: 0.1, hit: false },
+    { probability: 0.1, hit: true },
+    { probability: 0.1, hit: false },
+  ];
+  const calibrator = fitIsotonic(samples);
+  assert.ok(calibrator.knots.length > 0);
+  const values = calibrator.knots.map((knot) => knot.y);
+  for (let index = 1; index < values.length; index += 1) {
+    assert.ok(values[index] >= values[index - 1]);
+  }
+  assert.ok(applyIsotonic(calibrator, 0.9) < 0.9);
+  assert.ok(applyIsotonic(calibrator, 0.1) <= 0.5);
+  const before = expectedCalibrationError(samples);
+  const after = expectedCalibrationError(
+    samples.map((sample) => ({ probability: applyIsotonic(calibrator, sample.probability), hit: sample.hit })),
+  );
+  assert.ok(before !== null && after !== null && after <= before);
 });

@@ -1,7 +1,16 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { evaluateResponse, type EvaluatedVariant } from '../src/lib/audit/evaluate';
-import { aggregateMetrics, type AggregateMetrics, type MatchMetrics } from '../src/lib/audit/metrics';
+import {
+  aggregateMetrics,
+  applyIsotonic,
+  expectedCalibrationError,
+  fitIsotonic,
+  type AggregateMetrics,
+  type CalibrationSample,
+  type MatchMetrics,
+} from '../src/lib/audit/metrics';
+import { loadResults, withResult, type MatchResults } from '../src/lib/audit/results';
 import { AnalysisError, analyzeMatch } from '../src/lib/engine/analyze';
 import type { AnalysisResult } from '../src/lib/types/analysis';
 import type { AggregatedResponse } from '../src/lib/types/api';
@@ -66,6 +75,52 @@ function printAggregate(title: string, aggregate: AggregateMetrics): void {
   );
 }
 
+function calibrationSamples(results: SnapshotResult[], variant: EvaluatedVariant['variant']): CalibrationSample[] {
+  const samples: CalibrationSample[] = [];
+  for (const result of results) {
+    const evaluated = variant === 'motor' ? result.motor : result.anclado;
+    if (!evaluated.outcome) continue;
+    for (const side of ['home', 'draw', 'away'] as const) {
+      samples.push({ probability: evaluated.winProbabilities[side], hit: evaluated.outcome === side });
+    }
+  }
+  return samples;
+}
+
+function printCalibration(results: SnapshotResult[], variant: EvaluatedVariant['variant']): void {
+  const samples = calibrationSamples(results, variant);
+  if (samples.length === 0) {
+    console.log(`Calibración (${variant}): sin resultados reales. Añade data/results.json.`);
+    return;
+  }
+  const ece = expectedCalibrationError(samples);
+  const isotonic = fitIsotonic(samples);
+  const recalibrated = samples.map((sample) => ({
+    probability: applyIsotonic(isotonic, sample.probability),
+    hit: sample.hit,
+  }));
+  const eceAfter = expectedCalibrationError(recalibrated);
+  console.log(
+    `Calibración (${variant}, ${samples.length} muestras): ECE ${ece === null ? '—' : (ece * 100).toFixed(1)} pp · ` +
+      `isotónica ECE ${eceAfter === null ? '—' : (eceAfter * 100).toFixed(1)} pp · ${isotonic.knots.length} tramos`,
+  );
+}
+
+function loadSnapshots(results: MatchResults): { response: AggregatedResponse; file: string }[] {
+  const directory = join(process.cwd(), 'data', 'snapshots');
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory)
+    .filter((file) => file.endsWith('.json'))
+    .sort()
+    .map((file) => ({
+      file,
+      response: withResult(
+        JSON.parse(readFileSync(join(directory, file), 'utf8')) as AggregatedResponse,
+        results,
+      ),
+    }));
+}
+
 function main(): void {
   const directory = join(process.cwd(), 'data', 'snapshots');
   if (!existsSync(directory)) {
@@ -73,18 +128,16 @@ function main(): void {
     process.exitCode = 1;
     return;
   }
-  const files = readdirSync(directory)
-    .filter((file) => file.endsWith('.json'))
-    .sort();
-  if (files.length === 0) {
+  const results = loadResults(join(process.cwd(), 'data', 'results.json'));
+  const snapshots = loadSnapshots(results);
+  if (snapshots.length === 0) {
     console.error('data/snapshots está vacío. Captura al menos un partido antes de medir.');
     process.exitCode = 1;
     return;
   }
 
-  const results: SnapshotResult[] = [];
-  for (const file of files) {
-    const response = JSON.parse(readFileSync(join(directory, file), 'utf8')) as AggregatedResponse;
+  const rows: SnapshotResult[] = [];
+  for (const { response, file } of snapshots) {
     if (!response.match || !response.teams?.home || !response.teams?.away) {
       console.warn(`Snapshot ignorado (sin partido o equipos): ${file}`);
       continue;
@@ -93,7 +146,7 @@ function main(): void {
     const motor = evaluateResponse(response, 'motor', null);
     const anclado = evaluateResponse(response, 'anclado', analysis);
     const totals = analysis?.markets.find((market) => market.key === 'totals');
-    results.push({
+    rows.push({
       label: `${response.teams.home.name} – ${response.teams.away.name}`,
       league: response.match.league?.name ?? response.match.league?.id ?? 'Liga',
       date: response.match.date,
@@ -104,13 +157,13 @@ function main(): void {
     });
   }
 
-  if (results.length === 0) {
+  if (rows.length === 0) {
     console.error('Ningún snapshot válido para medir.');
     process.exitCode = 1;
     return;
   }
 
-  for (const result of results) {
+  for (const result of rows) {
     console.log(`\n${result.label} · ${result.league} · ${result.date.slice(0, 10)}`);
     console.log(
       `  mercado: total implícito ${goals(result.marketTotal)} · línea ${result.marketLine === null ? '—' : result.marketLine.toFixed(2)}`,
@@ -120,14 +173,18 @@ function main(): void {
   }
 
   const rowsFor = (variant: EvaluatedVariant['variant']): MatchMetrics[] =>
-    results.map((result) => (variant === 'motor' ? result.motor.metrics : result.anclado.metrics));
+    rows.map((result) => (variant === 'motor' ? result.motor.metrics : result.anclado.metrics));
 
   const motorAggregate = aggregateMetrics(rowsFor('motor'));
   const anchoredAggregate = aggregateMetrics(rowsFor('anclado'));
 
-  console.log(`\nAgregado (${results.length} partidos con cuotas)`);
+  console.log(`\nAgregado (${rows.length} partidos con cuotas)`);
   printAggregate('motor  ', motorAggregate);
   printAggregate('anclado', anchoredAggregate);
+  if (results.size > 0) {
+    printCalibration(rows, 'motor');
+    printCalibration(rows, 'anclado');
+  }
 
   const favoriteOk =
     anchoredAggregate.meanAbsFavoriteDelta !== null && anchoredAggregate.meanAbsFavoriteDelta * 100 <= 2.5;

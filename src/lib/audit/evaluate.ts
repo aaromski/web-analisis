@@ -3,7 +3,14 @@ import type { AnalysisResult } from '../types/analysis';
 import { anchorLambdas, impliedTotalFromOver, type AnchorResult } from '../engine/anchor';
 import { buildLambdas, type LambdaModel } from '../engine/lambdas';
 import { resultOutcomes } from '../engine/markets';
-import { extractTotalsMarket, extractWinMarket, modelAgreement } from '../engine/odds';
+import {
+  buildMarketSignal,
+  extractTotalsMarket,
+  extractWinMarket,
+  modelAgreement,
+  movementWeightScale,
+  pickBalancedLine,
+} from '../engine/odds';
 import { buildScoreMatrix, round } from '../engine/poisson';
 import { assessQuality } from '../engine/quality';
 import {
@@ -30,11 +37,18 @@ export interface EvaluatedVariant {
   lambdaTotal: number;
   marketTotal: number | null;
   anchor: AnchorResult | null;
+  winProbabilities: OutcomeProbabilities;
+  outcome: Outcome | null;
   metrics: MatchMetrics;
 }
 
 function round2(value: number): number {
   return round(value, 2);
+}
+
+export interface EvaluateOptions {
+  /** Escala manual del peso del ancla (además del movimiento real). */
+  weightScale?: number;
 }
 
 /**
@@ -46,12 +60,20 @@ export function evaluateResponse(
   response: AggregatedResponse,
   variant: Variant,
   analysis?: AnalysisResult | null,
+  options: EvaluateOptions = {},
 ): EvaluatedVariant {
   const lambdas: LambdaModel = buildLambdas(response);
   const quality = assessQuality(response);
   const winMarket = extractWinMarket(response.pre_match);
   const oddsWin = winMarket?.source === 'odds' ? winMarket : null;
+  const predictionWin = winMarket?.source === 'prediction' ? winMarket : null;
   const totalsMarket = extractTotalsMarket(response.pre_match);
+  const signal = buildMarketSignal(response.pre_match);
+  const predictionLines = pickBalancedLine(response.pre_match?.prediction?.over_under);
+  const predictionTotal =
+    predictionLines && predictionLines.probability !== null
+      ? impliedTotalFromOver(predictionLines.line, predictionLines.probability)
+      : null;
 
   let lambdaHome = lambdas.lambdaHome;
   let lambdaAway = lambdas.lambdaAway;
@@ -66,8 +88,11 @@ export function evaluateResponse(
       lambdaAway,
       winMarket: oddsWin,
       totalsMarket,
+      predictionTotal,
+      predictionWin,
       quality: quality.score,
       agreement,
+      weightScale: movementWeightScale(signal) * (options.weightScale ?? 1),
     });
     if (anchor.applied) {
       lambdaHome = anchor.lambdaHome;
@@ -99,6 +124,12 @@ export function evaluateResponse(
     lambdaTotal: round2(lambdaTotal),
     marketTotal: marketTotal === null ? null : round2(marketTotal),
     anchor,
+    winProbabilities: {
+      home: round(modelWin.home, 4),
+      draw: round(modelWin.draw, 4),
+      away: round(modelWin.away, 4),
+    },
+    outcome,
     metrics: {
       label: `${response.teams.home.name} – ${response.teams.away.name}`,
       variant,

@@ -42,16 +42,17 @@ npm run dev        # Next.js en 3100
 npm run build      # build de producción
 npm start          # servidor de producción en 3100
 npm run typecheck  # TypeScript estricto
-npm test           # 40 pruebas del motor, el arnés y el servidor con node:test
+npm test           # 57 pruebas del motor, el arnés y el servidor con node:test
 npm run snapshot -- --home "AC Milan" --away "Internazionale" --date 2026-10-31 --league ita.1
-npm run audit      # métricas de los snapshots guardados en data/snapshots/
+npm run audit      # métricas de los snapshots (y de data/results.json si existe)
+npm run tune       # barrido del peso del ancla por Brier medio
 ```
 
 ## Cómo se usa
 
 1. En `/`, busca por equipos (local, visitante; fecha y liga opcionales) o por ID (`espn:401874795`).
 2. El panel muestra λ por equipo, probabilidad 1X2, calidad de datos, umbral y los mercados: 1X2, doble oportunidad, altas/bajas, hándicap, primer gol, impar/par, HT/FT, marcador exacto y BTTS; córners como mercado extendido.
-3. Cada tarjeta expone la selección, la línea publicada, la probabilidad, la cuota justa, la confianza, el riesgo y el valor frente al mercado. Al expandir aparece la curva de calibración, el umbral, la línea base, la línea de mercado y una tabla de líneas.
+3. Cada tarjeta expone la selección, la línea publicada, la probabilidad, la cuota justa, la confianza, el riesgo, el rango 10–90 cuando aplica y el valor frente al mercado. Al expandir aparece la curva de calibración, el umbral, la línea base, la línea de mercado y una tabla de líneas.
 4. La combinada se calcula sobre la matriz (correlación incorporada), no multiplicando probabilidades.
 5. «Generar informe» envía el análisis a Gemini y muestra el markdown en el panel IA.
 
@@ -69,7 +70,7 @@ src/
     globals.css         tokens, layout y componentes visuales
   components/          buscador, cabecera, resumen, mercados, curva, combinada, contexto, IA
   lib/
-    engine/            motor puro: poisson, mercados, calibración, λ, liga, ancla, calidad, combinada
+    engine/            motor puro: poisson, mercados, calibración, λ, liga, ancla, ajustes, incertidumbre, vivo, calidad, combinada
     server/            cliente HTTP, caché, validación, errores y Gemini
     types/             contrato canónico de la API y contrato de salida del motor
     ui/                formato de porcentajes, cuotas, líneas y fechas
@@ -80,13 +81,15 @@ docs/
   PROGRESS.md          bitácora de fases, QA y auditoría
 scripts/
   snapshot.ts          captura una respuesta real de la API
-  measure.ts           mide snapshots contra el mercado
+  measure.ts           mide snapshots contra el mercado y los resultados
+  tune.ts              barre el peso del ancla y guarda data/tuning.json
 data/snapshots/        capturas locales (ignoradas por git)
+data/results.json      marcadores reales para backtest (local, ignorado por git)
 ```
 
 ### Motor en una frase
 
-λ por equipo = fuerza multiplicativa relativa a la media de su liga (mezcla 62/38 de xG y goles, encogida hacia la media), ajustada por forma y blend 65/35 con la predicción externa; después se ancla al total y la supremacía implícitos en las cuotas cuando existen. Matriz Poisson bivariada con corrección Dixon-Coles (`rho = -0.1`, hasta 12 goles); los mercados se derivan de la matriz y las líneas se calibran con un umbral propio por mercado que sube cuando baja la calidad de datos.
+λ por equipo = fuerza multiplicativa relativa a la media de su liga (mezcla 62/38 de xG y goles ponderada por estado `observed`/`projected`, encogida hacia la media), ajustada por forma y contexto acotado (bajas, descanso, rival, clima, h2h) y blend 65/35 con la predicción externa; después se ancla al total y la supremacía implícitos en las cuotas (o en la predicción si no hay cuota). Matriz Poisson bivariada con corrección Dixon-Coles (`rho = -0.1`, hasta 12 goles); los mercados se derivan de la matriz, las líneas se calibran con un umbral propio por mercado y un Monte Carlo publica la banda p10–p90. En vivo se desplaza la matriz por el marcador y se proyectan solo los goles restantes.
 
 `confidence = 100 · (0,7·p + 0,18·calidad + 0,12·acuerdo con el mercado)`. Riesgo Bajo ≥ 74 con calidad ≥ 0,6; Medio ≥ 62; Alto por debajo.
 
@@ -100,7 +103,7 @@ data/snapshots/        capturas locales (ignoradas por git)
 ## Limitaciones
 
 - Búsqueda por equipos sin fecha/liga puede devolver 404 según la API; por ID es determinista.
-- Los partidos finalizados o en juego se rechazan: el motor calibra antes del inicio.
+- Los partidos finalizados se rechazan; los partidos en vivo se analizan con los goles restantes y sin ancla de mercado.
 - El informe IA tarda 15–40 s y depende de la cuota del plan de Gemini.
 - Sin listado de partidos ni autocompletado.
 

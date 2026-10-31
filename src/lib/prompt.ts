@@ -10,7 +10,9 @@ Escribe un informe en español, en markdown, para alguien que decide si arma un 
 4. Justifica la línea calibrada de Altas/Bajas y la de Hándicap: menciona la línea base, el umbral de confianza, la probabilidad elegida y por qué se bajó o subió la línea. Si no está calibrada, dilo y explica el riesgo. Cuando exista valor frente al mercado, cítalo en puntos porcentuales y aclara que se mide en la línea de mercado, no en la recomendada.
 5. Comenta 2-4 mercados con la mejor relación probabilidad/riesgo y 1-2 de alta varianza (HT/FT, marcador exacto, par/impar). No recomiendes todos.
 6. Evalúa la combinada sugerida: coherencia, correlación entre selecciones y probabilidad conjunta. Si no hay combinada, explica por qué.
-7. Señala los caveats de datos (cobertura, muestra, contexto parcial, cuotas ausentes) y cómo afectan la confianza. Si "ancla_mercado.applied" es verdadero, explica que λ se apoya parcialmente en las cuotas y que eso reduce la independencia del pronóstico.
+7. Señala los caveats de datos (cobertura, muestra, contexto parcial, cuotas ausentes) y cómo afectan la confianza. Si "ancla_mercado.applied" es verdadero, explica que λ se apoya parcialmente en las cuotas o en la predicción externa y que eso reduce la independencia del pronóstico.
+8. Si el JSON incluye "incertidumbre", cita la banda p10–p90 de goles o de probabilidad en lugar de presentar una cifra única como certeza. Si "ajustes" no está vacío, menciona cómo alineación, descanso, rival, clima o historial movieron λ. Si "en_vivo" existe, aclara que el análisis cubre solo el tiempo restante y el marcador actual.
+9. Cuando un mercado indique "referencia" distinta de "odds", di que la comparación viene de una predicción o de un mercado extra y que el valor es orientativo.
 8. Cierra con una advertencia breve de juego responsable y recuerda que las probabilidades son estimaciones.
 
 Formato exacto (sin tablas gigantes, máximo ~700 palabras):
@@ -48,6 +50,11 @@ function compactMarket(market: MarketResult): Record<string, unknown> {
     confianza: market.confidence,
     riesgo: market.risk,
     calibrada: market.calibrated,
+    referencia: market.comparisonSource ?? null,
+    intervalo_p10_p90:
+      market.interval === null || market.interval === undefined
+        ? null
+        : { bajo_pct: percent(market.interval.low), alto_pct: percent(market.interval.high) },
     valor_vs_mercado_pp: market.edge === null ? null : Math.round(market.edge * 1000) / 10,
     modelo_en_linea_mercado_pct:
       market.marketModelProbability === null ? null : percent(market.marketModelProbability),
@@ -106,6 +113,10 @@ export function buildAnalysisDigest(envelope: AnalysisEnvelope): Record<string, 
       media_liga_goles: analysis.model.leagueBaseline,
       acuerdo_motor_mercado: analysis.model.marketAgreement,
       ancla_mercado: analysis.model.marketAnchor,
+      senal_mercado: analysis.model.marketSignal,
+      ajustes: analysis.model.adjustments,
+      incertidumbre: analysis.model.uncertainty,
+      en_vivo: analysis.model.live,
       fuentes_lambda: analysis.model.lambdaSources,
       version: analysis.model.version,
     },
@@ -127,9 +138,13 @@ export function buildAnalysisDigest(envelope: AnalysisEnvelope): Record<string, 
       prediccion_externa: analysis.context.prediction,
       forma_reciente: analysis.context.recentForm,
       bajas: analysis.context.injuries,
+      alineaciones: analysis.context.lineups,
+      descanso: analysis.context.rest,
+      posiciones: analysis.context.standings,
       h2h: analysis.context.h2h,
       arbitro: analysis.context.referee,
       clima: analysis.context.weather,
+      sede: analysis.context.venue,
       cuotas: analysis.context.odds,
       insights: analysis.context.insights,
     },

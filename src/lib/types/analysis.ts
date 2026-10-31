@@ -36,6 +36,14 @@ export interface MarketOption {
   edge?: number | null;
 }
 
+export interface ProbabilityInterval {
+  low: number;
+  high: number;
+}
+
+/** Origen de la probabilidad externa con la que se compara el modelo. */
+export type ComparisonSource = 'odds' | 'extra_market' | 'prediction';
+
 export interface ScoreProbability {
   score: string;
   home: number;
@@ -73,6 +81,10 @@ export interface MarketResult {
   /** Probabilidad del modelo evaluada en la línea de mercado (misma apuesta). */
   marketModelProbability: number | null;
   edge: number | null;
+  /** De dónde sale la referencia externa: cuotas, mercado extra o predicción. */
+  comparisonSource?: ComparisonSource | null;
+  /** Rango p10-p90 de Monte Carlo para la selección publicada. */
+  interval?: ProbabilityInterval | null;
   curve: CalibrationPoint[];
   alternatives: MarketOption[];
   scores?: ScoreProbability[];
@@ -102,6 +114,10 @@ export interface DataQuality {
   label: 'Alta' | 'Media' | 'Baja';
   /** 0–1: proporción de estadísticas clave presentes. */
   coverage: number;
+  /** 0–1: cobertura ponderada por observed/projected, no solo presencia. */
+  confidenceCoverage: number;
+  /** 0–1: proporción de estadísticas realmente observadas. */
+  observedShare: number;
   sample: number | null;
   signals: string[];
   caveats: string[];
@@ -125,6 +141,10 @@ export interface TeamModel {
     form: string | null;
   };
   sources: string[];
+  lineupStatus?: string | null;
+  unavailable?: number | null;
+  restDays?: number | null;
+  strengthPpg?: number | null;
 }
 
 export interface MatchSummary {
@@ -141,16 +161,44 @@ export interface MatchSummary {
   isRetrospective: boolean;
 }
 
+export interface LineupInfo {
+  status: string | null;
+  starters: number | null;
+  unavailable: number;
+  averageRating: number | null;
+}
+
+export interface TeamStanding {
+  rank: number | null;
+  points: number | null;
+  played: number | null;
+  ppg: number | null;
+}
+
 export interface MatchContext {
   referee: { name: string; cardsPerMatch: number | null } | null;
-  weather: { description: string | null; temperatureC: number | null; precipitationPct: number | null } | null;
+  weather: {
+    description: string | null;
+    temperatureC: number | null;
+    precipitationPct: number | null;
+    windSpeed: number | null;
+  } | null;
   prediction: {
     model: string | null;
+    confidence: number | null;
     result: { home: number | null; draw: number | null; away: number | null };
     expectedGoals: { home: number | null; away: number | null };
     mostLikelyScore: string | null;
     bttsYes: number | null;
+    overUnder: Array<{ line: number; probability: number | null }>;
+    corners: Array<{ line: number; probability: number | null }>;
   } | null;
+  lineups: {
+    home: LineupInfo | null;
+    away: LineupInfo | null;
+  } | null;
+  rest: { home: number | null; away: number | null } | null;
+  standings: { home: TeamStanding | null; away: TeamStanding | null } | null;
   recentForm: {
     home: { form: string | null; goalsFor: number | null; goalsAgainst: number | null; matches: number | null };
     away: { form: string | null; goalsFor: number | null; goalsAgainst: number | null; matches: number | null };
@@ -159,12 +207,17 @@ export interface MatchContext {
   h2h: { summary: string | null; totalMatches: number | null } | null;
   odds: {
     provider: string | null;
+    providerCount: number | null;
     capturedAt: string | null;
     moneylineNoVig: { home: number; draw: number; away: number } | null;
     totalsLine: number | null;
     totalsOverNoVig: number | null;
     spreadLine: number | null;
+    openTotalLine: number | null;
+    openMoneylineNoVig: { home: number; draw: number; away: number } | null;
+    movement: { home: string | null; draw: string | null; away: string | null } | null;
   } | null;
+  venue: { name: string | null; city: string | null; country: string | null } | null;
   insights: string[];
 }
 
@@ -172,10 +225,58 @@ export interface MarketAnchorMeta {
   applied: boolean;
   /** Peso del mercado en λ (0–1). */
   weight: number;
-  source: 'moneyline+totals' | 'moneyline' | 'totals' | 'none';
+  source: 'moneyline+totals' | 'moneyline+prediction' | 'moneyline' | 'totals' | 'prediction' | 'none';
   marketTotal: number | null;
   marketHome: number | null;
   marketAway: number | null;
+  /** De dónde sale el total de referencia: cuotas o predicción. */
+  totalSource: 'odds' | 'prediction' | 'none';
+}
+
+export interface MarketSignal {
+  openTotalLine: number | null;
+  currentTotalLine: number | null;
+  totalLineDrift: number | null;
+  openMoneylineNoVig: { home: number; draw: number; away: number } | null;
+  currentMoneylineNoVig: { home: number; draw: number; away: number } | null;
+  moneylineDrift: { home: number; draw: number; away: number } | null;
+  movement: { home: string | null; draw: string | null; away: string | null } | null;
+  providerCount: number | null;
+}
+
+export interface ModelAdjustment {
+  key: string;
+  label: string;
+  side: 'home' | 'away' | 'both';
+  /** Cambio porcentual aplicado a λ; negativo reduce los goles esperados. */
+  deltaPct: number;
+  detail: string;
+}
+
+export interface ModelUncertainty {
+  samples: number;
+  /** Desviación lognormal usada para perturbar λ. */
+  sigma: number;
+  lambdas: {
+    home: ProbabilityInterval;
+    away: ProbabilityInterval;
+    total: ProbabilityInterval;
+  };
+  win: {
+    home: ProbabilityInterval;
+    draw: ProbabilityInterval;
+    away: ProbabilityInterval;
+  };
+  totalLine: number | null;
+  total: ProbabilityInterval | null;
+}
+
+export interface LiveMeta {
+  elapsedMinutes: number;
+  remainingShare: number;
+  currentScore: { home: number; away: number };
+  remainingLambdaHome: number;
+  remainingLambdaAway: number;
 }
 
 export interface ModelMeta {
@@ -197,6 +298,10 @@ export interface ModelMeta {
   leagueBaseline: number;
   marketAgreement: number;
   marketAnchor: MarketAnchorMeta;
+  marketSignal: MarketSignal;
+  adjustments: ModelAdjustment[];
+  uncertainty: ModelUncertainty | null;
+  live: LiveMeta | null;
   lambdaSources: string[];
 }
 

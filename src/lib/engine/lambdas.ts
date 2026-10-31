@@ -1,8 +1,15 @@
-import type { AggregatedResponse, PreMatchPayload, PreMatchTeam, TeamPayload } from '../types/api';
-import type { TeamModel } from '../types/analysis';
+import type {
+  AggregatedResponse,
+  PreMatchPayload,
+  PreMatchTeam,
+  RecentFormSplit,
+  TeamPayload,
+} from '../types/api';
+import type { ModelAdjustment, TeamModel } from '../types/analysis';
+import { buildAdjustments, lineupAverageRating, pointsPerMatch } from './adjustments';
 import { leagueBaseline, type LeagueBaseline } from './league';
 import { clamp, round } from './poisson';
-import { statNumber, teamSample } from './quality';
+import { statDetail, statNumber, teamConfidence, teamSample } from './quality';
 
 /**
  * Peso con el que cada fuerza se acerca a 1 (media de liga). Se aplica en
@@ -15,24 +22,42 @@ interface BlendValue {
   usedXg: boolean;
   usedGoals: boolean;
   fallback: boolean;
+  /** 0–1: observed pesa 1, projected 0.65, derivada 0.85. */
+  confidence: number;
 }
 
 function blendAttack(team: TeamPayload | undefined, fallback: number): BlendValue {
-  const xg = statNumber(team, 'xg');
-  const goals = statNumber(team, 'goals_scored');
-  if (xg !== null && goals !== null) return { value: 0.62 * xg + 0.38 * goals, usedXg: true, usedGoals: true, fallback: false };
-  if (xg !== null) return { value: xg, usedXg: true, usedGoals: false, fallback: false };
-  if (goals !== null) return { value: goals, usedXg: false, usedGoals: true, fallback: false };
-  return { value: fallback, usedXg: false, usedGoals: false, fallback: true };
+  const xg = statDetail(team, 'xg');
+  const goals = statDetail(team, 'goals_scored');
+  const wx = xg.value === null ? 0 : 0.62 * xg.confidence;
+  const wg = goals.value === null ? 0 : 0.38 * goals.confidence;
+  if (wx + wg > 0) {
+    return {
+      value: (wx * (xg.value ?? 0) + wg * (goals.value ?? 0)) / (wx + wg),
+      usedXg: xg.value !== null,
+      usedGoals: goals.value !== null,
+      fallback: false,
+      confidence: clamp(wx / 0.62 + wg / 0.38, 0, 1),
+    };
+  }
+  return { value: fallback, usedXg: false, usedGoals: false, fallback: true, confidence: 0 };
 }
 
 function blendDefense(team: TeamPayload | undefined, fallback: number): BlendValue {
-  const xga = statNumber(team, 'xga');
-  const conceded = statNumber(team, 'goals_conceded');
-  if (xga !== null && conceded !== null) return { value: 0.62 * xga + 0.38 * conceded, usedXg: true, usedGoals: true, fallback: false };
-  if (xga !== null) return { value: xga, usedXg: true, usedGoals: false, fallback: false };
-  if (conceded !== null) return { value: conceded, usedXg: false, usedGoals: true, fallback: false };
-  return { value: fallback, usedXg: false, usedGoals: false, fallback: true };
+  const xga = statDetail(team, 'xga');
+  const conceded = statDetail(team, 'goals_conceded');
+  const wx = xga.value === null ? 0 : 0.62 * xga.confidence;
+  const wg = conceded.value === null ? 0 : 0.38 * conceded.confidence;
+  if (wx + wg > 0) {
+    return {
+      value: (wx * (xga.value ?? 0) + wg * (conceded.value ?? 0)) / (wx + wg),
+      usedXg: xga.value !== null,
+      usedGoals: conceded.value !== null,
+      fallback: false,
+      confidence: clamp(wx / 0.62 + wg / 0.38, 0, 1),
+    };
+  }
+  return { value: fallback, usedXg: false, usedGoals: false, fallback: true, confidence: 0 };
 }
 
 interface FormNumbers {
@@ -41,22 +66,45 @@ interface FormNumbers {
   matches: number | null;
   form: string | null;
   source: 'recent_form' | 'form' | null;
+  window: string | null;
 }
 
-function fromRecent(team: PreMatchTeam | undefined, side: 'home' | 'away'): FormNumbers {
-  const empty: FormNumbers = { goalsFor: null, goalsAgainst: null, matches: null, form: null, source: null };
+function splitNumbers(
+  split: RecentFormSplit | null | undefined,
+  label: string,
+  fallbackForm: string | null,
+): FormNumbers | null {
+  if (!split || (split.matches ?? 0) < 3 || split.goals_for === null || split.goals_against === null) return null;
+  const matches = split.matches as number;
+  return {
+    goalsFor: split.goals_for / matches,
+    goalsAgainst: split.goals_against / matches,
+    matches,
+    form: split.form ?? fallbackForm,
+    source: 'recent_form',
+    window: label,
+  };
+}
+
+function fromRecent(
+  team: PreMatchTeam | undefined,
+  side: 'home' | 'away',
+  ownPpg: number | null,
+  opponentPpg: number | null,
+): FormNumbers {
+  const empty: FormNumbers = { goalsFor: null, goalsAgainst: null, matches: null, form: null, source: null, window: null };
   const recent = team?.recent_form;
   if (recent) {
-    const split = side === 'home' ? recent.splits?.home : recent.splits?.away;
-    if (split && (split.matches ?? 0) >= 3 && split.goals_for !== null && split.goals_against !== null) {
-      return {
-        goalsFor: split.goals_for / (split.matches as number),
-        goalsAgainst: split.goals_against / (split.matches as number),
-        matches: split.matches,
-        form: split.form ?? recent.results.form ?? null,
-        source: 'recent_form',
-      };
-    }
+    const stronger = ownPpg !== null && opponentPpg !== null && opponentPpg > ownPpg + 0.15;
+    const weaker = ownPpg !== null && opponentPpg !== null && opponentPpg < ownPpg - 0.15;
+    const preferred = stronger
+      ? splitNumbers(recent.splits?.vs_stronger, 'vs_stronger', recent.results.form)
+      : weaker
+        ? splitNumbers(recent.splits?.vs_weaker, 'vs_weaker', recent.results.form)
+        : null;
+    if (preferred) return preferred;
+    const role = splitNumbers(side === 'home' ? recent.splits?.home : recent.splits?.away, side, recent.results.form);
+    if (role) return role;
     const matches = recent.results.matches ?? recent.matches;
     if (matches && matches >= 5 && recent.results.goals_for !== null && recent.results.goals_against !== null) {
       return {
@@ -65,6 +113,7 @@ function fromRecent(team: PreMatchTeam | undefined, side: 'home' | 'away'): Form
         matches,
         form: recent.results.form ?? null,
         source: 'recent_form',
+        window: 'overall',
       };
     }
   }
@@ -96,6 +145,7 @@ function fromRecent(team: PreMatchTeam | undefined, side: 'home' | 'away'): Form
       matches: parsed.length,
       form: parsed.map((item) => item.result ?? '?').join(''),
       source: 'form',
+      window: 'form',
     };
   }
   return empty;
@@ -136,6 +186,9 @@ export interface LambdaModel {
   caveats: string[];
   predictionBlended: boolean;
   formApplied: boolean;
+  adjustments: ModelAdjustment[];
+  /** Extra de incertidumbre cuando la alineación no está confirmada. */
+  sigmaBoost: number;
 }
 
 export function buildLambdas(response: AggregatedResponse): LambdaModel {
@@ -199,9 +252,17 @@ export function buildLambdas(response: AggregatedResponse): LambdaModel {
     }
   }
 
+  // Ajustes contextuales (alineación, descanso, nivel del rival, clima, h2h).
+  const homePpg = pointsPerMatch(pre?.teams?.home);
+  const awayPpg = pointsPerMatch(pre?.teams?.away);
+  const contextual = buildAdjustments(response, lambdaHome + lambdaAway);
+  lambdaHome *= contextual.home.attack * contextual.away.defense * contextual.total;
+  lambdaAway *= contextual.away.attack * contextual.home.defense * contextual.total;
+  if (contextual.adjustments.length > 0) sources.push('Ajustes contextuales');
+
   // Forma reciente: ataque propio y defensa propia (que afecta al rival).
-  const homeForm = fromRecent(pre?.teams?.home, 'home');
-  const awayForm = fromRecent(pre?.teams?.away, 'away');
+  const homeForm = fromRecent(pre?.teams?.home, 'home', homePpg, awayPpg);
+  const awayForm = fromRecent(pre?.teams?.away, 'away', awayPpg, homePpg);
   let formApplied = false;
 
   if (homeForm.goalsFor !== null) {
@@ -275,6 +336,10 @@ export function buildLambdas(response: AggregatedResponse): LambdaModel {
       formApplied ? 'forma' : null,
       predictionBlended ? 'predicción externa' : null,
     ].filter((item): item is string => Boolean(item)),
+    lineupStatus: pre?.teams?.home?.lineup?.status ?? null,
+    unavailable: pre?.teams?.home?.lineup?.unavailable?.length ?? null,
+    restDays: pre?.teams?.home?.rest_days ?? null,
+    strengthPpg: homePpg,
   };
 
   const awayModel: TeamModel = {
@@ -298,6 +363,10 @@ export function buildLambdas(response: AggregatedResponse): LambdaModel {
       formApplied ? 'forma' : null,
       predictionBlended ? 'predicción externa' : null,
     ].filter((item): item is string => Boolean(item)),
+    lineupStatus: pre?.teams?.away?.lineup?.status ?? null,
+    unavailable: pre?.teams?.away?.lineup?.unavailable?.length ?? null,
+    restDays: pre?.teams?.away?.rest_days ?? null,
+    strengthPpg: awayPpg,
   };
 
   return {
@@ -312,5 +381,7 @@ export function buildLambdas(response: AggregatedResponse): LambdaModel {
     caveats,
     predictionBlended,
     formApplied,
+    adjustments: contextual.adjustments,
+    sigmaBoost: contextual.sigmaBoost,
   };
 }

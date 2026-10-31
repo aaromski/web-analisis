@@ -253,3 +253,87 @@ Criterios (variante anclada): |Δtotal| ≤ 0,20 ✔ (0,18); |sesgo favorito| �
 - La línea recomendada **no** se fuerza a la de mercado: sigue siendo la más ambiciosa que sostiene el umbral. La tarjeta muestra ambas y la probabilidad del modelo en la línea de mercado.
 - Tres partidos detectan sesgos gruesos, no certifican calibración; no hay resultados observados todavía, así que Brier y log-loss quedan vacíos.
 - Sigue pendiente la acción del usuario en Vercel: añadir `STATS_API_BASE_URL` al proyecto web y redesplegar.
+
+## 14. Uso completo de los datos, incertidumbre y modo en vivo (2026-10-30)
+
+**Motivo:** el motor ya estaba anclado al mercado, pero ignoraba parte del contrato
+de la API (estado de cada estadística, alineaciones, descanso, posiciones, clima,
+h2h, mercados extra, apertura/movimiento) y no comunicaba cuánto podía moverse el
+pronóstico. Tampoco analizaba partidos en juego. `MODEL_VERSION` pasa a `1.2.0`.
+
+### 14.1 Cambios
+
+1. **Ponderación por estado y contexto acotado.** `lambdas.ts` usa
+   `observed` = 1, `projected` = 0,65 y derivadas ×0,85 para cada estadística.
+   `adjustments.ts` aplica factores por alineación confirmada (ratings), descanso
+   corto, nivel del rival, clima, temperatura y h2h; cada lado queda en ±15 % y el
+   total en ±10 %, con `model.adjustments` y un caveat por ajuste.
+2. **Forma por rol y nivel.** Se priorizan `splits.vs_stronger/vs_weaker`,
+   `splits.home/away`, el agregado con muestra ≥ 5 y, por último, `form`.
+3. **Ancla ampliada.** `anchor.ts` acepta `predictionTotal` y `predictionWin`
+   cuando no hay cuota (`moneyline+prediction`, `prediction`), publica
+   `totalSource` y escala el peso con la deriva apertura→cierre y el número de
+   casas (`movementWeightScale`). `model.marketSignal` resume el movimiento.
+4. **Valor con mercados extra.** `extra_markets` alimenta doble oportunidad, BTTS
+   y córners (alias sin acentos); si no hay cuota se usa la predicción y se marca
+   `comparisonSource: prediction`. Se corrigió el emparejamiento de la línea de
+   córners: nunca se mezcla una línea de proveedor con la probabilidad de la
+   predicción.
+5. **Incertidumbre.** `uncertainty.ts` hace 240 muestras Monte Carlo
+   (lognormal, semilla fija 20261030) y publica p10–p90 de λ, 1X2 y Over en la
+   línea base; solo se adjunta a los mercados cuyo producto se muestreó.
+6. **Modo en vivo.** `live.ts` estima el minuto desde el inicio, reparte λ
+   restante y `shiftMatrix` desplaza la matriz por el marcador. Se retiran primer
+   gol, HT/FT, córners y combinada; no se aplica el ancla ni se compara con
+   cuotas previas al partido (el motor lo declara en un caveat).
+7. **Backtest y tuning.** `results.ts` carga `data/results.json` (marcadores
+   reales) sin cambiar el estado; `metrics.ts` añade fiabilidad por tramos, ECE e
+   isotónica (PAVA); `scripts/tune.ts` barre el peso del ancla por Brier.
+8. **UI y prompt.** `MarketCard` muestra rango 10–90 y la referencia de valor;
+   `SummaryStrip` añade bandas a λ y 1X2; `ContextPanel` publica alineaciones,
+   descanso, posiciones, apertura/movimiento y sede. `prompt.ts` envía señal,
+   ajustes, incertidumbre, vivo y contexto.
+
+### 14.2 Medición
+
+Mismos tres snapshots; `npm run audit` con los cambios de §14:
+
+| Partido | Total mercado | Motor λ / Δ / MAE / sesgo | Anclado λ / Δ / MAE / sesgo | Peso |
+|---|---|---|---|---|
+| Bayern – Dortmund | 4,07 (línea 3,5) | 3,04 / −1,03 / 4,6 pp / −6,9 pp | 3,92 / −0,15 / 0,8 pp / −0,9 pp | 85 % |
+| Milan – Inter | 3,02 (línea 2,5) | 3,64 / +0,62 / 3,9 pp / +5,8 pp | 3,19 / +0,17 / 1,3 pp / +2,0 pp | 72 % |
+| Liverpool – Arsenal | 2,74 (línea 2,5) | 2,26 / −0,48 / 4,7 pp / +3,9 pp | 2,59 / −0,15 / 1,4 pp / +0,9 pp | 69 % |
+| **Agregado** | — | **|Δ| 0,71 · MAE 4,4 · sesgo 5,6** | **|Δ| 0,16 · MAE 1,2 · sesgo 1,2** | 69–85 % |
+
+Los tres criterios se cumplen en la variante anclada. Cobertura de valor 16/30:
+cuatro mercados con cuotas por partido y BTTS/córners con predicción en Milan y
+Liverpool. Detalle en `docs/MEDICION.md`.
+
+### 14.3 Verificación
+
+- `npm run typecheck` sin errores; `npm test` 57/57 en ~6 s; `npm run build`
+  correcto (`/` estática 59 kB, 162 kB de First Load JS).
+- `npm run audit`: criterios OK (|Δ| 0,16 · sesgo 1,2 pp · MAE 1,2 pp).
+- Producción local en 3300 contra la API desplegada (3100/3000 no se tocaron):
+  `/api/health` 200 `ok:true`; `POST /api/analyze` (Bayern–Dortmund) 200 con
+  `version 1.2.0`, λ 2,73/1,19 (3,92), ancla 85 % `moneyline+totals` con
+  `totalSource: odds`, señal 4,5→3,5, cuatro ajustes (descanso y nivel del rival),
+  banda total 3,16–4,68, resultado 69,2 % con rango 55–79 %, 10 mercados,
+  referencia «Cuotas» en cuatro y combinada 79,0 %; `GET /` 200.
+- Navegador (3300): versión 1.2.0 visible, sin mensajes de consola, banda p10–p90
+  en λ y 1X2, «Rango 10–90» en la tarjeta de resultado, bloques de alineaciones,
+  descanso, posiciones, apertura y sede; sin errores de hidratación.
+- En vivo verificado sobre el fixture real de Bayern con estado `live`, 65 min y
+  1-0 (script temporal, ya eliminado): 7 mercados (sin HT/FT, primer gol,
+  córners), `parlay: null`, `marketAnchor.applied: false`, sin
+  `comparisonSource`/valor, matriz desplazada y λ restantes 0,66/0,30.
+- `../api` intacta; servidor temporal detenido; sin commits, pushes ni despliegues.
+
+### 14.4 Límites y pendientes
+
+- Los intervalos comunican sensibilidad a la entrada, no calibración observada;
+  Brier/ECE reales requieren `data/results.json` con partidos ya jugados.
+- En vivo no hay cuotas condicionadas al marcador en el contrato actual; el motor
+  evita comparar, pero no puede publicar valor en vivo.
+- Sigue pendiente la acción del usuario en Vercel: añadir `STATS_API_BASE_URL` al
+  proyecto web y redesplegar para publicar esta versión.

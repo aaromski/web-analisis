@@ -328,14 +328,25 @@ export interface CornersCalibration {
   selection: 'over' | 'under';
   line: number;
   probability: number;
+  marketProbability: number | null;
+  marketModelProbability: number | null;
+  edge: number | null;
   calibrated: boolean;
   curve: CalibrationPoint[];
   alternatives: MarketOption[];
   explanation: string;
+  note?: string;
   baseLine: number;
 }
 
-export function calibrateCorners(lambdaCorners: number, threshold: number): CornersCalibration {
+export function calibrateCorners(
+  lambdaCorners: number,
+  threshold: number,
+  marketLine: number | null = null,
+  marketOver: number | null = null,
+  marketUnder: number | null = null,
+  comparisonSource: 'odds' | 'prediction' | null = null,
+): CornersCalibration {
   const baseLine = nearestHalfLine(lambdaCorners, CORNER_LINES[0], CORNER_LINES[CORNER_LINES.length - 1]);
   const points = CORNER_LINES.map((line) => ({
     line,
@@ -397,16 +408,38 @@ export function calibrateCorners(lambdaCorners: number, threshold: number): Corn
   }
 
   const sideLabel = selection === 'over' ? 'Over' : 'Under';
+  const marketModelProbability =
+    marketLine === null ? null : selection === 'over' ? poissonOver(lambdaCorners, marketLine) : poissonUnder(lambdaCorners, marketLine);
+  const marketProbability = marketLine === null ? null : selection === 'over' ? marketOver : marketUnder;
+  const edge =
+    marketProbability !== null && marketProbability > 0 && marketModelProbability !== null
+      ? marketModelProbability - marketProbability
+      : null;
+  const notes: string[] = [];
+  if (comparisonSource === 'prediction') {
+    notes.push('La referencia de córners es una predicción externa, no una cuota: el valor es orientativo.');
+  }
+  const value = valueNote(
+    edge,
+    marketModelProbability,
+    marketProbability,
+    marketLine === null ? '' : `la línea ${marketLine.toFixed(1)}`,
+  );
+  if (value) notes.push(value);
   const explanation = `Proyección de ${lambdaCorners.toFixed(1)} córners. Con umbral del ${(threshold * 100).toFixed(0)} %, la línea calibrada es ${sideLabel} ${picked.line.toFixed(1)} (${(probability * 100).toFixed(0)} %).`;
 
   return {
     selection,
     line: picked.line,
     probability,
+    marketProbability,
+    marketModelProbability,
+    edge,
     calibrated,
     curve,
     alternatives,
     explanation,
+    note: notes.length > 0 ? notes.join(' ') : undefined,
     baseLine,
   };
 }

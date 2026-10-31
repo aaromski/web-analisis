@@ -23,11 +23,20 @@ Del bloque opcional `pre_match` se usan:
 
 | Sección | Uso |
 |---|---|
-| `prediction.expected_goals`, `prediction.match_result`, `prediction.over_under` | Contraste y mezcla con el modelo propio. |
+| `prediction.expected_goals`, `prediction.match_result` | Contraste y mezcla con el modelo propio; fallback del ancla. |
+| `prediction.over_under`, `prediction.corners` | Total implícito y línea de córners cuando no hay cuota. |
+| `prediction.btts`, `prediction.confidence` | Referencia de valor y ponderación del contexto. |
 | `odds.moneyline`, `odds.totals`, `odds.spread` | Ancla de λ, probabilidad implícita sin vig y detección de valor. |
-| `teams.*.recent_form` y `teams.*.form` | Ajuste de forma (peso bajo, ventana distinta a la temporada). |
-| `teams.*.lineup.unavailable` / `insights` | Contexto para el prompt de Gemini, no para la matriz. |
-| `h2h` | Contexto para el prompt, no para la matriz. |
+| `odds.open` y `odds.movement` | Deriva de línea apertura→cierre; escala el peso del ancla. |
+| `odds.provider_count` | Consenso entre casas; refuerza el peso del ancla. |
+| `odds.extra_markets` | BTTS, doble oportunidad y córners como fuente de valor. |
+| `teams.*.recent_form` (incluye `splits`) | Forma con ventana por rol y por nivel de rival. |
+| `teams.*.form` | Fallback de forma si `recent_form` no alcanza muestra. |
+| `teams.*.lineup` | Ajuste de λ solo con once confirmado y ratings; si no, incertidumbre. |
+| `teams.*.rest_days` | Penalización por descanso corto. |
+| `teams.*.standings` | Nivel del rival (puntos por partido). |
+| `h2h.aggregate` | Prior de ritmo cuando la muestra propia es corta. |
+| `referee`, `weather`, `venue`, `insights` | Contexto para el prompt y ajuste de clima. |
 
 ## 2. Goles esperados (λ)
 
@@ -41,9 +50,11 @@ defense = 0.62 * xGA      + 0.38 * goals_against
 ```
 
 Si `xg` o `xga` faltan, se usan los goles y se marca una penalización de calidad.
-Las fuerzas se expresan **relativas a la media de la liga** y se combinan de forma
-multiplicativa. Esto evita que un ataque fuerte contra una defensa débil se diluya
-en un promedio aritmético y que la supremacía entre equipos quede comprimida:
+Cada estadística pondera según su estado: `observed` = 1, `projected` = 0.65 y las
+derivadas ×0.85. Las fuerzas se expresan **relativas a la media de la liga** y se
+combinan de forma multiplicativa. Esto evita que un ataque fuerte contra una
+defensa débil se diluya en un promedio aritmético y que la supremacía entre
+equipos quede comprimida:
 
 ```text
 perTeam          = leagueTotal / 2
@@ -82,21 +93,47 @@ corta acerca más las fuerzas a la media de liga y se refleja en los caveats.
 
 ### 2.2 Ajustes posteriores
 
-1. **Forma reciente** (`recent_form` de los últimos 10 partidos o `form` de los
-   últimos 5): se compara la media de goles de la ventana con `perTeam`.
-   - Goles a favor: `λ_propia *= clamp(1 + 0.15 * (ratio - 1), 0.85, 1.15)`.
-   - Goles en contra: `λ_rival *= clamp(1 + 0.10 * (ratio - 1), 0.90, 1.10)`.
-2. **Predicción externa:** si `pre_match.prediction.expected_goals` existe y es
-   positiva, se mezcla un 35 % de la fuente externa (65 % modelo propio / 35 %
-   fuente).
+Antes de la forma y la predicción se aplican **ajustes contextuales acotados**
+(`src/lib/engine/adjustments.ts`). Ninguno domina λ: cada factor se limita a
+±15 % por equipo y ±10 % en el total.
+
+| Ajuste | Regla | Efecto |
+|---|---|---|
+| Alineación confirmada | Rating medio del once 〈 6,6 | Ataque ×(1−penal), defensa ×(1+0,8·penal), penal ≤ 6 %. |
+| Alineación proyectada | Sin ratings suficientes | No toca λ; suma +0,02 a σ. |
+| Descanso | < 3 días / < 4 días | Ataque ×0,97 / ×0,985; defensa ×1,02 / ×1,01. |
+| Nivel del rival | Puntos/partido del rival frente a 1,35 | Ataque ×(1−0,06·s), defensa ×(1+0,05·s), s ∈ [−0,5, 0,5]. |
+| Clima | Lluvia ≥ 60 % o viento ≥ 25 km/h | Total ×0,97. |
+| Temperatura | ≥ 32 °C o ≤ 0 °C | Total ×0,98. |
+| H2H | Muestra propia < 5 y ≥ 3 partidos directos | Total ×clamp(1+0,10·(media/λ−1), 0,94, 1,06). |
+
+Después:
+
+1. **Forma reciente** (`recent_form`, 10 partidos, o `form`, 5): se elige la
+   ventana más representativa:
+   - `splits.vs_stronger` / `vs_weaker` si el rival está a más de 0,15 pts/partido
+     del propio nivel y la muestra es ≥ 3;
+   - si no, `splits.home` / `splits.away` según el rol;
+   - si no, el agregado general con ≥ 5 partidos;
+   - si no, las entradas de `form`.
+
+   Con esa media: goles a favor `λ_propia *= clamp(1 + 0.15 * (ratio - 1), 0.85, 1.15)`
+   y goles en contra `λ_rival *= clamp(1 + 0.10 * (ratio - 1), 0.90, 1.10)`.
+2. **Predicción externa:** si `prediction.expected_goals` existe y es positiva, se
+   mezcla un 35 % de la fuente externa (65 % modelo propio / 35 % fuente).
 3. **Clamp:** cada λ en `[0.15, 4.5]`; el total se reescala a `[0.8, 7.0]`
    conservando la proporción entre equipos.
+
+Los ajustes aplicados viajan en `model.adjustments` (clave, lado, delta % y
+detalle) y el extra de incertidumbre en `model.uncertainty.sigma`.
 
 ### 2.3 Ancla al mercado
 
 Las cuotas son la mejor estimación agregada de goles y supremacía. Después de
 construir λ, el motor calcula una λ de referencia con el mercado y mezcla ambas.
-Solo usa **cuotas reales**: la predicción externa ya entró en §2.2.
+La referencia sigue este orden de prioridad: **cuotas de totales → predicción
+`over_under`**; para la supremacía, **moneyline → `prediction.match_result`**.
+La predicción solo sustituye cuando no hay cuota y pesa menos.
 
 **Total implícito.** A partir de la línea de totales y su probabilidad Over sin
 vig se invierte una Poisson 1D por bisección (60 iteraciones, λ ∈ [0.15, 8]):
@@ -123,22 +160,39 @@ cuadrático del 1X2.
 **Peso del ancla.** El ancla pesa más cuando los datos propios son débiles, cuando
 el modelo se aleja del mercado o cuando el total difiere mucho (una discrepancia
 grande suele ser un problema de escala de promedios de temporada, no información
-nueva):
+nueva). La predicción externa, al no ser una cuota ejecutable, arranca con un peso
+menor y con techo más bajo:
 
 ```text
 gap = clamp((|λ_total - total_mercado| - 0.3) / 0.7, 0, 1) * 0.18
 
-moneyline + totales: w = clamp(0.58 + 0.20*(1-calidad) + 0.10*(1-acuerdo) + gap, 0.50, 0.85)
-solo totales:        w = clamp(0.45 + 0.15*(1-calidad) + 0.6*gap,                  0.40, 0.70)
-solo moneyline:      w = clamp(0.48 + 0.20*(1-calidad) + 0.5*gap,                  0.45, 0.70)
+cuotas:      moneyline + totales: w = clamp(0.58 + 0.20*(1-calidad) + 0.10*(1-acuerdo) + gap,       0.50, 0.85)
+             solo totales:        w = clamp(0.45 + 0.15*(1-calidad) + 0.6*gap,                       0.40, 0.70)
+             solo moneyline:      w = clamp(0.48 + 0.20*(1-calidad) + 0.5*gap,                       0.45, 0.70)
+predicción:  moneyline + total:   w = clamp(0.42 + 0.15*(1-calidad) + 0.08*(1-acuerdo) + 0.7*gap, 0.36, 0.62)
+             solo predicción:     w = clamp(0.30 + 0.12*(1-calidad) + 0.4*gap,                       0.25, 0.50)
+```
+
+**Señal de movimiento.** Si la API expone línea de apertura y cierre (`odds.open`,
+`odds.movement`), la deriva del total y el número de casas escalan el peso final.
+Una línea que se mueve hacia más goles con consenso amplio refuerza la referencia;
+sin datos de apertura la escala es 1 y el ancla no cambia:
+
+```text
+deriva  = |línea_cierre - línea_apertura|
+escala  = clamp(1 + clamp(deriva * 0.12, 0, 0.10) + (casas ≥ 3 ? 0.05 : 0), 0.95, 1.12)
+w       = clamp(w * escala, 0.25, 0.85)
 ```
 
 La λ final es `(1 - w) * λ_modelo + w * λ_mercado`, reescalada y redondeada a dos
-decimales. Si no hay cuotas válidas, el ancla no se aplica (`applied: false`).
+decimales. Si no hay cuotas ni predicción válidas, el ancla no se aplica
+(`applied: false`).
 
 El motor publica `model.marketAnchor` con `applied`, `weight`, `source`
-(`moneyline+totals`, `moneyline`, `totals`, `none`), `marketTotal`, `marketHome` y
-`marketAway`, además de una entrada en `sources` y un caveat con el peso aplicado.
+(`moneyline+totals`, `moneyline+prediction`, `moneyline`, `totals`, `prediction`,
+`none`), `totalSource` (`odds`, `prediction`, `none`), `marketTotal`, `marketHome`
+y `marketAway`, además de una entrada en `sources` y un caveat con el peso
+aplicado. `model.marketSignal` resume apertura, cierre, deriva y número de casas.
 
 Las λ finales se publican en `lambdas.home/away/total`, la procedencia en
 `sources`/`blend` y las advertencias en `caveats`.
@@ -214,8 +268,11 @@ tau = clamp(base + 0.08 * (1 - calidad) + 0.02 * desacuerdo, base - 0.06, base +
 ### Córners (extendido)
 
 Poisson sobre `λ_corners = corners_local + corners_visitante`; mismas reglas de
-Over/Under con líneas `6.5 … 14.5`. Se publica como mercado extendido, separado
-de los nueve mercados objetivo.
+Over/Under con líneas `6.5 … 14.5`. La referencia de valor sigue el mismo orden
+que en goles: cuotas extra de córners (`odds.extra_markets`) → línea de córners
+del proveedor → `prediction.corners`. Cuando la referencia es una predicción, la
+nota del mercado avisa de que el valor es orientativo. Se publica como mercado
+extendido, separado de los nueve mercados objetivo.
 
 ### Valor en la línea de mercado
 
@@ -231,33 +288,86 @@ edge              = modelo_en_linea - p_mercado
 - En totales se usa Over o Under de la línea de mercado según el lado elegido.
 - En hándicap se usa la línea del favorito (la del mercado se refleja de signo si
   el favorito es el visitante).
+- En doble oportunidad y BTTS se usan primero los mercados extra
+  (`odds.extra_markets`, con alias sin acentos ni mayúsculas); si no hay cuota,
+  se cae a `prediction.match_result` / `prediction.btts`. La comparación se
+  etiqueta con `comparisonSource`: `odds`, `extra_market` o `prediction`, y la UI
+  muestra «Referencia cuotas / cuotas extra / predicción externa».
 - `marketModelProbability` y `marketProbability` viajan en el mercado; la UI
   muestra «Modelo en mercado X%».
 - La nota de valor se emite a partir de ±3 puntos: «Valor en…», «Sin valor en…» o
   «Modelo y mercado alineados…». Si la línea recomendada está a más de 0.5 de la
   de mercado, se añade una nota con la distancia.
 
-## 5. Mercados publicados
+## 5. Incertidumbre del pronóstico
 
-| Mercado | Cálculo | Línea dinámica |
-|---|---|---|
-| Resultado (1X2) | Suma de celdas por signo | No |
-| Doble oportunidad | Suma de dos signos | No |
-| Altas/Bajas | `P(total > L)` / `P(total < L)` | Sí |
-| Hándicap | `P(margen + L > 0)` con push | Sí |
-| Anota primero | Procesos de Poisson: `λh/(λh+λa)·(1-e^-Λ)` | No |
-| Par/Impar | Suma de celdas por paridad | No |
-| HT/FT | Matriz conjunta por mitades | No |
-| Marcador exacto | Top 6 celdas | No |
-| BTTS | `1 - P(0,·) - P(·,0) + P(0,0)` | No |
-| Córners (extendido) | Poisson 1D sobre λ de córners | Sí |
+Un único par de λ oculta cuánto depende el resultado de datos imperfectos. El motor
+lo comunica con un Monte Carlo determinista (`src/lib/engine/uncertainty.ts`):
+240 muestras de λ en escala lognormal con semilla fija (mulberry32 + Box-Muller),
+de modo que dos análisis idénticos producen los mismos intervalos.
+
+```text
+σ        = clamp(0.10 + 0.20*(1-calidad) + extra_alineación, 0.08, 0.40)
+λ_muestra = clamp(λ * exp(σ * z), 0.1, 5)
+```
+
+`extra_alineación` vale +0,02 cuando el once es proyectado y no confirmado. Con
+cada muestra se reconstruye la matriz Dixon-Coles y se recalculan las
+probabilidades. Se publican los percentiles 10 y 90 de:
+
+- `lambdas.home`, `lambdas.away`, `lambdas.total`;
+- `win.home`, `win.draw`, `win.away`;
+- `total` (Over en la línea base del partido).
+
+Los intervalos viajan en `model.uncertainty`; la UI muestra «Rango 10–90» en el
+mercado de resultado y en totales solo cuando la línea recomendada coincide con la
+línea base, y una banda en el resumen de λ y del 1X2. No se publican intervalos
+para productos que el Monte Carlo no muestrea (hándicap, doble oportunidad, BTTS,
+marcador exacto, córners) ni para partidos en vivo.
+
+## 6. Partido en vivo
+
+Si la API marca el partido como `live`, el motor no analiza el partido completo
+sino los goles que quedan por jugar (`src/lib/engine/live.ts`):
+
+```text
+transcurrido = clamp(ahora - inicio, 0, 120)      (45 min si falta la hora)
+reparto      = clamp((95 - transcurrido) / 95, 0.02, 1)
+λ_restante   = λ_modelo * reparto
+```
+
+La matriz se desplaza por el marcador actual (`shiftMatrix`), así que las celdas
+representan el marcador **final** y los mercados se recalculan sobre ese espacio.
+En vivo se mantienen resultado, doble oportunidad, totales, hándicap, par/impar,
+BTTS y marcador exacto; se retiran primer gol, HT/FT, córners y combinada —que
+dependen de tramos ya jugados o de mercados ausentes— y no se aplica el ancla: las
+cuotas en vivo describen el resultado condicionado al marcador, no el total previo.
+
+`model.live` publica `elapsedMinutes`, `remainingShare`, `currentScore` y las λ
+restantes, y un caveat resume el minuto y el marcador usados.
+
+## 7. Mercados publicados
+
+| Mercado | Cálculo | Línea dinámica | En vivo |
+|---|---|---|---|
+| Resultado (1X2) | Suma de celdas por signo | No | Sí |
+| Doble oportunidad | Suma de dos signos | No | Sí |
+| Altas/Bajas | `P(total > L)` / `P(total < L)` | Sí | Sí |
+| Hándicap | `P(margen + L > 0)` con push | Sí | Sí |
+| Anota primero | Procesos de Poisson: `λh/(λh+λa)·(1-e^-Λ)` | No | No |
+| Par/Impar | Suma de celdas por paridad | No | Sí |
+| HT/FT | Matriz conjunta por mitades | No | No |
+| Marcador exacto | Top 6 celdas | No | Sí |
+| BTTS | `1 - P(0,·) - P(·,0) + P(0,0)` | No | Sí |
+| Córners (extendido) | Poisson 1D sobre λ de córners | Sí | No |
 
 Cada mercado devuelve: selección, línea (si aplica), probabilidad, línea base,
 línea de mercado, probabilidad del modelo en la línea de mercado, cuota justa
-(`1/p`), umbral, riesgo, confianza 0-100, valor frente al mercado (si hay cuota),
-curva de calibración y una explicación corta en español.
+(`1/p`), umbral, riesgo, confianza 0-100, valor frente al mercado (si hay
+referencia), `comparisonSource`, intervalo p10–p90 (cuando aplica), curva de
+calibración y una explicación corta en español.
 
-## 6. Confianza y riesgo
+## 8. Confianza y riesgo
 
 - **Probabilidad** = probabilidad del resultado recomendado, no del mercado entero.
 - **Confianza 0-100** = 70 % probabilidad + 18 % calidad de datos + 12 % acuerdo
@@ -269,7 +379,7 @@ curva de calibración y una explicación corta en español.
   cuando la API publica cuota; nunca se inventa una cuota. Los mercados sin cuota
   comparable no publican valor.
 
-## 7. Combinada
+## 9. Combinada
 
 Se eligen hasta 3 selecciones con probabilidad ≥ 0.66 y ≤ 0.93, sin repetir
 mercado ni anidar selecciones (una pata que implique a otra no aporta valor).
@@ -278,36 +388,50 @@ cumplen todas las condiciones**, no multiplicando. Si la conjunta cae por debajo
 de 0.45, se recorta a 2 selecciones. Se publica probabilidad conjunta, cuota
 justa y una advertencia de correlación.
 
-## 8. Prompt de Gemini
+## 10. Prompt de Gemini
 
 `src/lib/prompt.ts` construye un JSON compacto con: partido, calidad y cobertura,
-λ y blend, umbrales por mercado, ancla de mercado, mercados recomendados, curvas
-de calibración, combinada, cuotas y caveats. Gemini recibe instrucciones de:
+λ y blend, umbrales por mercado, ancla de mercado, señal de movimiento, ajustes
+contextuales, incertidumbre, estado en vivo, alineaciones y descanso, posiciones,
+sede y clima, mercados recomendados (con `referencia` e `intervalo_p10_p90`),
+curvas de calibración, combinada, cuotas y caveats. Gemini recibe instrucciones de:
 
 - usar solo los datos del JSON y no inventar estadísticas;
 - explicar la lectura del partido y por qué la línea elegida es la óptima;
 - citar el valor en puntos porcentuales y aclarar que se mide en la línea de
   mercado;
 - explicar si el ancla de mercado se aplicó y con qué peso;
-- proponer una combinada coherente con las probabilidades;
+- tratar el rango 10–90 como banda de incertidumbre, no como promesa;
+- explicar qué ajustes contextuales (bajas, descanso, rival, clima, h2h) movieron λ;
+- si el partido está en vivo, razonar sobre los goles restantes y el marcador;
+- distinguir una referencia de cuotas de una predicción externa;
+- proponer una combinada coherente con las probabilidades (salvo en vivo);
 - responder en español, en markdown, con una advertencia de juego responsable;
 - no prometer resultados ni presentar probabilidades como certezas.
 
 El reporte se muestra tal cual (markdown saneado por `react-markdown`), con estado
 de carga, error y reintento. La clave `GEMINI_API_KEY` solo existe en el servidor.
 
-## 9. Arnés de medición
+## 11. Arnés de medición
 
-`scripts/snapshot.ts` y `scripts/measure.ts` permiten congelar respuestas de la
-API y medir el motor contra el mercado sin tocar la UI:
+`scripts/snapshot.ts`, `scripts/measure.ts` y `scripts/tune.ts` permiten congelar
+respuestas de la API y medir el motor contra el mercado sin tocar la UI:
 
 ```text
 npm run snapshot -- --home Bayern --away Dortmund --league ger.1 --date 2026-11-01
 npm run audit
+npm run tune
 ```
 
-`npm run audit` evalúa dos variantes sobre los snapshots de
-`data/snapshots/`: **motor** (λ sin ancla) y **anclado** (λ final). Compara 1X2
-con el mercado sin vig y el total con el implícito, y verifica los criterios
-(|Δtotal| ≤ 0,30, sesgo del favorito ≤ 3 pp, MAE 1X2 ≤ 4 pp). Los detalles,
-métricas y resultados vigentes están en `docs/MEDICION.md`.
+`npm run audit` evalúa dos variantes sobre los snapshots de `data/snapshots/`:
+**motor** (λ sin ancla) y **anclado** (λ final). Compara 1X2 con el mercado sin
+vig y el total con el implícito, y verifica los criterios (|Δtotal| ≤ 0,30, sesgo
+del favorito ≤ 3 pp, MAE 1X2 ≤ 4 pp). Si existe `data/results.json` con
+marcadores reales, añade Brier, fiabilidad por tramos, ECE e isotónica; la
+isotónica se ajusta solo con muestras disponibles y nunca inventa resultados.
+
+`npm run tune` recorre escalas de peso del ancla (0,80…1,20 en pasos de 0,05) sobre
+la variante anclada, ordena por Brier medio y guarda el resultado en
+`data/tuning.json`; con menos de 20 partidos avisa de que la muestra no es
+concluyente. Los detalles, métricas y resultados vigentes están en
+`docs/MEDICION.md`.

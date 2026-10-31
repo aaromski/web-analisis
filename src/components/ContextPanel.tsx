@@ -1,11 +1,53 @@
 'use client';
 
-import type { DataQuality, MatchContext } from '@/lib/types/analysis';
+import type { DataQuality, LineupInfo, MatchContext, TeamStanding } from '@/lib/types/analysis';
 import { formatLine, formatPct } from '@/lib/ui/format';
 
 interface Props {
   context: MatchContext;
   quality: DataQuality;
+}
+
+const MOVEMENT_LABEL: Record<string, string> = {
+  shortening: 'baja',
+  drifting: 'sube',
+  stable: 'estable',
+};
+
+function LineupRow({ label, lineup, rest }: { label: string; lineup: LineupInfo | null; rest: number | null }) {
+  if (!lineup && rest === null) return null;
+  return (
+    <div className="context-line">
+      <span>{label}</span>
+      <strong>
+        {lineup
+          ? [
+              lineup.status ?? 'sin estado',
+              lineup.starters !== null ? `${lineup.starters} titulares` : null,
+              lineup.unavailable > 0 ? `${lineup.unavailable} baja${lineup.unavailable === 1 ? '' : 's'}` : null,
+              lineup.averageRating !== null ? `rating ${formatLine(lineup.averageRating)}` : null,
+            ]
+              .filter(Boolean)
+              .join(' · ')
+          : 'Sin alineación'}
+        {rest !== null ? ` · ${rest} d descanso` : ''}
+      </strong>
+    </div>
+  );
+}
+
+function StandingRow({ label, standing }: { label: string; standing: TeamStanding | null }) {
+  if (!standing) return null;
+  return (
+    <div className="context-line">
+      <span>{label}</span>
+      <strong>
+        {standing.rank !== null ? `${standing.rank}.º` : '—'}
+        {standing.ppg !== null ? ` · ${formatLine(standing.ppg)} pts/partido` : ''}
+        {standing.played !== null ? ` · ${standing.played} jugados` : ''}
+      </strong>
+    </div>
+  );
 }
 
 function FormChips({ form }: { form: string | null }) {
@@ -22,7 +64,8 @@ function FormChips({ form }: { form: string | null }) {
 }
 
 export default function ContextPanel({ context, quality }: Props) {
-  const { prediction, recentForm, h2h, injuries, odds, referee, weather, insights } = context;
+  const { prediction, recentForm, h2h, injuries, odds, referee, weather, insights, lineups, rest, standings, venue } =
+    context;
 
   return (
     <aside className="context-card" id="contexto" aria-labelledby="contexto-title">
@@ -70,9 +113,25 @@ export default function ContextPanel({ context, quality }: Props) {
         )}
       </div>
 
+      {lineups || rest ? (
+        <div className="context-block">
+          <h3>Alineaciones y descanso</h3>
+          <LineupRow label="Local" lineup={lineups?.home ?? null} rest={rest?.home ?? null} />
+          <LineupRow label="Visitante" lineup={lineups?.away ?? null} rest={rest?.away ?? null} />
+          {!lineups ? <p className="context-empty">Sin alineaciones publicadas.</p> : null}
+        </div>
+      ) : null}
+
+      {standings ? (
+        <div className="context-block">
+          <h3>Posiciones</h3>
+          <StandingRow label="Local" standing={standings.home} />
+          <StandingRow label="Visitante" standing={standings.away} />
+        </div>
+      ) : null}
+
       <div className="context-block">
-        <h3>Forma reciente</h3>
-        {recentForm ? (
+        <h3>Forma reciente</h3>        {recentForm ? (
           <>
             <div className="context-line">
               <span>Local</span>
@@ -159,9 +218,35 @@ export default function ContextPanel({ context, quality }: Props) {
                 <strong>{formatLine(odds.spreadLine)}</strong>
               </div>
             ) : null}
+            {odds.openTotalLine !== null ? (
+              <div className="context-line">
+                <span>Apertura</span>
+                <strong>
+                  Línea {formatLine(odds.openTotalLine)}
+                  {odds.openMoneylineNoVig
+                    ? ` · ${formatPct(odds.openMoneylineNoVig.home, 0)} / ${formatPct(odds.openMoneylineNoVig.draw, 0)} / ${formatPct(odds.openMoneylineNoVig.away, 0)}`
+                    : ''}
+                </strong>
+              </div>
+            ) : null}
+            {odds.movement && (odds.movement.home || odds.movement.draw || odds.movement.away) ? (
+              <div className="context-line">
+                <span>Movimiento</span>
+                <strong>
+                  {(['home', 'draw', 'away'] as const)
+                    .map((side) => {
+                      const value = odds.movement?.[side];
+                      return value ? MOVEMENT_LABEL[value] ?? value : null;
+                    })
+                    .filter(Boolean)
+                    .join(' · ')}
+                </strong>
+              </div>
+            ) : null}
             {odds.provider ? (
               <p className="context-empty" style={{ marginTop: '6px' }}>
                 Fuente {odds.provider}
+                {odds.providerCount !== null ? ` · ${odds.providerCount} casas` : ''}
               </p>
             ) : null}
           </>
@@ -170,9 +255,15 @@ export default function ContextPanel({ context, quality }: Props) {
         )}
       </div>
 
-      {(referee || weather) && (
+      {(referee || weather || venue) && (
         <div className="context-block">
-          <h3>Árbitro y clima</h3>
+          <h3>Árbitro, clima y sede</h3>
+          {venue?.name || venue?.city ? (
+            <div className="context-line">
+              <span>{venue?.name ?? 'Sede'}</span>
+              <strong>{[venue?.city, venue?.country].filter(Boolean).join(', ') || '—'}</strong>
+            </div>
+          ) : null}
           {referee ? (
             <div className="context-line">
               <span>{referee.name}</span>
@@ -185,6 +276,7 @@ export default function ContextPanel({ context, quality }: Props) {
               <strong>
                 {weather.temperatureC !== null ? `${weather.temperatureC} °C` : '—'}
                 {weather.precipitationPct !== null ? ` · ${weather.precipitationPct} % lluvia` : ''}
+                {weather.windSpeed !== null && weather.windSpeed >= 20 ? ` · viento ${weather.windSpeed} km/h` : ''}
               </strong>
             </div>
           ) : null}

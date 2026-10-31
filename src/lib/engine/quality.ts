@@ -1,6 +1,15 @@
-import type { AggregatedResponse, CanonicalStat, TeamPayload } from '../types/api';
+import type { AggregatedResponse, CanonicalStat, StatStatus, TeamPayload } from '../types/api';
 import type { DataQuality } from '../types/analysis';
 import { clamp } from './poisson';
+
+export interface StatDetail {
+  value: number | null;
+  /** 0–1: observed=1, projected=0.65, missing=0; derivada resta 15 %. */
+  confidence: number;
+  status: StatStatus;
+  source: string | null;
+  derived: boolean;
+}
 
 export const KEY_STATS = [
   'xg',
@@ -13,11 +22,37 @@ export const KEY_STATS = [
   'possession_pct',
 ] as const;
 
-export function statNumber(team: TeamPayload | undefined, key: string): number | null {
+export function statDetail(team: TeamPayload | undefined, key: string): StatDetail {
   const stat: CanonicalStat | undefined = team?.stats?.[key];
-  if (!stat || stat.status === 'missing') return null;
-  if (typeof stat.value !== 'number' || !Number.isFinite(stat.value)) return null;
-  return stat.value;
+  if (!stat || stat.status === 'missing') {
+    return { value: null, confidence: 0, status: 'missing', source: stat?.source ?? null, derived: Boolean(stat?.derived) };
+  }
+  if (typeof stat.value !== 'number' || !Number.isFinite(stat.value)) {
+    return { value: null, confidence: 0, status: stat.status, source: stat.source ?? null, derived: Boolean(stat.derived) };
+  }
+  const base = stat.status === 'observed' ? 1 : stat.status === 'projected' ? 0.65 : 0;
+  return {
+    value: stat.value,
+    confidence: base * (stat.derived ? 0.85 : 1),
+    status: stat.status,
+    source: stat.source ?? null,
+    derived: Boolean(stat.derived),
+  };
+}
+
+export function statNumber(team: TeamPayload | undefined, key: string): number | null {
+  return statDetail(team, key).value;
+}
+
+export function teamConfidence(team: TeamPayload | undefined): { confidence: number; observedShare: number } {
+  let confidence = 0;
+  let observed = 0;
+  for (const key of KEY_STATS) {
+    const detail = statDetail(team, key);
+    confidence += detail.confidence;
+    if (detail.status === 'observed') observed += 1;
+  }
+  return { confidence: confidence / KEY_STATS.length, observedShare: observed / KEY_STATS.length };
 }
 
 export function teamSample(team: TeamPayload | undefined): number | null {
@@ -33,12 +68,20 @@ export function assessQuality(response: AggregatedResponse): DataQuality {
   const home = response.teams?.home;
   const away = response.teams?.away;
   let presentCount = 0;
+  let confidenceSum = 0;
+  let observedCount = 0;
   for (const key of KEY_STATS) {
-    if (present(home, key)) presentCount += 1;
-    if (present(away, key)) presentCount += 1;
+    for (const team of [home, away]) {
+      if (present(team, key)) presentCount += 1;
+      const detail = statDetail(team, key);
+      confidenceSum += detail.confidence;
+      if (detail.status === 'observed') observedCount += 1;
+    }
   }
   const total = KEY_STATS.length * 2;
   const coverage = presentCount / total;
+  const confidenceCoverage = confidenceSum / total;
+  const observedShare = observedCount / total;
 
   const homeSample = teamSample(home);
   const awaySample = teamSample(away);
@@ -58,7 +101,7 @@ export function assessQuality(response: AggregatedResponse): DataQuality {
   );
 
   const score = clamp(
-    0.45 * coverage +
+    0.45 * confidenceCoverage +
       0.25 * sampleScore +
       0.15 * (hasPrediction ? 1 : 0) +
       0.1 * (odds ? 1 : 0) +
@@ -69,6 +112,7 @@ export function assessQuality(response: AggregatedResponse): DataQuality {
 
   const signals: string[] = [
     `${presentCount}/${total} estadísticas clave disponibles`,
+    `Estadísticas observadas: ${Math.round(observedShare * 100)} %`,
     sample !== null ? `Muestra de ${sample} partido${sample === 1 ? '' : 's'}` : 'Muestra no declarada',
   ];
   if (hasPrediction) signals.push('Predicción externa disponible');
@@ -80,6 +124,9 @@ export function assessQuality(response: AggregatedResponse): DataQuality {
 
   const caveats: string[] = [];
   if (coverage < 0.5) caveats.push('Cobertura de estadísticas baja: las probabilidades descansan en medias de liga.');
+  if (confidenceCoverage < coverage - 0.15) {
+    caveats.push('Parte de las estadísticas son proyectadas, no observadas: la confianza se reduce.');
+  }
   if (sample !== null && sample < 5) caveats.push(`Muestra corta (${sample} partidos): mayor incertidumbre en las tasas.`);
   if (!hasPrediction) caveats.push('Sin predicción externa para contrastar el modelo.');
   if (!odds) caveats.push('Sin cuotas: no se puede medir valor frente al mercado.');
@@ -100,6 +147,8 @@ export function assessQuality(response: AggregatedResponse): DataQuality {
     score,
     label,
     coverage,
+    confidenceCoverage,
+    observedShare,
     sample,
     signals,
     caveats,

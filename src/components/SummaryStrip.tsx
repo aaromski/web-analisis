@@ -14,6 +14,14 @@ function roundedPercent(value: number): string {
 export default function SummaryStrip({ analysis }: Props) {
   const { lambdas, winProbabilities, dataQuality, model } = analysis;
   const tone = qualityTone(dataQuality.score);
+  const uncertainty = model.uncertainty;
+  const topSide =
+    winProbabilities.home >= winProbabilities.draw && winProbabilities.home >= winProbabilities.away
+      ? 'home'
+      : winProbabilities.away >= winProbabilities.draw
+        ? 'away'
+        : 'draw';
+  const topBand = uncertainty?.win[topSide] ?? null;
 
   return (
     <section className="summary-strip" aria-label="Resumen del modelo">
@@ -22,7 +30,12 @@ export default function SummaryStrip({ analysis }: Props) {
         <span className="metric-value">
           {formatLine(lambdas.home)} – {formatLine(lambdas.away)}
         </span>
-        <span className="metric-sub">Total {formatLine(lambdas.total)}</span>
+        <span className="metric-sub">
+          Total {formatLine(lambdas.total)}
+          {uncertainty
+            ? ` · p10–p90 ${formatLine(uncertainty.lambdas.total.low)}–${formatLine(uncertainty.lambdas.total.high)}`
+            : ''}
+        </span>
       </div>
 
       <div className="metric">
@@ -31,7 +44,10 @@ export default function SummaryStrip({ analysis }: Props) {
           {roundedPercent(winProbabilities.home)} / {roundedPercent(winProbabilities.draw)} /{' '}
           {roundedPercent(winProbabilities.away)} %
         </span>
-        <span className="metric-sub">Local · Empate · Visitante</span>
+        <span className="metric-sub">
+          Local · Empate · Visitante
+          {topBand ? ` · banda ${formatPct(topBand.low, 0)}–${formatPct(topBand.high, 0)}` : ''}
+        </span>
       </div>
 
       <div className="metric">

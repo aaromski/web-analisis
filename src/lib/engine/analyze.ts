@@ -1,11 +1,12 @@
 import type { AggregatedResponse } from '../types/api';
 import type {
   AnalysisResult,
+  ComparisonSource,
   MarketKey,
   MarketOption,
   MarketResult,
 } from '../types/analysis';
-import { anchorLambdas } from './anchor';
+import { anchorLambdas, impliedTotalFromOver } from './anchor';
 import {
   confidenceThreshold,
   computeConfidence,
@@ -27,11 +28,17 @@ import {
   resultOutcomes,
 } from './markets';
 import {
-  extractCornersLine,
+  EMPTY_MARKET_SIGNAL,
+  buildMarketSignal,
+  extraCornersMarket,
+  extraMarketProbability,
+  extractExtraMarkets,
   extractSpreadMarket,
   extractTotalsMarket,
   extractWinMarket,
   modelAgreement,
+  movementWeightScale,
+  pickBalancedLine,
 } from './odds';
 import { buildParlay, type ParlayCandidate } from './parlay';
 import {
@@ -40,10 +47,13 @@ import {
   exactScores,
   oddTotal,
   round,
+  shiftMatrix,
 } from './poisson';
 import { assessQuality, statNumber } from './quality';
+import { buildLiveMeta } from './live';
+import { buildUncertainty } from './uncertainty';
 
-export const MODEL_VERSION = '1.1.0';
+export const MODEL_VERSION = '1.2.0';
 export const RHO = -0.1;
 export const MAX_GOALS = 12;
 
@@ -73,6 +83,7 @@ interface MarketCore {
   marketProbability?: number | null;
   marketModelProbability?: number | null;
   edge?: number | null;
+  comparisonSource?: ComparisonSource | null;
   curve?: MarketResult['curve'];
   alternatives?: MarketOption[];
   scores?: MarketResult['scores'];
@@ -158,13 +169,10 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
     throw new AnalysisError('MISSING_TEAMS', 'La API no devolvió los nombres de ambos equipos.');
   }
 
-  if (response.match.status === 'finished' || response.match.status === 'live') {
-    const finished = response.match.status === 'finished';
+  if (response.match.status === 'finished') {
     throw new AnalysisError(
       'MATCH_NOT_PROJECTABLE',
-      finished
-        ? 'El partido ya finalizó. El motor calibra líneas antes del inicio; elige un partido programado.'
-        : 'El partido está en juego. El motor calibra líneas antes del inicio; elige un partido programado.',
+      'El partido ya finalizó. El motor calibra líneas antes del inicio; elige un partido programado o en juego.',
       {
         status: response.match.status,
         score: response.match.score,
@@ -175,6 +183,9 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
     );
   }
 
+  const matchStatus = normalizeStatus(response.match.status);
+  const isLive = matchStatus === 'live';
+
   const pre = response.pre_match ?? null;
   const homeName = response.teams.home.name;
   const awayName = response.teams.away.name;
@@ -182,9 +193,21 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
   const lambdas = buildLambdas(response);
   const quality = assessQuality(response);
   const winMarket = extractWinMarket(pre);
-  const oddsWin = winMarket?.source === 'odds' ? winMarket : null;
-  const totalsMarket = extractTotalsMarket(pre);
-  const spreadMarket = extractSpreadMarket(pre);
+  // En vivo las cuotas son previas al partido y no condicionan al marcador
+  // actual: no sirven como referencia de valor.
+  const oddsWin = !isLive && winMarket?.source === 'odds' ? winMarket : null;
+  const predictionWin = !isLive && winMarket?.source === 'prediction' ? winMarket : null;
+  const totalsMarket = isLive ? { line: null, over: null, under: null } : extractTotalsMarket(pre);
+  const spreadMarket = isLive ? { line: null, home: null, away: null } : extractSpreadMarket(pre);
+  const extraMarkets = isLive ? [] : extractExtraMarkets(pre);
+  const signal = isLive ? null : buildMarketSignal(pre);
+
+  // Sin cuotas de totales, la predicción externa aporta la escala de goles.
+  const predictionLines = pickBalancedLine(pre?.prediction?.over_under);
+  const predictionTotal =
+    predictionLines && predictionLines.probability !== null
+      ? impliedTotalFromOver(predictionLines.line, predictionLines.probability)
+      : null;
 
   let matrix = buildScoreMatrix(lambdas.lambdaHome, lambdas.lambdaAway, {
     rho: RHO,
@@ -193,16 +216,34 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
   let win = resultOutcomes(matrix);
 
   // Ancla al mercado: corrige la compresión de la supremacía y fija la escala
-  // de goles con la expectativa agregada de las cuotas.
-  const agreement = modelAgreement(win, winMarket);
-  const anchor = anchorLambdas({
-    lambdaHome: lambdas.lambdaHome,
-    lambdaAway: lambdas.lambdaAway,
-    winMarket: oddsWin,
-    totalsMarket,
-    quality: quality.score,
-    agreement,
-  });
+  // de goles con la expectativa agregada de las cuotas. En vivo se omite: las
+  // cuotas de un partido en juego no describen el partido completo.
+  const agreement = isLive ? 0.5 : modelAgreement(win, winMarket);
+  const comparisonWin = isLive ? null : winMarket;
+  const anchor = isLive
+    ? {
+        lambdaHome: lambdas.lambdaHome,
+        lambdaAway: lambdas.lambdaAway,
+        applied: false,
+        weight: 0,
+        source: 'none' as const,
+        marketTotal: null,
+        marketHome: null,
+        marketAway: null,
+        totalSource: 'none' as const,
+        note: null,
+      }
+    : anchorLambdas({
+        lambdaHome: lambdas.lambdaHome,
+        lambdaAway: lambdas.lambdaAway,
+        winMarket: oddsWin,
+        totalsMarket,
+        predictionTotal,
+        predictionWin,
+        quality: quality.score,
+        agreement,
+        weightScale: movementWeightScale(signal),
+      });
   if (anchor.applied) {
     lambdas.lambdaHome = anchor.lambdaHome;
     lambdas.lambdaAway = anchor.lambdaAway;
@@ -211,11 +252,35 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
     lambdas.away.lambda = anchor.lambdaAway;
     lambdas.sources.push('Ancla de mercado');
     if (anchor.note) lambdas.caveats.push(anchor.note);
+    if (anchor.totalSource === 'prediction' || anchor.source === 'prediction' || anchor.source === 'moneyline+prediction') {
+      lambdas.caveats.push(
+        'La referencia del ancla es la predicción externa, no cuotas: λ hereda su incertidumbre.',
+      );
+    }
     matrix = buildScoreMatrix(lambdas.lambdaHome, lambdas.lambdaAway, {
       rho: RHO,
       maxGoals: MAX_GOALS,
     });
     win = resultOutcomes(matrix);
+  }
+
+  // Modo en vivo: se proyecta solo el tiempo restante sobre el marcador actual.
+  const live = isLive ? buildLiveMeta(response, lambdas.lambdaHome, lambdas.lambdaAway) : null;
+  if (live) {
+    matrix = shiftMatrix(
+      buildScoreMatrix(live.remainingLambdaHome, live.remainingLambdaAway, {
+        rho: RHO,
+        maxGoals: MAX_GOALS,
+      }),
+      live.currentScore.home,
+      live.currentScore.away,
+    );
+    win = resultOutcomes(matrix);
+    lambdas.sources.push('Modo en vivo');
+    lambdas.caveats.push(
+      `Partido en juego (~${live.elapsedMinutes} min): se proyecta el ${Math.round(live.remainingShare * 100)} % restante con marcador ${live.currentScore.home}-${live.currentScore.away}.`,
+    );
+    lambdas.caveats.push('En vivo no se compara el modelo con cuotas previas al partido.');
   }
 
   const threshold = confidenceThreshold(quality.score, lambdas.lambdaTotal, totalsMarket.line);
@@ -256,9 +321,9 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
   const resultPick = maxBy(resultOptions, (option) => option.probability);
   const resultExplanation =
     `${homeName} gana en ${pct(win.home)} de los escenarios, el empate en ${pct(win.draw)} y ${awayName} en ${pct(win.away)}.` +
-    (winMarket
-      ? ` La referencia ${winMarket.source === 'odds' ? 'de cuotas sin vig' : 'externa'} le da ${pct(
-          winMarket[resultPick.code as 'home' | 'draw' | 'away'],
+    (comparisonWin
+      ? ` La referencia ${comparisonWin.source === 'odds' ? 'de cuotas sin vig' : 'externa'} le da ${pct(
+          comparisonWin[resultPick.code as 'home' | 'draw' | 'away'],
         )} a la misma selección.`
       : ' Sin cuotas disponibles no se calcula valor.');
   markets.push(
@@ -273,6 +338,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
         threshold: 0.5,
         marketProbability: resultPick.marketProbability ?? null,
         edge: resultPick.edge ?? null,
+        comparisonSource: comparisonWin ? comparisonWin.source : null,
         alternatives: resultOptions.map((option) => ({ ...option, selected: option.code === resultPick.code })),
         explanation: resultExplanation,
         note: resultPick.probability < 0.5 ? 'Ningún resultado supera el 50 %: mercado de alta incertidumbre.' : undefined,
@@ -293,30 +359,49 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
 
   // 2. Doble oportunidad
   const dc = doubleChanceOutcomes(matrix);
+  const dcMarket = {
+    homeDraw:
+      oddsWin !== null
+        ? oddsWin.home + oddsWin.draw
+        : extraMarketProbability(extraMarkets, ['double chance', 'doble oportunidad'], ['1x', 'home or draw']),
+    drawAway:
+      oddsWin !== null
+        ? oddsWin.draw + oddsWin.away
+        : extraMarketProbability(extraMarkets, ['double chance', 'doble oportunidad'], ['x2', 'draw or away']),
+    homeAway:
+      oddsWin !== null
+        ? oddsWin.home + oddsWin.away
+        : extraMarketProbability(extraMarkets, ['double chance', 'doble oportunidad'], ['12', 'home or away']),
+  };
+  const dcSource: ComparisonSource | null = oddsWin
+    ? 'odds'
+    : dcMarket.homeDraw !== null || dcMarket.drawAway !== null || dcMarket.homeAway !== null
+      ? 'extra_market'
+      : null;
   const dcOptions: MarketOption[] = [
     {
       label: '1X · Local o empate',
       code: 'homeDraw',
       probability: dc.homeDraw,
       fairOdds: fairOdds(dc.homeDraw),
-      marketProbability: oddsWin ? oddsWin.home + oddsWin.draw : null,
-      edge: oddsWin ? dc.homeDraw - (oddsWin.home + oddsWin.draw) : null,
+      marketProbability: dcMarket.homeDraw,
+      edge: dcMarket.homeDraw !== null ? dc.homeDraw - dcMarket.homeDraw : null,
     },
     {
       label: 'X2 · Empate o visitante',
       code: 'drawAway',
       probability: dc.drawAway,
       fairOdds: fairOdds(dc.drawAway),
-      marketProbability: oddsWin ? oddsWin.draw + oddsWin.away : null,
-      edge: oddsWin ? dc.drawAway - (oddsWin.draw + oddsWin.away) : null,
+      marketProbability: dcMarket.drawAway,
+      edge: dcMarket.drawAway !== null ? dc.drawAway - dcMarket.drawAway : null,
     },
     {
       label: '12 · Local o visitante',
       code: 'homeAway',
       probability: dc.homeAway,
       fairOdds: fairOdds(dc.homeAway),
-      marketProbability: oddsWin ? oddsWin.home + oddsWin.away : null,
-      edge: oddsWin ? dc.homeAway - (oddsWin.home + oddsWin.away) : null,
+      marketProbability: dcMarket.homeAway,
+      edge: dcMarket.homeAway !== null ? dc.homeAway - dcMarket.homeAway : null,
     },
   ];
   const dcPick = maxBy(dcOptions, (option) => option.probability);
@@ -332,6 +417,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
         threshold: 0.5,
         marketProbability: dcPick.marketProbability ?? null,
         edge: dcPick.edge ?? null,
+        comparisonSource: dcSource,
         alternatives: dcOptions.map((option) => ({ ...option, selected: option.code === dcPick.code })),
         explanation: `La cobertura ${dcPick.label} acumula ${pct(dcPick.probability)} de los escenarios de la matriz. ${dcPick.edge !== null && dcPick.edge !== undefined ? (dcPick.edge >= 0 ? `Frente al mercado hay ${(dcPick.edge * 100).toFixed(1)} pts de valor.` : `El mercado la valora ${Math.abs(dcPick.edge * 100).toFixed(1)} pts por encima del modelo.`) : 'Sin cuota comparable no se calcula valor.'}`,
       },
@@ -376,6 +462,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
         marketProbability: totalsCalibration.marketProbability,
         marketModelProbability: totalsCalibration.marketModelProbability,
         edge: totalsCalibration.edge,
+        comparisonSource: totalsMarket.line !== null ? 'odds' : null,
         curve: totalsCalibration.curve,
         alternatives: totalsCalibration.alternatives,
         calibrated: totalsCalibration.calibrated,
@@ -425,6 +512,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
         marketProbability: handicapCalibration.marketProbability,
         marketModelProbability: handicapCalibration.marketModelProbability,
         edge: handicapCalibration.edge,
+        comparisonSource: spreadMarket.line !== null ? 'odds' : null,
         curve: handicapCalibration.curve,
         alternatives: handicapCalibration.alternatives,
         calibrated: handicapCalibration.calibrated,
@@ -437,37 +525,39 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
     ),
   );
 
-  // 5. Anota primero
-  const first = firstGoalProbabilities(
-    lambdas.lambdaHome,
-    lambdas.lambdaAway,
-    matrix.cells[0]?.[0],
-  );
-  const firstOptions: MarketOption[] = [
-    { label: `${homeName} anota primero`, code: 'home', probability: first.home, fairOdds: fairOdds(first.home) },
-    { label: `${awayName} anota primero`, code: 'away', probability: first.away, fairOdds: fairOdds(first.away) },
-    { label: 'Sin goles', code: 'none', probability: first.none, fairOdds: fairOdds(first.none) },
-  ];
-  const firstPick = maxBy(firstOptions, (option) => option.probability);
-  markets.push(
-    finalizeMarket(
-      {
-        key: 'first_goal',
-        name: 'Anota primero',
-        tagline: 'Primer gol del partido',
-        selection: firstPick.label,
-        selectionCode: firstPick.code ?? 'home',
-        probability: firstPick.probability,
-        threshold: 0.5,
-        alternatives: firstOptions.map((option) => ({ ...option, selected: option.code === firstPick.code })),
-        explanation: `Con tasas de ${lambdas.lambdaHome.toFixed(2)} y ${lambdas.lambdaAway.toFixed(2)} goles, el primer gol se reparte: ${homeName} ${pct(first.home)}, ${awayName} ${pct(first.away)} y sin goles ${pct(first.none)}.`,
-        note: 'Modelo de procesos de Poisson: no distingue el minuto ni el ritmo inicial.',
-      },
-      markets.length + 1,
-      quality.score,
-      agreement,
-    ),
-  );
+  // 5. Anota primero (solo pre-partido: en vivo el primer gol ya puede haber caído)
+  if (!live) {
+    const first = firstGoalProbabilities(
+      lambdas.lambdaHome,
+      lambdas.lambdaAway,
+      matrix.cells[0]?.[0],
+    );
+    const firstOptions: MarketOption[] = [
+      { label: `${homeName} anota primero`, code: 'home', probability: first.home, fairOdds: fairOdds(first.home) },
+      { label: `${awayName} anota primero`, code: 'away', probability: first.away, fairOdds: fairOdds(first.away) },
+      { label: 'Sin goles', code: 'none', probability: first.none, fairOdds: fairOdds(first.none) },
+    ];
+    const firstPick = maxBy(firstOptions, (option) => option.probability);
+    markets.push(
+      finalizeMarket(
+        {
+          key: 'first_goal',
+          name: 'Anota primero',
+          tagline: 'Primer gol del partido',
+          selection: firstPick.label,
+          selectionCode: firstPick.code ?? 'home',
+          probability: firstPick.probability,
+          threshold: 0.5,
+          alternatives: firstOptions.map((option) => ({ ...option, selected: option.code === firstPick.code })),
+          explanation: `Con tasas de ${lambdas.lambdaHome.toFixed(2)} y ${lambdas.lambdaAway.toFixed(2)} goles, el primer gol se reparte: ${homeName} ${pct(first.home)}, ${awayName} ${pct(first.away)} y sin goles ${pct(first.none)}.`,
+          note: 'Modelo de procesos de Poisson: no distingue el minuto ni el ritmo inicial.',
+        },
+        markets.length + 1,
+        quality.score,
+        agreement,
+      ),
+    );
+  }
 
   // 6. Par o impar
   const odd = oddTotal(matrix);
@@ -503,29 +593,31 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
     predicate: (i, j) => (parityPick.code === 'odd' ? (i + j) % 2 === 1 : (i + j) % 2 === 0),
   });
 
-  // 7. HT/FT
-  const htft = htFtProbabilities(lambdas.lambdaHome, lambdas.lambdaAway, RHO);
-  const combos = htft.combos.slice(0, 6);
-  const topCombo = combos[0];
-  markets.push(
-    finalizeMarket(
-      {
-        key: 'ht_ft',
-        name: 'Descanso / Final',
-        tagline: 'HT/FT · nueve combinaciones',
-        selection: topCombo.label,
-        selectionCode: `${topCombo.ht}/${topCombo.ft}`,
-        probability: topCombo.probability,
-        threshold: 0.5,
-        combos,
-        explanation: `El escenario HT/FT más probable es ${topCombo.label} (${pct(topCombo.probability)}). Se modela el 44 % de los goles en la primera parte y se convoluciona la segunda.`,
-        note: 'Mercado de alta varianza: incluso el escenario más probable rara vez supera el 30 %.',
-      },
-      markets.length + 1,
-      quality.score,
-      agreement,
-    ),
-  );
+  // 7. HT/FT (solo pre-partido: el descanso ya ocurrió o no es reconstruible)
+  if (!live) {
+    const htft = htFtProbabilities(lambdas.lambdaHome, lambdas.lambdaAway, RHO);
+    const combos = htft.combos.slice(0, 6);
+    const topCombo = combos[0];
+    markets.push(
+      finalizeMarket(
+        {
+          key: 'ht_ft',
+          name: 'Descanso / Final',
+          tagline: 'HT/FT · nueve combinaciones',
+          selection: topCombo.label,
+          selectionCode: `${topCombo.ht}/${topCombo.ft}`,
+          probability: topCombo.probability,
+          threshold: 0.5,
+          combos,
+          explanation: `El escenario HT/FT más probable es ${topCombo.label} (${pct(topCombo.probability)}). Se modela el 44 % de los goles en la primera parte y se convoluciona la segunda.`,
+          note: 'Mercado de alta varianza: incluso el escenario más probable rara vez supera el 30 %.',
+        },
+        markets.length + 1,
+        quality.score,
+        agreement,
+      ),
+    );
+  }
 
   // 8. Marcador exacto
   const scoreList = exactScores(matrix, 6);
@@ -557,12 +649,45 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
 
   // 9. BTTS
   const btts = bttsProbabilities(matrix);
+  const externalBtts = isLive ? undefined : response.pre_match?.prediction?.btts?.yes;
+  const bttsExtraYes = extraMarketProbability(
+    extraMarkets,
+    ['both teams to score', 'btts', 'ambos anotan'],
+    ['yes', 'si'],
+  );
+  const bttsExtraNo = extraMarketProbability(
+    extraMarkets,
+    ['both teams to score', 'btts', 'ambos anotan'],
+    ['no'],
+  );
+  const bttsReferenceYes = bttsExtraYes ?? (typeof externalBtts === 'number' ? externalBtts : null);
+  const bttsReferenceNo =
+    bttsExtraNo ?? (typeof externalBtts === 'number' ? 1 - externalBtts : null);
+  const bttsSource: ComparisonSource | null =
+    bttsExtraYes !== null || bttsExtraNo !== null
+      ? 'extra_market'
+      : typeof externalBtts === 'number'
+        ? 'prediction'
+        : null;
   const bttsOptions: MarketOption[] = [
-    { label: 'Sí · ambos anotan', code: 'yes', probability: btts.yes, fairOdds: fairOdds(btts.yes) },
-    { label: 'No · al menos uno no anota', code: 'no', probability: btts.no, fairOdds: fairOdds(btts.no) },
+    {
+      label: 'Sí · ambos anotan',
+      code: 'yes',
+      probability: btts.yes,
+      fairOdds: fairOdds(btts.yes),
+      marketProbability: bttsReferenceYes,
+      edge: bttsReferenceYes !== null ? btts.yes - bttsReferenceYes : null,
+    },
+    {
+      label: 'No · al menos uno no anota',
+      code: 'no',
+      probability: btts.no,
+      fairOdds: fairOdds(btts.no),
+      marketProbability: bttsReferenceNo,
+      edge: bttsReferenceNo !== null ? btts.no - bttsReferenceNo : null,
+    },
   ];
   const bttsPick = maxBy(bttsOptions, (option) => option.probability);
-  const externalBtts = response.pre_match?.prediction?.btts?.yes;
   markets.push(
     finalizeMarket(
       {
@@ -573,8 +698,11 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
         selectionCode: bttsPick.code ?? 'yes',
         probability: bttsPick.probability,
         threshold: 0.5,
+        marketProbability: bttsPick.marketProbability ?? null,
+        edge: bttsPick.edge ?? null,
+        comparisonSource: bttsSource,
         alternatives: bttsOptions.map((option) => ({ ...option, selected: option.code === bttsPick.code })),
-        explanation: `La probabilidad de que ambos equipos marquen es ${pct(btts.yes)}; el No acumula ${pct(btts.no)}.${externalBtts !== null && externalBtts !== undefined ? ` La predicción externa da ${pct(externalBtts)} al Sí.` : ''}`,
+        explanation: `La probabilidad de que ambos equipos marquen es ${pct(btts.yes)}; el No acumula ${pct(btts.no)}.${bttsReferenceYes !== null ? ` La referencia ${bttsSource === 'extra_market' ? 'de cuotas' : 'externa'} da ${pct(bttsReferenceYes)} al Sí.` : ''}`,
       },
       markets.length + 1,
       quality.score,
@@ -593,9 +721,38 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
   const cornersHome = statNumber(response.teams.home, 'corners');
   const cornersAway = statNumber(response.teams.away, 'corners');
   const cornersAvailable = cornersHome !== null && cornersAway !== null && cornersHome + cornersAway > 0;
-  if (cornersAvailable) {
+  if (cornersAvailable && !live) {
     const lambdaCorners = (cornersHome as number) + (cornersAway as number);
-    const cornersCalibration = calibrateCorners(lambdaCorners, cornersThreshold);
+    const predictionCorners = pickBalancedLine(pre?.prediction?.corners);
+    const cornersExtra = extraCornersMarket(pre);
+    // Solo se usa la línea del proveedor si trae probabilidades: mezclar su
+    // línea con la probabilidad de la predicción mediría otro producto.
+    const cornersHasOdds =
+      cornersExtra.line !== null && (cornersExtra.over !== null || cornersExtra.under !== null);
+    const cornersMarketLine = cornersHasOdds ? cornersExtra.line : predictionCorners?.line ?? null;
+    const cornersMarketOver = cornersHasOdds
+      ? cornersExtra.over
+      : predictionCorners && predictionCorners.probability !== null
+        ? predictionCorners.probability
+        : null;
+    const cornersMarketUnder = cornersHasOdds
+      ? cornersExtra.under
+      : predictionCorners && predictionCorners.probability !== null
+        ? 1 - predictionCorners.probability
+        : null;
+    const cornersComparison: 'odds' | 'prediction' | null = cornersHasOdds
+      ? 'odds'
+      : predictionCorners
+        ? 'prediction'
+        : null;
+    const cornersCalibration = calibrateCorners(
+      lambdaCorners,
+      cornersThreshold,
+      cornersMarketLine,
+      cornersMarketOver,
+      cornersMarketUnder,
+      cornersComparison,
+    );
     const cornersSideLabel = cornersCalibration.selection === 'over' ? 'Over' : 'Under';
     markets.push(
       finalizeMarket(
@@ -607,20 +764,26 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
           selectionCode: cornersCalibration.selection,
           line: cornersCalibration.line,
           baseLine: cornersCalibration.baseLine,
-          marketLine: extractCornersLine(pre),
+          marketLine: cornersMarketLine,
           probability: cornersCalibration.probability,
           threshold: cornersThreshold,
+          marketProbability: cornersCalibration.marketProbability,
+          marketModelProbability: cornersCalibration.marketModelProbability,
+          edge: cornersCalibration.edge,
+          comparisonSource: cornersComparison,
           curve: cornersCalibration.curve,
           alternatives: cornersCalibration.alternatives,
           calibrated: cornersCalibration.calibrated,
           explanation: cornersCalibration.explanation,
-          note: 'Mercado extendido (fuera de los nueve objetivo): usa una Poisson 1D sobre córners proyectados.',
+          note: `Mercado extendido (fuera de los nueve objetivo): usa una Poisson 1D sobre córners proyectados.${cornersCalibration.note ? ` ${cornersCalibration.note}` : ''}`,
         },
         markets.length + 1,
         quality.score,
         agreement,
       ),
     );
+  } else if (live) {
+    quality.caveats.push('En vivo se omiten los córners: la proyección de temporada describe el partido completo.');
   } else {
     quality.caveats.push('Sin córners proyectados para ambos equipos: se omite el mercado extendido de córners.');
   }
@@ -632,8 +795,34 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
     dataCaveats.unshift('λ combina el modelo propio con la predicción externa (65/35).');
   }
 
-  const parlay = buildParlay(matrix, parlayCandidates);
-  const matchStatus = normalizeStatus(response.match.status);
+  const parlay = live ? null : buildParlay(matrix, parlayCandidates);
+  if (live) {
+    dataCaveats.push('Sin combinada en vivo: las selecciones no describen el partido completo.');
+  }
+
+  const baseTotalLine = nearestHalfLine(lambdas.lambdaTotal);
+  const uncertainty = buildUncertainty({
+    lambdaHome: lambdas.lambdaHome,
+    lambdaAway: lambdas.lambdaAway,
+    quality: quality.score,
+    sigmaBoost: lambdas.sigmaBoost,
+    totalLine: baseTotalLine,
+  });
+
+  // Solo se publican intervalos donde el Monte Carlo midió el mismo producto.
+  for (const market of markets) {
+    if (market.key === 'result') {
+      const code = market.selectionCode as 'home' | 'draw' | 'away';
+      market.interval = uncertainty.win[code] ?? null;
+    } else if (
+      market.key === 'totals' &&
+      market.line !== null &&
+      uncertainty.totalLine !== null &&
+      Math.abs(market.line - uncertainty.totalLine) < 1e-9
+    ) {
+      market.interval = uncertainty.total;
+    }
+  }
 
   return {
     match: {
@@ -682,7 +871,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
         handicap: handicapThreshold,
         corners: cornersThreshold,
       },
-      baseTotalLine: nearestHalfLine(lambdas.lambdaTotal),
+      baseTotalLine,
       leagueBaseline: round(lambdas.leagueTotal, 2),
       marketAgreement: round(agreement, 3),
       marketAnchor: {
@@ -692,7 +881,12 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
         marketTotal: anchor.marketTotal,
         marketHome: anchor.marketHome,
         marketAway: anchor.marketAway,
+        totalSource: anchor.totalSource,
       },
+      marketSignal: signal ?? EMPTY_MARKET_SIGNAL,
+      adjustments: lambdas.adjustments,
+      uncertainty,
+      live,
       lambdaSources: lambdas.sources,
     },
   };

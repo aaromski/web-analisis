@@ -1,7 +1,7 @@
 'use client';
 
 import { useId, useState } from 'react';
-import type { MarketOption, MarketResult } from '@/lib/types/analysis';
+import type { ComparisonSource, MarketOption, MarketResult } from '@/lib/types/analysis';
 import { confidenceTone, formatEdge, formatLine, formatOdds, formatPct, riskTone } from '@/lib/ui/format';
 import CalibrationChart from './CalibrationChart';
 
@@ -9,6 +9,12 @@ interface Props {
   market: MarketResult;
   index: number;
 }
+
+const SOURCE_LABEL: Record<ComparisonSource, string> = {
+  odds: 'Cuotas',
+  extra_market: 'Cuotas extra',
+  prediction: 'Predicción externa',
+};
 
 interface BarRow {
   label: string;
@@ -119,6 +125,14 @@ export default function MarketCard({ market, index }: Props) {
             <span>Cuota justa</span>
             <strong>{formatOdds(market.fairOdds)}</strong>
           </span>
+          {market.interval ? (
+            <span className="prob-meta">
+              <span>Rango 10–90</span>
+              <strong>
+                {formatPct(market.interval.low, 0)} – {formatPct(market.interval.high, 0)}
+              </strong>
+            </span>
+          ) : null}
         </div>
 
         <div className="confidence">
@@ -144,6 +158,11 @@ export default function MarketCard({ market, index }: Props) {
           ) : (
             <span className="chip">Sin cuota comparable</span>
           )}
+          {market.comparisonSource ? (
+            <span className="chip" data-tone="lime">
+              Referencia {SOURCE_LABEL[market.comparisonSource]}
+            </span>
+          ) : null}
           <span className="chip">{stateLabel}</span>
         </div>
 

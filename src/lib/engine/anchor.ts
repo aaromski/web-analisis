@@ -13,7 +13,13 @@ const MAX_GOALS = 12;
 const MIN_LAMBDA = 0.15;
 const MAX_LAMBDA = 4.5;
 
-export type AnchorSource = 'moneyline+totals' | 'moneyline' | 'totals' | 'none';
+export type AnchorSource =
+  | 'moneyline+totals'
+  | 'moneyline+prediction'
+  | 'moneyline'
+  | 'totals'
+  | 'prediction'
+  | 'none';
 
 export interface MarketAnchor {
   applied: boolean;
@@ -22,17 +28,23 @@ export interface MarketAnchor {
   marketTotal: number | null;
   marketHome: number | null;
   marketAway: number | null;
+  totalSource: 'odds' | 'prediction' | 'none';
   note: string | null;
 }
 
 export interface AnchorInput {
   lambdaHome: number;
   lambdaAway: number;
-  /** Solo cuotas reales; la predicción externa ya se mezcla en buildLambdas. */
   winMarket: WinMarket | null;
   totalsMarket: TotalsMarket;
+  /** Total implícito de la predicción externa, si no hay cuotas de totales. */
+  predictionTotal?: number | null;
+  /** 1X2 de la predicción externa, usado si no hay moneyline. */
+  predictionWin?: WinMarket | null;
   quality: number;
   agreement: number;
+  /** Escala el peso (p. ej. según el movimiento de la línea). 1 = neutro. */
+  weightScale?: number;
 }
 
 export interface AnchorResult extends MarketAnchor {
@@ -147,8 +159,10 @@ function scaleToTotal(lambdaHome: number, lambdaAway: number): { home: number; a
 
 const SOURCE_LABEL: Record<AnchorSource, string> = {
   'moneyline+totals': 'total y supremacía',
+  'moneyline+prediction': 'predicción externa',
   moneyline: 'solo 1X2',
   totals: 'solo total',
+  prediction: 'solo predicción',
   none: 'sin cuotas',
 };
 
@@ -156,6 +170,7 @@ const SOURCE_LABEL: Record<AnchorSource, string> = {
  * Ancla λ al mercado. El mercado resume la expectativa agregada de goles y
  * supremacía; el modelo aporta la estructura de la matriz. El peso es mayor
  * cuando los datos propios son débiles o el modelo se aleja del mercado.
+ * Sin cuotas, la predicción externa actúa como referencia de menor peso.
  */
 export function anchorLambdas(input: AnchorInput): AnchorResult {
   const empty: AnchorResult = {
@@ -167,6 +182,7 @@ export function anchorLambdas(input: AnchorInput): AnchorResult {
     marketTotal: null,
     marketHome: null,
     marketAway: null,
+    totalSource: 'none',
     note: null,
   };
 
@@ -177,25 +193,38 @@ export function anchorLambdas(input: AnchorInput): AnchorResult {
     Number.isFinite(totals.line) &&
     totals.over > 0.02 &&
     totals.over < 0.98;
-  const marketTotal = hasTotals ? impliedTotalFromOver(totals.line as number, totals.over as number) : null;
+  const oddsTotal = hasTotals ? impliedTotalFromOver(totals.line as number, totals.over as number) : null;
+  const predictedTotal =
+    typeof input.predictionTotal === 'number' && Number.isFinite(input.predictionTotal) && input.predictionTotal > 0.4
+      ? input.predictionTotal
+      : null;
+  const marketTotal = oddsTotal ?? predictedTotal;
+  const totalSource: MarketAnchor['totalSource'] =
+    oddsTotal !== null ? 'odds' : predictedTotal !== null ? 'prediction' : 'none';
+
   const hasWin = Boolean(input.winMarket && input.winMarket.home > 0.01 && input.winMarket.away > 0.01);
+  const winTarget: WinMarket | null = hasWin
+    ? (input.winMarket as WinMarket)
+    : input.predictionWin && input.predictionWin.home > 0.01
+      ? input.predictionWin
+      : null;
 
   let source: AnchorSource = 'none';
   let marketHome: number | null = null;
   let marketAway: number | null = null;
 
-  if (marketTotal !== null && hasWin) {
-    const split = fitSupremacy(marketTotal, (input.winMarket as WinMarket).home);
+  if (marketTotal !== null && winTarget) {
+    const split = fitSupremacy(marketTotal, winTarget.home);
     marketHome = split.home;
     marketAway = split.away;
-    source = 'moneyline+totals';
+    source = totalSource === 'odds' ? 'moneyline+totals' : 'moneyline+prediction';
   } else if (marketTotal !== null) {
     const share = input.lambdaHome / Math.max(0.2, input.lambdaHome + input.lambdaAway);
     marketHome = marketTotal * share;
     marketAway = marketTotal * (1 - share);
-    source = 'totals';
-  } else if (hasWin) {
-    const fit = fitWinProbabilities(input.winMarket as WinMarket, {
+    source = totalSource === 'odds' ? 'totals' : 'prediction';
+  } else if (winTarget) {
+    const fit = fitWinProbabilities(winTarget, {
       home: input.lambdaHome,
       away: input.lambdaAway,
     });
@@ -224,10 +253,17 @@ export function anchorLambdas(input: AnchorInput): AnchorResult {
   let weight: number;
   if (source === 'moneyline+totals') {
     weight = clamp(0.58 + 0.2 * (1 - quality) + 0.1 * (1 - agreement) + gapBoost, 0.5, 0.85);
+  } else if (source === 'moneyline+prediction') {
+    weight = clamp(0.42 + 0.15 * (1 - quality) + 0.08 * (1 - agreement) + gapBoost * 0.7, 0.36, 0.62);
   } else if (source === 'totals') {
     weight = clamp(0.45 + 0.15 * (1 - quality) + gapBoost * 0.6, 0.4, 0.7);
+  } else if (source === 'prediction') {
+    weight = clamp(0.3 + 0.12 * (1 - quality) + gapBoost * 0.4, 0.25, 0.5);
   } else {
     weight = clamp(0.48 + 0.2 * (1 - quality) + gapBoost * 0.5, 0.45, 0.7);
+  }
+  if (input.weightScale !== undefined) {
+    weight = clamp(weight * clamp(input.weightScale, 0.6, 1.15), 0.25, 0.85);
   }
 
   const blended = scaleToTotal(
@@ -244,6 +280,7 @@ export function anchorLambdas(input: AnchorInput): AnchorResult {
     marketTotal: marketTotal === null ? null : round(marketTotal, 2),
     marketHome: round(marketHome, 2),
     marketAway: round(marketAway, 2),
+    totalSource,
     note: `λ anclada al mercado (${SOURCE_LABEL[source]}, peso ${Math.round(weight * 100)} %).`,
   };
 }

@@ -101,6 +101,125 @@ export interface MatchMetrics {
   markets: number;
 }
 
+export interface ReliabilityBin {
+  low: number;
+  high: number;
+  predicted: number;
+  observed: number;
+  count: number;
+}
+
+export interface CalibrationSample {
+  probability: number;
+  hit: boolean;
+}
+
+/** Bins de fiabilidad (ancho 0.1): probabilidad media frente a frecuencia real. */
+export function reliabilityBins(samples: CalibrationSample[], binWidth = 0.1): ReliabilityBin[] {
+  if (samples.length === 0) return [];
+  const width = clamp(binWidth, 0.02, 0.5);
+  const bins = new Map<number, CalibrationSample[]>();
+  for (const sample of samples) {
+    const index = Math.min(Math.floor(clamp(sample.probability, 0, 0.999999) / width), Math.ceil(1 / width) - 1);
+    const bucket = bins.get(index) ?? [];
+    bucket.push(sample);
+    bins.set(index, bucket);
+  }
+  return [...bins.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([index, bucket]) => ({
+      low: round(index * width, 3),
+      high: round(Math.min(1, (index + 1) * width), 3),
+      predicted: round(mean(bucket.map((item) => item.probability)) ?? 0, 4),
+      observed: round(bucket.filter((item) => item.hit).length / bucket.length, 4),
+      count: bucket.length,
+    }));
+}
+
+/** Error de calibración esperado: media de |predicho − observado| ponderada por bin. */
+export function expectedCalibrationError(samples: CalibrationSample[], binWidth = 0.1): number | null {
+  const bins = reliabilityBins(samples, binWidth);
+  if (bins.length === 0) return null;
+  const total = bins.reduce((sum, bin) => sum + bin.count, 0);
+  return round(
+    bins.reduce((sum, bin) => sum + (bin.count / total) * Math.abs(bin.predicted - bin.observed), 0),
+    4,
+  );
+}
+
+export interface IsotonicCalibrator {
+  /** Puntos (x = probabilidad cruda, y = probabilidad calibrada), crecientes. */
+  knots: Array<{ x: number; y: number }>;
+}
+
+/**
+ * Regresión isotónica por PAVA (pool adjacent violators). Devuelve una función
+ * escalonada monótona para recalibrar probabilidades con datos históricos.
+ */
+export function fitIsotonic(samples: CalibrationSample[]): IsotonicCalibrator {
+  const sorted = [...samples]
+    .filter((sample) => Number.isFinite(sample.probability))
+    .sort((left, right) => left.probability - right.probability);
+  if (sorted.length === 0) return { knots: [] };
+
+  interface Block {
+    sum: number;
+    weight: number;
+    minX: number;
+    maxX: number;
+  }
+  const blocks: Block[] = [];
+  for (const sample of sorted) {
+    blocks.push({
+      sum: sample.hit ? 1 : 0,
+      weight: 1,
+      minX: sample.probability,
+      maxX: sample.probability,
+    });
+    while (blocks.length > 1) {
+      const last = blocks[blocks.length - 1];
+      const previous = blocks[blocks.length - 2];
+      if (previous.sum / previous.weight <= last.sum / last.weight) break;
+      blocks.splice(blocks.length - 2, 2, {
+        sum: previous.sum + last.sum,
+        weight: previous.weight + last.weight,
+        minX: previous.minX,
+        maxX: last.maxX,
+      });
+    }
+  }
+
+  const knots: IsotonicCalibrator['knots'] = [];
+  for (const block of blocks) {
+    const value = round(block.sum / block.weight, 4);
+    if (knots.length > 0 && knots[knots.length - 1].y === value) {
+      knots[knots.length - 1].x = round(block.maxX, 4);
+    } else {
+      knots.push({ x: round(block.maxX, 4), y: value });
+    }
+  }
+  return { knots };
+}
+
+export function applyIsotonic(calibrator: IsotonicCalibrator, probability: number): number {
+  if (calibrator.knots.length === 0) return clamp(probability, 0, 1);
+  let value = calibrator.knots[0].y;
+  for (const knot of calibrator.knots) {
+    if (probability >= knot.x) value = knot.y;
+    else break;
+  }
+  return clamp(value, 0, 1);
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function round(value: number, decimals: number): number {
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
+}
+
 export interface AggregateMetrics {
   matches: number;
   meanMae1x2: number | null;

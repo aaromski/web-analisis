@@ -37,8 +37,10 @@ Métricas:
 | `MAE 1X2` | media de \|modelo − mercado\| en local, empate y visitante | puntos porcentuales |
 | `Δtotal` | λ_total − total implícito en la línea de totales (bisección Poisson) | goles |
 | `sesgo favorito` | p(modelo) − p(mercado) en el lado favorito del mercado | puntos porcentuales |
-| `Brier` | Σ(p_i − y_i)² con el resultado observado; solo si el snapshot trae marcador | 0–2 |
+| `Brier` | Σ(p_i − y_i)² con el resultado observado; solo con marcador | 0–2 |
 | `log-loss` | −ln p(resultado observado) | nats |
+| `ECE` | error medio de calibración agrupando probabilidades por tramos | 0–1 |
+| `ECE isotónica` | ECE tras calibrar con regresión isotónica (PAVA) ajustada en la muestra | 0–1 |
 | `línea rec.` | línea recomendada de Altas/Bajas − línea de mercado | goles |
 | `valor` | mercados con `edge` calculado / mercados publicados | conteo |
 
@@ -46,27 +48,35 @@ El total implícito se obtiene invirtiendo `P(total > línea) = over` sin vig co
 Poisson 1D; es la referencia de goles que el mercado está pagando, no la línea
 semientera.
 
+Los marcadores reales se leen de `data/results.json` (ignorado por git), con la
+forma `{ "espn:401884754": { "home": 2, "away": 1 } }` o `{ "matches": { … } }`.
+`measure.ts` inyecta el marcador **sin cambiar el estado del partido**, así que el
+análisis sigue produciendo mercados y además se puede puntuar. Sin ese archivo,
+Brier, log-loss y ECE quedan vacíos; el arnés nunca inventa resultados.
+
 ## 3. Resultado de la corrida de referencia
 
 Tres partidos programados capturados el 2026-10-30 contra la API desplegada:
 
 | Partido | Total mercado | Motor λ / Δ / MAE / sesgo | Anclado λ / Δ / MAE / sesgo | Peso ancla |
 |---|---|---|---|---|
-| Bayern – Dortmund | 4.07 (línea 3.5) | 3.09 / −0.98 / 3.9 pp / −5.9 pp | 3.90 / −0.17 / 0.8 pp / −0.8 pp | 82 % |
-| Milan – Inter | 3.02 (línea 2.5) | 3.66 / +0.64 / 2.3 pp / +2.9 pp | 3.22 / +0.20 / 1.0 pp / +1.3 pp | 69 % |
-| Liverpool – Arsenal | 2.74 (línea 2.5) | 2.27 / −0.47 / 3.9 pp / +2.7 pp | 2.58 / −0.16 / 1.3 pp / +0.6 pp | 66 % |
-| **Agregado** | — | **|Δ| 0.70 · MAE 3.4 · sesgo 3.8** | **|Δ| 0.18 · MAE 1.0 · sesgo 0.9** | 66–82 % |
+| Bayern – Dortmund | 4.07 (línea 3.5) | 3.04 / −1.03 / 4.6 pp / −6.9 pp | 3.92 / −0.15 / 0.8 pp / −0.9 pp | 85 % |
+| Milan – Inter | 3.02 (línea 2.5) | 3.64 / +0.62 / 3.9 pp / +5.8 pp | 3.19 / +0.17 / 1.3 pp / +2.0 pp | 72 % |
+| Liverpool – Arsenal | 2.74 (línea 2.5) | 2.26 / −0.48 / 4.7 pp / +3.9 pp | 2.59 / −0.15 / 1.4 pp / +0.9 pp | 69 % |
+| **Agregado** | — | **|Δ| 0.71 · MAE 4.4 · sesgo 5.6** | **|Δ| 0.16 · MAE 1.2 · sesgo 1.2** | 69–85 % |
 
 Criterios acordados para la variante anclada:
 
-- `|Δtotal| ≤ 0.20` goles: **cumple** (0.18).
-- `|sesgo favorito| ≤ 2.5 pp`: **cumple** (0.9).
-- `MAE 1X2 ≤ 2.5 pp`: **cumple** (1.0).
+- `|Δtotal| ≤ 0.20` goles: **cumple** (0.16).
+- `|sesgo favorito| ≤ 2.5 pp`: **cumple** (1.2).
+- `MAE 1X2 ≤ 2.5 pp`: **cumple** (1.2).
 
-Cobertura de valor: 12/30 mercados (4 por partido: 1X2, doble oportunidad,
-Altas/Bajas y hándicap). Los otros seis no tienen cuota comparable en la API
-(primer gol, par/impar, HT/FT, marcador exacto, BTTS y córners), así que no se
-inventa un valor.
+Cobertura de valor: 16/30 mercados. Los tres partidos publican valor en 1X2,
+doble oportunidad, Altas/Bajas y hándicap (cuotas); Milan y Liverpool añaden BTTS y
+córners con la predicción externa como referencia orientativa. Bayern no publica
+esos dos porque no trae predicción y los otros mercados (primer gol, par/impar,
+HT/FT, marcador exacto) no tienen referencia comparable; el arnés no inventa una
+cuota.
 
 ## 4. Lectura correcta
 
@@ -84,12 +94,32 @@ inventa un valor.
   partidos con resultado; el arnés ya calcula Brier y log-loss cuando el
   snapshot trae marcador.
 - **Sin resultados en la corrida.** Los tres snapshots son partidos programados;
-  Brier y log-loss quedan vacíos. Para medirlos, capturar partidos finalizados o
-  guardar el snapshot previo y añadir el marcador después.
+  Brier, log-loss y ECE quedan vacíos. Para medirlos, guardar el snapshot previo y
+  añadir el marcador en `data/results.json`.
+- **La banda p10–p90 no es calibración.** El Monte Carlo mide sensibilidad a la
+  incertidumbre de λ (calidad y alineación), no la frecuencia real de acierto; para
+  eso hacen falta resultados.
+- **Los partidos en vivo no entran en el arnés.** `evaluateResponse` compara con
+  cuotas previas al partido, que no condicionan al marcador actual.
 
-## 5. Pruebas del arnés
+## 5. Barrido del peso del ancla
+
+```bash
+npm run tune
+```
+
+Recorre escalas del peso del ancla (`0,80 … 1,20`, paso `0,05`) sobre la variante
+anclada de todos los snapshots, ordena por Brier medio y reporta log-loss y ECE
+antes y después de la isotónica. Guarda el resultado en `data/tuning.json`
+(ignorado por git). Sin `data/results.json` no hay Brier y el script solo confirma
+que el ancla reproduce el mercado; con menos de 20 partidos avisa de que la
+muestra no es concluyente.
+
+## 6. Pruebas del arnés
 
 `tests/audit/metrics.test.ts` cubre MAE, sesgo del favorito, Brier, log-loss,
-derivación del resultado y agregación con nulos. `tests/engine/anchor.test.ts`
-cubre la inversión del total, el ajuste de supremacía, el ajuste 2D de 1X2 y el
-efecto del ancla sobre el derbi.
+derivación del resultado, fiabilidad por tramos, ECE e isotónica (monotonía y
+reducción del error). `tests/audit/results.test.ts` cubre la carga de marcadores y
+la inyección sin cambiar el estado. `tests/engine/anchor.test.ts` cubre la
+inversión del total, el ajuste de supremacía, el ajuste 2D de 1X2 y el efecto del
+ancla sobre el derbi.
