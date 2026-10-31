@@ -32,8 +32,14 @@ STATS_API_BASE_URL=http://localhost:3000 npm run dev
 | `GEMINI_API_KEY` | Solo para IA | Clave de Google AI Studio. Se usa únicamente en el servidor. |
 | `GEMINI_MODEL` | No | Modelo de Gemini. Por defecto `gemini-3.6-flash`. |
 | `GEMINI_API_BASE_URL` | No | Base del endpoint de Gemini. Por defecto `.../v1`. |
+| `SUPABASE_URL` | Para aprendizaje | URL del proyecto Supabase. Si falta, la persistencia queda desactivada. |
+| `SUPABASE_SERVICE_ROLE_KEY` | Para aprendizaje | Clave `service_role`. Solo en servidor; salta RLS, nunca debe llegar al cliente. |
+| `SUPABASE_PERSISTENCE_ENABLED` | No | `true` por defecto; `false` desactiva todas las escrituras. |
+| `SUPABASE_TIMEOUT_MS` | No | Tiempo máximo por llamada a PostgREST. Por defecto `1200` (250–10000). |
+| `INGEST_TOKEN` | Para ingesta post | Token de `x-ingest-token` en `POST /api/ingest/post`. Sin él, la ruta responde 503 en producción. |
 
-`.env.local` está ignorado por git. Nunca se envía la clave al navegador.
+`.env.local` está ignorado por git. Nunca se envía la clave de Gemini ni la `service_role` al navegador.
+La persistencia es fail-open: si Supabase falla o no está configurado, el análisis sigue funcionando.
 
 ## Scripts
 
@@ -42,10 +48,11 @@ npm run dev        # Next.js en 3100
 npm run build      # build de producción
 npm start          # servidor de producción en 3100
 npm run typecheck  # TypeScript estricto
-npm test           # 57 pruebas del motor, el arnés y el servidor con node:test
+npm test           # 86 pruebas del motor, el arnés, la persistencia y el servidor con node:test
 npm run snapshot -- --home "AC Milan" --away "Internazionale" --date 2026-10-31 --league ita.1
 npm run audit      # métricas de los snapshots (y de data/results.json si existe)
 npm run tune       # barrido del peso del ancla por Brier medio
+npm run purge -- --keep 90   # vacía payloads post más antiguos que la ventana (acepta --dry-run)
 ```
 
 ## Cómo se usa
@@ -55,6 +62,9 @@ npm run tune       # barrido del peso del ancla por Brier medio
 3. Cada tarjeta expone la selección, la línea publicada, la probabilidad, la cuota justa, la confianza, el riesgo, el rango 10–90 cuando aplica y el valor frente al mercado. Al expandir aparece la curva de calibración, el umbral, la línea base, la línea de mercado y una tabla de líneas.
 4. La combinada se calcula sobre la matriz (correlación incorporada), no multiplicando probabilidades.
 5. «Generar informe» envía el análisis a Gemini y muestra el markdown en el panel IA.
+6. Al final del panel aparece **Sombra vs. producción**: la compuerta de 100 partidos con resultado y, cuando exista, la comparación por mercado entre el motor de producción y la variante experimental. La sombra v1 es el mismo motor **sin ancla de mercado** (`engine-1.3.0-shadow-noanchor`): un brazo de control que compite contra la producción con resultados reales. Es informativa y nunca cambia la recomendación publicada.
+
+Cada análisis pre-partido se guarda en Supabase al terminar la respuesta (sin bloquear ni romper la UI): partido, snapshot pre por hash de contenido y dos predicciones con `engine_version`/`params_version` — `production` (1.2.0) y `shadow` (parámetros `status = shadow` de `engine_params`). Reanalizar un partido solo añade snapshot si los datos cambiaron; el resto se detecta como duplicado. `/api/lab` empareja la última captura pre de cada partido finalizado que tenga ambas variantes y publica, por mercado, medias, delta en puntos porcentuales, muestra y un IC 95 % cuando hay al menos dos partidos. La ingesta post solo acepta partidos con captura pre: si no existe, responde 409 `POST_MATCH_WITHOUT_PRE` y no crea filas, y un trigger en la base bloquea la misma escritura por RPC. `npm run purge` conserva filas y predicciones y solo vacía el JSON de los snapshots post antiguos.
 
 La URL es la fuente de verdad: `/?id=…` o `/?home=…&away=…&date=YYYY-MM-DD&league=ita.1`. Recargar reproduce el análisis.
 
@@ -66,12 +76,14 @@ src/
     api/analyze   POST  analiza un partido (valida, consulta la API, ejecuta el motor)
     api/ai        POST  genera el informe con Gemini (rate limit 6/5 min)
     api/health    GET   salud de la API de estadísticas y configuración de Gemini
+    api/lab       GET   comparación producción/sombra por mercado y compuerta de 100 partidos
+    api/ingest/post POST registra el resultado post-partido (x-ingest-token)
     page.tsx            busca o muestra el dashboard según la URL
     globals.css         tokens, layout y componentes visuales
-  components/          buscador, cabecera, resumen, mercados, curva, combinada, contexto, IA
+  components/          buscador, cabecera, resumen, mercados, curva, combinada, contexto, IA, sombra
   lib/
-    engine/            motor puro: poisson, mercados, calibración, λ, liga, ancla, ajustes, incertidumbre, vivo, calidad, combinada
-    server/            cliente HTTP, caché, validación, errores y Gemini
+    engine/            motor puro: poisson, mercados, calibración, λ, liga, ancla, ajustes, incertidumbre, vivo, calidad, combinada, EngineParams y variante sombra
+    server/            cliente HTTP, caché, validación, errores, Gemini, Supabase/PostgREST e ingesta post
     types/             contrato canónico de la API y contrato de salida del motor
     ui/                formato de porcentajes, cuotas, líneas y fechas
 docs/
@@ -83,6 +95,10 @@ scripts/
   snapshot.ts          captura una respuesta real de la API
   measure.ts           mide snapshots contra el mercado y los resultados
   tune.ts              barre el peso del ancla y guarda data/tuning.json
+  purge.ts             retención: vacía payloads post antiguos vía RPC
+supabase/
+  migrations/          tablas, RLS, funciones y vista del ciclo de aprendizaje
+  rollback/            desmontaje ordenado del esquema
 data/snapshots/        capturas locales (ignoradas por git)
 data/results.json      marcadores reales para backtest (local, ignorado por git)
 ```
@@ -93,10 +109,13 @@ data/results.json      marcadores reales para backtest (local, ignorado por git)
 
 `confidence = 100 · (0,7·p + 0,18·calidad + 0,12·acuerdo con el mercado)`. Riesgo Bajo ≥ 74 con calidad ≥ 0,6; Medio ≥ 62; Alto por debajo.
 
+Todos los parámetros numéricos viven en `src/lib/engine/params.ts` (`EngineParams`, 141 ajustes en 8 dominios). Los valores por defecto reproducen 1.2.0 y una prueba de identidad verifica que pasarlos explícitamente no cambia ninguna salida.
+
 ## Seguridad y alcance
 
-- Sin base de datos, sin autenticación, sin apuestas: es una herramienta de análisis.
-- La clave de Gemini solo se usa en `src/lib/server/gemini.ts`.
+- Supabase solo almacena datos del ciclo de aprendizaje. RLS activo sin políticas: únicamente `service_role` escribe, y esa clave nunca sale del servidor.
+- Sin autenticación de usuarios y sin apuestas: es una herramienta de análisis.
+- La clave de Gemini solo se usa en `src/lib/server/gemini.ts`; `INGEST_TOKEN` se compara en tiempo constante.
 - Caché y rate limit en memoria; para varias instancias habría que externalizarlos.
 - No se publica ni se despliega desde este repositorio sin autorización explícita.
 

@@ -1,4 +1,6 @@
-import { getAnalysis } from '@/lib/server/analysis-service';
+import { after } from 'next/server';
+import { getAnalysisCapture } from '@/lib/server/analysis-service';
+import { persistPreAnalysis, persistShadowAnalysis } from '@/lib/server/db';
 import { errorResponse, jsonError, requireJson } from '@/lib/server/http';
 import { parseMatchInput } from '@/lib/server/validation';
 
@@ -19,7 +21,20 @@ export async function POST(request: Request): Promise<Response> {
 
   try {
     const input = parseMatchInput(body);
-    const envelope = await getAnalysis(input);
+    const { envelope, response } = await getAnalysisCapture(input);
+
+    // La captura corre después de enviar la respuesta y nunca puede romperla:
+    // `persistPreAnalysis` es fail-open y respeta el interruptor de persistencia.
+    after(async () => {
+      const saved = await persistPreAnalysis({ response, analysis: envelope.analysis });
+      if (!saved.snapshotId) return;
+      await persistShadowAnalysis({
+        response,
+        matchId: response.match.match_id,
+        snapshotId: saved.snapshotId,
+      });
+    });
+
     return Response.json(envelope, {
       headers: { 'Cache-Control': 'no-store' },
     });

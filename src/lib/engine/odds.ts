@@ -1,5 +1,6 @@
 import type { PreMatchPayload, OddsPrice, PreMatchPredictionLine } from '../types/api';
 import type { MarketSignal } from '../types/analysis';
+import { DEFAULT_ENGINE_PARAMS, type EngineParams } from './params';
 import { clamp } from './poisson';
 
 /** Cuota americana a probabilidad implícita. */
@@ -217,11 +218,19 @@ export function buildMarketSignal(preMatch?: PreMatchPayload | null): MarketSign
 }
 
 /** Multiplicador del peso del ancla según movimiento y proveedores. */
-export function movementWeightScale(signal: MarketSignal | null): number {
+export function movementWeightScale(
+  signal: MarketSignal | null,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): number {
   if (!signal) return 1;
+  const knobs = params.movement;
   const drift = Math.abs(signal.totalLineDrift ?? 0);
-  const providerBoost = (signal.providerCount ?? 0) >= 3 ? 0.05 : 0;
-  return clamp(1 + clamp(drift * 0.12, 0, 0.1) + providerBoost, 0.95, 1.12);
+  const providerBoost = (signal.providerCount ?? 0) >= knobs.providerMin ? knobs.providerBoost : 0;
+  return clamp(
+    1 + clamp(drift * knobs.driftCoef, 0, knobs.driftCap) + providerBoost,
+    knobs.min,
+    knobs.max,
+  );
 }
 
 function normalizeLabel(label: string): string {

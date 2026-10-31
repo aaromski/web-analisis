@@ -14,7 +14,8 @@
     "test": "node --import tsx --test \"tests/**/*.test.ts\"",
     "snapshot": "node --env-file-if-exists=.env.local --import tsx scripts/snapshot.ts",
     "audit": "node --env-file-if-exists=.env.local --import tsx scripts/measure.ts",
-    "tune": "node --env-file-if-exists=.env.local --import tsx scripts/tune.ts"
+    "tune": "node --env-file-if-exists=.env.local --import tsx scripts/tune.ts",
+    "purge": "node --env-file-if-exists=.env.local --import tsx scripts/purge.ts"
   },
   "dependencies": {
     "next": "15.5.28",

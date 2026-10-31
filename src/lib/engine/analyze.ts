@@ -41,6 +41,7 @@ import {
   pickBalancedLine,
 } from './odds';
 import { buildParlay, type ParlayCandidate } from './parlay';
+import { DEFAULT_ENGINE_PARAMS, MAX_GOALS, RHO, type EngineParams } from './params';
 import {
   buildScoreMatrix,
   clamp,
@@ -54,8 +55,12 @@ import { buildLiveMeta } from './live';
 import { buildUncertainty } from './uncertainty';
 
 export const MODEL_VERSION = '1.2.0';
-export const RHO = -0.1;
-export const MAX_GOALS = 12;
+export { MAX_GOALS, RHO } from './params';
+
+/** Opciones de `analyzeMatch`; `params` permite inyectar una variante sombra. */
+export interface AnalyzeOptions {
+  params?: EngineParams;
+}
 
 export class AnalysisError extends Error {
   constructor(
@@ -98,9 +103,10 @@ function finalizeMarket(
   index: number,
   qualityScore: number,
   agreement: number,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
 ): MarketResult {
   const probability = round(clamp(draft.probability, 0, 1), 4);
-  const confidence = computeConfidence(probability, qualityScore, agreement);
+  const confidence = computeConfidence(probability, qualityScore, agreement, params);
   const curve = (draft.curve ?? []).map((point) => ({
     ...point,
     probability: round(point.probability, 4),
@@ -161,7 +167,11 @@ function normalizeStatus(value: string | undefined | null): AnalysisResult['matc
   return 'unknown';
 }
 
-export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
+export function analyzeMatch(
+  response: AggregatedResponse,
+  options: AnalyzeOptions = {},
+): AnalysisResult {
+  const params = options.params ?? DEFAULT_ENGINE_PARAMS;
   if (!response?.match || !response?.teams?.home || !response?.teams?.away) {
     throw new AnalysisError('INVALID_RESPONSE', 'La API devolvió una respuesta sin partido o sin equipos.');
   }
@@ -190,8 +200,8 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
   const homeName = response.teams.home.name;
   const awayName = response.teams.away.name;
 
-  const lambdas = buildLambdas(response);
-  const quality = assessQuality(response);
+  const lambdas = buildLambdas(response, params);
+  const quality = assessQuality(response, params);
   const winMarket = extractWinMarket(pre);
   // En vivo las cuotas son previas al partido y no condicionan al marcador
   // actual: no sirven como referencia de valor.
@@ -242,8 +252,8 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
         predictionWin,
         quality: quality.score,
         agreement,
-        weightScale: movementWeightScale(signal),
-      });
+        weightScale: movementWeightScale(signal, params),
+      }, params);
   if (anchor.applied) {
     lambdas.lambdaHome = anchor.lambdaHome;
     lambdas.lambdaAway = anchor.lambdaAway;
@@ -283,10 +293,34 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
     lambdas.caveats.push('En vivo no se compara el modelo con cuotas previas al partido.');
   }
 
-  const threshold = confidenceThreshold(quality.score, lambdas.lambdaTotal, totalsMarket.line);
-  const totalsThreshold = confidenceThreshold(quality.score, lambdas.lambdaTotal, totalsMarket.line, 0.72);
-  const handicapThreshold = confidenceThreshold(quality.score, lambdas.lambdaTotal, totalsMarket.line, 0.66);
-  const cornersThreshold = confidenceThreshold(quality.score, lambdas.lambdaTotal, totalsMarket.line, 0.7);
+  const threshold = confidenceThreshold(
+    quality.score,
+    lambdas.lambdaTotal,
+    totalsMarket.line,
+    params.calibration.thresholdBase,
+    params,
+  );
+  const totalsThreshold = confidenceThreshold(
+    quality.score,
+    lambdas.lambdaTotal,
+    totalsMarket.line,
+    params.calibration.thresholdTotals,
+    params,
+  );
+  const handicapThreshold = confidenceThreshold(
+    quality.score,
+    lambdas.lambdaTotal,
+    totalsMarket.line,
+    params.calibration.thresholdHandicap,
+    params,
+  );
+  const cornersThreshold = confidenceThreshold(
+    quality.score,
+    lambdas.lambdaTotal,
+    totalsMarket.line,
+    params.calibration.thresholdCorners,
+    params,
+  );
 
   const markets: MarketResult[] = [];
   const parlayCandidates: ParlayCandidate[] = [];
@@ -346,6 +380,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
       markets.length + 1,
       quality.score,
       agreement,
+      params,
     ),
   );
   parlayCandidates.push({
@@ -424,6 +459,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
       markets.length + 1,
       quality.score,
       agreement,
+      params,
     ),
   );
   parlayCandidates.push({
@@ -472,6 +508,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
       markets.length + 1,
       quality.score,
       agreement,
+      params,
     ),
   );
   parlayCandidates.push({
@@ -522,6 +559,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
       markets.length + 1,
       quality.score,
       agreement,
+      params,
     ),
   );
 
@@ -555,6 +593,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
         markets.length + 1,
         quality.score,
         agreement,
+        params,
       ),
     );
   }
@@ -583,6 +622,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
       markets.length + 1,
       quality.score,
       agreement,
+      params,
     ),
   );
   parlayCandidates.push({
@@ -595,7 +635,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
 
   // 7. HT/FT (solo pre-partido: el descanso ya ocurrió o no es reconstruible)
   if (!live) {
-    const htft = htFtProbabilities(lambdas.lambdaHome, lambdas.lambdaAway, RHO);
+    const htft = htFtProbabilities(lambdas.lambdaHome, lambdas.lambdaAway, RHO, params);
     const combos = htft.combos.slice(0, 6);
     const topCombo = combos[0];
     markets.push(
@@ -609,12 +649,13 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
           probability: topCombo.probability,
           threshold: 0.5,
           combos,
-          explanation: `El escenario HT/FT más probable es ${topCombo.label} (${pct(topCombo.probability)}). Se modela el 44 % de los goles en la primera parte y se convoluciona la segunda.`,
+          explanation: `El escenario HT/FT más probable es ${topCombo.label} (${pct(topCombo.probability)}). Se modela el ${Math.round(params.lambda.htShare * 100)} % de los goles en la primera parte y se convoluciona la segunda.`,
           note: 'Mercado de alta varianza: incluso el escenario más probable rara vez supera el 30 %.',
         },
         markets.length + 1,
         quality.score,
         agreement,
+        params,
       ),
     );
   }
@@ -644,6 +685,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
       markets.length + 1,
       quality.score,
       agreement,
+      params,
     ),
   );
 
@@ -707,6 +749,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
       markets.length + 1,
       quality.score,
       agreement,
+      params,
     ),
   );
   parlayCandidates.push({
@@ -780,6 +823,7 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
         markets.length + 1,
         quality.score,
         agreement,
+        params,
       ),
     );
   } else if (live) {
@@ -792,22 +836,26 @@ export function analyzeMatch(response: AggregatedResponse): AnalysisResult {
     (item, index, array) => array.indexOf(item) === index,
   );
   if (lambdas.predictionBlended) {
-    dataCaveats.unshift('λ combina el modelo propio con la predicción externa (65/35).');
+    const externalPct = Math.round(params.lambda.externalBlendWeight * 100);
+    dataCaveats.unshift(`λ combina el modelo propio con la predicción externa (${100 - externalPct}/${externalPct}).`);
   }
 
-  const parlay = live ? null : buildParlay(matrix, parlayCandidates);
+  const parlay = live ? null : buildParlay(matrix, parlayCandidates, params);
   if (live) {
     dataCaveats.push('Sin combinada en vivo: las selecciones no describen el partido completo.');
   }
 
   const baseTotalLine = nearestHalfLine(lambdas.lambdaTotal);
-  const uncertainty = buildUncertainty({
-    lambdaHome: lambdas.lambdaHome,
-    lambdaAway: lambdas.lambdaAway,
-    quality: quality.score,
-    sigmaBoost: lambdas.sigmaBoost,
-    totalLine: baseTotalLine,
-  });
+  const uncertainty = buildUncertainty(
+    {
+      lambdaHome: lambdas.lambdaHome,
+      lambdaAway: lambdas.lambdaAway,
+      quality: quality.score,
+      sigmaBoost: lambdas.sigmaBoost,
+      totalLine: baseTotalLine,
+    },
+    params,
+  );
 
   // Solo se publican intervalos donde el Monte Carlo midió el mismo producto.
   for (const market of markets) {

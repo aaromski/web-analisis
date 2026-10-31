@@ -1,8 +1,6 @@
 import type { ModelUncertainty, ProbabilityInterval } from '../types/analysis';
+import { DEFAULT_ENGINE_PARAMS, MAX_GOALS, RHO, type EngineParams } from './params';
 import { buildScoreMatrix, clamp, resultProbability, round, totalOver } from './poisson';
-
-const MAX_GOALS = 12;
-const RHO = -0.1;
 
 /** Generador determinista (mulberry32) para que los intervalos sean estables. */
 function seededRandom(seed: number): () => number {
@@ -54,13 +52,21 @@ export interface UncertaintyInput {
  * lognormal y se recalculan matriz y mercados. El intervalo p10–p90 comunica
  * cuánto puede moverse el resultado si los datos de entrada están sesgados.
  */
-export function buildUncertainty(input: UncertaintyInput): ModelUncertainty {
-  const samples = clamp(Math.round(input.samples ?? 240), 40, 800);
+export function buildUncertainty(
+  input: UncertaintyInput,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): ModelUncertainty {
+  const knobs = params.uncertainty;
+  const samples = clamp(Math.round(input.samples ?? knobs.samples), knobs.sampleMin, knobs.sampleMax);
   const quality = clamp(input.quality, 0, 1);
-  const sigma = clamp(0.1 + 0.2 * (1 - quality) + (input.sigmaBoost ?? 0), 0.08, 0.4);
+  const sigma = clamp(
+    knobs.sigmaBase + knobs.sigmaQuality * (1 - quality) + (input.sigmaBoost ?? 0),
+    knobs.sigmaMin,
+    knobs.sigmaMax,
+  );
   const totalLine =
     typeof input.totalLine === 'number' && Number.isFinite(input.totalLine) ? input.totalLine : null;
-  const random = seededRandom(input.seed ?? 20261030);
+  const random = seededRandom(input.seed ?? knobs.seed);
 
   const lambdaHomeSamples: number[] = [];
   const lambdaAwaySamples: number[] = [];
@@ -71,8 +77,16 @@ export function buildUncertainty(input: UncertaintyInput): ModelUncertainty {
   const winAway: number[] = [];
 
   for (let sample = 0; sample < samples; sample += 1) {
-    const home = clamp(input.lambdaHome * Math.exp(sigma * standardNormal(random)), 0.1, 5);
-    const away = clamp(input.lambdaAway * Math.exp(sigma * standardNormal(random)), 0.1, 5);
+    const home = clamp(
+      input.lambdaHome * Math.exp(sigma * standardNormal(random)),
+      knobs.lambdaMin,
+      knobs.lambdaMax,
+    );
+    const away = clamp(
+      input.lambdaAway * Math.exp(sigma * standardNormal(random)),
+      knobs.lambdaMin,
+      knobs.lambdaMax,
+    );
     lambdaHomeSamples.push(home);
     lambdaAwaySamples.push(away);
     totalSamples.push(home + away);

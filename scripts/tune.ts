@@ -3,9 +3,19 @@ import { join } from 'node:path';
 import { evaluateResponse } from '../src/lib/audit/evaluate';
 import { applyIsotonic, expectedCalibrationError, fitIsotonic, mean, type CalibrationSample } from '../src/lib/audit/metrics';
 import { loadResults, withResult } from '../src/lib/audit/results';
+import { DEFAULT_ENGINE_PARAMS } from '../src/lib/engine/params';
 import type { AggregatedResponse } from '../src/lib/types/api';
 
-const SCALES: number[] = Array.from({ length: 9 }, (_, index) => Math.round((0.8 + index * 0.05) * 100) / 100);
+// El ancla recorta la escala a [scaleMin, scaleMax] y el peso resultante a
+// [finalWeightMin, finalWeightMax]. Un grid que pase de scaleMax satura en el
+// clamp: el «óptimo» sería un artefacto del borde, no una mejora del modelo.
+const GRID_MIN = 0.8;
+const GRID_MAX = DEFAULT_ENGINE_PARAMS.anchor.scaleMax;
+const GRID_STEP = 0.05;
+const SCALES: number[] = Array.from(
+  { length: Math.round((GRID_MAX - GRID_MIN) / GRID_STEP) + 1 },
+  (_, index) => Math.round((GRID_MIN + index * GRID_STEP) * 100) / 100,
+);
 const OUTPUT = join(process.cwd(), 'data', 'tuning.json');
 
 interface Row {

@@ -1,4 +1,5 @@
 import type { TotalsMarket, WinMarket } from './odds';
+import { DEFAULT_ENGINE_PARAMS, MAX_GOALS, RHO, type AnchorWeightKey, type EngineParams } from './params';
 import {
   buildScoreMatrix,
   clamp,
@@ -7,11 +8,6 @@ import {
   round,
   type ScoreMatrix,
 } from './poisson';
-
-const RHO = -0.1;
-const MAX_GOALS = 12;
-const MIN_LAMBDA = 0.15;
-const MAX_LAMBDA = 4.5;
 
 export type AnchorSource =
   | 'moneyline+totals'
@@ -61,11 +57,16 @@ function homeProbability(lambdaHome: number, lambdaAway: number): number {
  * Total de goles implícito en una línea de totales y su probabilidad over sin
  * vig. Invierte la Poisson 1D por bisección: P(total > línea) crece con λ.
  */
-export function impliedTotalFromOver(line: number, over: number): number | null {
+export function impliedTotalFromOver(
+  line: number,
+  over: number,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): number | null {
   if (!Number.isFinite(line) || !Number.isFinite(over)) return null;
-  if (over <= 0.001 || over >= 0.999) return null;
-  let low = MIN_LAMBDA;
-  let high = 8;
+  const { anchor } = params;
+  if (over <= anchor.overMin || over >= anchor.overMax) return null;
+  let low = params.lambda.minLambda;
+  let high = anchor.impliedTotalMax;
   for (let iteration = 0; iteration < 60; iteration += 1) {
     const mid = (low + high) / 2;
     if (poissonOver(mid, line) < over) low = mid;
@@ -79,11 +80,17 @@ export function impliedTotalFromOver(line: number, over: number): number | null 
  * probabilidad de victoria local. La probabilidad local crece de forma monótona
  * con la cuota de goles del local, así que basta una bisección.
  */
-export function fitSupremacy(total: number, targetHome: number, rho = RHO): { home: number; away: number } {
-  const safeTotal = clamp(total, 0.4, 8);
-  const target = clamp(targetHome, 0.01, 0.98);
-  let low = 0.12;
-  let high = 0.88;
+export function fitSupremacy(
+  total: number,
+  targetHome: number,
+  rho = RHO,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): { home: number; away: number } {
+  const { anchor } = params;
+  const safeTotal = clamp(total, anchor.supremacyTotalMin, anchor.supremacyTotalMax);
+  const target = clamp(targetHome, anchor.supremacyHomeMin, anchor.supremacyHomeMax);
+  let low = anchor.supremacyShareMin;
+  let high = anchor.supremacyShareMax;
   for (let iteration = 0; iteration < 50; iteration += 1) {
     const mid = (low + high) / 2;
     if (homeProbability(safeTotal * mid, safeTotal * (1 - mid)) < target) low = mid;
@@ -108,9 +115,11 @@ function winError(lambdaHome: number, lambdaAway: number, target: WinMarket): nu
 export function fitWinProbabilities(
   target: WinMarket,
   start: { home: number; away: number },
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
 ): { home: number; away: number; error: number } {
-  let home = clamp(start.home, MIN_LAMBDA, MAX_LAMBDA);
-  let away = clamp(start.away, MIN_LAMBDA, MAX_LAMBDA);
+  const { minLambda, maxLambda } = params.lambda;
+  let home = clamp(start.home, minLambda, maxLambda);
+  let away = clamp(start.away, minLambda, maxLambda);
   let best = winError(home, away, target);
   let step = 0.4;
   const moves: Array<[number, number]> = [
@@ -126,8 +135,8 @@ export function fitWinProbabilities(
   for (let iteration = 0; iteration < 80 && step > 0.004; iteration += 1) {
     let improved = false;
     for (const [homeStep, awayStep] of moves) {
-      const candidateHome = clamp(home + homeStep * step, MIN_LAMBDA, MAX_LAMBDA);
-      const candidateAway = clamp(away + awayStep * step, MIN_LAMBDA, MAX_LAMBDA);
+      const candidateHome = clamp(home + homeStep * step, minLambda, maxLambda);
+      const candidateAway = clamp(away + awayStep * step, minLambda, maxLambda);
       const error = winError(candidateHome, candidateAway, target);
       if (error < best - 1e-10) {
         best = error;
@@ -141,16 +150,21 @@ export function fitWinProbabilities(
   return { home, away, error: best };
 }
 
-function scaleToTotal(lambdaHome: number, lambdaAway: number): { home: number; away: number } {
-  let home = clamp(lambdaHome, MIN_LAMBDA, MAX_LAMBDA);
-  let away = clamp(lambdaAway, MIN_LAMBDA, MAX_LAMBDA);
+function scaleToTotal(
+  lambdaHome: number,
+  lambdaAway: number,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): { home: number; away: number } {
+  const { minLambda, maxLambda, minTotal, maxTotal } = params.lambda;
+  let home = clamp(lambdaHome, minLambda, maxLambda);
+  let away = clamp(lambdaAway, minLambda, maxLambda);
   const total = home + away;
-  if (total > 7) {
-    const factor = 7 / total;
+  if (total > maxTotal) {
+    const factor = maxTotal / total;
     home *= factor;
     away *= factor;
-  } else if (total < 0.8) {
-    const factor = 0.8 / total;
+  } else if (total < minTotal) {
+    const factor = minTotal / total;
     home *= factor;
     away *= factor;
   }
@@ -166,13 +180,24 @@ const SOURCE_LABEL: Record<AnchorSource, string> = {
   none: 'sin cuotas',
 };
 
+const WEIGHT_KEY: Record<Exclude<AnchorSource, 'none'>, AnchorWeightKey> = {
+  'moneyline+totals': 'moneylineTotals',
+  'moneyline+prediction': 'moneylinePrediction',
+  totals: 'totals',
+  prediction: 'prediction',
+  moneyline: 'moneyline',
+};
+
 /**
  * Ancla λ al mercado. El mercado resume la expectativa agregada de goles y
  * supremacía; el modelo aporta la estructura de la matriz. El peso es mayor
  * cuando los datos propios son débiles o el modelo se aleja del mercado.
  * Sin cuotas, la predicción externa actúa como referencia de menor peso.
  */
-export function anchorLambdas(input: AnchorInput): AnchorResult {
+export function anchorLambdas(
+  input: AnchorInput,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): AnchorResult {
   const empty: AnchorResult = {
     lambdaHome: input.lambdaHome,
     lambdaAway: input.lambdaAway,
@@ -247,28 +272,33 @@ export function anchorLambdas(input: AnchorInput): AnchorResult {
   const agreement = clamp(input.agreement, 0, 1);
   const modelTotal = input.lambdaHome + input.lambdaAway;
   const referenceTotal = marketTotal ?? marketHome + marketAway;
+  const { anchor: knobs } = params;
   // Una discrepancia grande de total suele ser un problema de escala del motor
   // (promedios de temporada), no información nueva: se refuerza el ancla.
-  const gapBoost = clamp((Math.abs(modelTotal - referenceTotal) - 0.3) / 0.7, 0, 1) * 0.18;
-  let weight: number;
-  if (source === 'moneyline+totals') {
-    weight = clamp(0.58 + 0.2 * (1 - quality) + 0.1 * (1 - agreement) + gapBoost, 0.5, 0.85);
-  } else if (source === 'moneyline+prediction') {
-    weight = clamp(0.42 + 0.15 * (1 - quality) + 0.08 * (1 - agreement) + gapBoost * 0.7, 0.36, 0.62);
-  } else if (source === 'totals') {
-    weight = clamp(0.45 + 0.15 * (1 - quality) + gapBoost * 0.6, 0.4, 0.7);
-  } else if (source === 'prediction') {
-    weight = clamp(0.3 + 0.12 * (1 - quality) + gapBoost * 0.4, 0.25, 0.5);
-  } else {
-    weight = clamp(0.48 + 0.2 * (1 - quality) + gapBoost * 0.5, 0.45, 0.7);
-  }
+  const gapBoost =
+    clamp((Math.abs(modelTotal - referenceTotal) - knobs.gapThreshold) / knobs.gapRange, 0, 1) *
+    knobs.gapWeight;
+  const config = knobs.weight[WEIGHT_KEY[source]];
+  let weight = clamp(
+    config.base +
+      config.quality * (1 - quality) +
+      config.agreement * (1 - agreement) +
+      gapBoost * config.gapScale,
+    config.min,
+    config.max,
+  );
   if (input.weightScale !== undefined) {
-    weight = clamp(weight * clamp(input.weightScale, 0.6, 1.15), 0.25, 0.85);
+    weight = clamp(
+      weight * clamp(input.weightScale, knobs.scaleMin, knobs.scaleMax),
+      knobs.finalWeightMin,
+      knobs.finalWeightMax,
+    );
   }
 
   const blended = scaleToTotal(
     (1 - weight) * input.lambdaHome + weight * marketHome,
     (1 - weight) * input.lambdaAway + weight * marketAway,
+    params,
   );
 
   return {

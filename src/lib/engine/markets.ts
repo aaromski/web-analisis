@@ -1,4 +1,5 @@
 import type { HtFtProbability } from '../types/analysis';
+import { DEFAULT_ENGINE_PARAMS, RHO, type EngineParams } from './params';
 import {
   buildScoreMatrix,
   bttsYes,
@@ -66,20 +67,23 @@ export interface HtFtResult {
   matrix: number[][];
 }
 
-const HT_SHARE = 0.44;
+const HT_MAX_GOALS = 8;
 
 /**
- * Modela los goles de cada mitad como procesos Poisson independientes con el
- * 44 % del total en la primera parte, y convoluciona para obtener el resultado
- * final. Devuelve la matriz conjunta HT/FT 3×3.
+ * Modela los goles de cada mitad como procesos Poisson independientes con la
+ * fracción `params.lambda.htShare` del total en la primera parte (44 % por
+ * defecto), y convoluciona para obtener el resultado final. Devuelve la matriz
+ * conjunta HT/FT 3×3.
  */
 export function htFtProbabilities(
   lambdaHome: number,
   lambdaAway: number,
-  rho = -0.1,
+  rho = RHO,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
 ): HtFtResult {
-  const first = buildScoreMatrix(lambdaHome * HT_SHARE, lambdaAway * HT_SHARE, { rho, maxGoals: 8 });
-  const second = buildScoreMatrix(lambdaHome * (1 - HT_SHARE), lambdaAway * (1 - HT_SHARE), { rho, maxGoals: 8 });
+  const share = params.lambda.htShare;
+  const first = buildScoreMatrix(lambdaHome * share, lambdaAway * share, { rho, maxGoals: HT_MAX_GOALS });
+  const second = buildScoreMatrix(lambdaHome * (1 - share), lambdaAway * (1 - share), { rho, maxGoals: HT_MAX_GOALS });
   const joint: number[][] = Array.from({ length: 3 }, () => [0, 0, 0]);
 
   for (let hi = 0; hi < first.cells.length; hi += 1) {

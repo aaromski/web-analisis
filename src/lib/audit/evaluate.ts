@@ -12,6 +12,7 @@ import {
   pickBalancedLine,
 } from '../engine/odds';
 import { buildScoreMatrix, round } from '../engine/poisson';
+import { DEFAULT_ENGINE_PARAMS, MAX_GOALS, RHO, type EngineParams } from '../engine/params';
 import { assessQuality } from '../engine/quality';
 import {
   brierScore,
@@ -24,9 +25,6 @@ import {
   type Outcome,
   type OutcomeProbabilities,
 } from './metrics';
-
-const RHO = -0.1;
-const MAX_GOALS = 12;
 
 export type Variant = 'motor' | 'anclado';
 
@@ -49,6 +47,8 @@ function round2(value: number): number {
 export interface EvaluateOptions {
   /** Escala manual del peso del ancla (además del movimiento real). */
   weightScale?: number;
+  /** Parámetros del motor; por defecto, los de producción (1.2.0). */
+  params?: EngineParams;
 }
 
 /**
@@ -62,8 +62,9 @@ export function evaluateResponse(
   analysis?: AnalysisResult | null,
   options: EvaluateOptions = {},
 ): EvaluatedVariant {
-  const lambdas: LambdaModel = buildLambdas(response);
-  const quality = assessQuality(response);
+  const params = options.params ?? DEFAULT_ENGINE_PARAMS;
+  const lambdas: LambdaModel = buildLambdas(response, params);
+  const quality = assessQuality(response, params);
   const winMarket = extractWinMarket(response.pre_match);
   const oddsWin = winMarket?.source === 'odds' ? winMarket : null;
   const predictionWin = winMarket?.source === 'prediction' ? winMarket : null;
@@ -92,8 +93,8 @@ export function evaluateResponse(
       predictionWin,
       quality: quality.score,
       agreement,
-      weightScale: movementWeightScale(signal) * (options.weightScale ?? 1),
-    });
+      weightScale: movementWeightScale(signal, params) * (options.weightScale ?? 1),
+    }, params);
     if (anchor.applied) {
       lambdaHome = anchor.lambdaHome;
       lambdaAway = anchor.lambdaAway;

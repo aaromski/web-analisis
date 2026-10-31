@@ -1,5 +1,6 @@
 import type { AggregatedResponse, PreMatchTeam } from '../types/api';
 import type { ModelAdjustment } from '../types/analysis';
+import { DEFAULT_ENGINE_PARAMS, type EngineParams } from './params';
 import { clamp } from './poisson';
 import { teamSample } from './quality';
 
@@ -19,8 +20,6 @@ export interface AdjustmentBundle {
   /** Incremento de incertidumbre si la alineación no está confirmada. */
   sigmaBoost: number;
 }
-
-const LEAGUE_PPG = 1.35;
 
 export function pointsPerMatch(team: PreMatchTeam | null | undefined): number | null {
   const standings = team?.standings;
@@ -47,7 +46,12 @@ function sideFromIndex(index: number): 'home' | 'away' {
  * clima e historial directo. Cada factor se limita para evitar que un dato
  * aislado domine λ.
  */
-export function buildAdjustments(response: AggregatedResponse, lambdaTotal: number): AdjustmentBundle {
+export function buildAdjustments(
+  response: AggregatedResponse,
+  lambdaTotal: number,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): AdjustmentBundle {
+  const knobs = params.adjustments;
   const pre = response.pre_match ?? null;
   const preTeams = [pre?.teams?.home, pre?.teams?.away] as const;
   const adjustments: ModelAdjustment[] = [];
@@ -71,15 +75,19 @@ export function buildAdjustments(response: AggregatedResponse, lambdaTotal: numb
     // Alineación: solo se ajusta λ si está confirmada y hay ratings suficientes.
     const lineup = team?.lineup;
     if (!lineup) {
-      result.sigmaBoost += 0.01;
+      result.sigmaBoost += knobs.sigmaBoostNoLineup;
     } else {
       const rating = lineupAverageRating(team);
       const unavailable = lineup.unavailable?.length ?? 0;
       if (lineup.status === 'confirmed' && rating !== null) {
-        const penalty = clamp((6.6 - rating) / 6.6, 0, 0.06);
+        const penalty = clamp(
+          (knobs.lineupRatingBaseline - rating) / knobs.lineupRatingBaseline,
+          0,
+          knobs.lineupPenaltyMax,
+        );
         if (penalty > 0.001) {
           target.attack *= 1 - penalty;
-          target.defense *= 1 + penalty * 0.8;
+          target.defense *= 1 + penalty * knobs.lineupDefenseScale;
           adjustments.push({
             key: 'lineup',
             label: 'Alineación confirmada',
@@ -89,7 +97,7 @@ export function buildAdjustments(response: AggregatedResponse, lambdaTotal: numb
           });
         }
       } else {
-        result.sigmaBoost += 0.02;
+        result.sigmaBoost += knobs.sigmaBoostUnconfirmed;
         adjustments.push({
           key: 'lineup',
           label: 'Alineación proyectada',
@@ -105,12 +113,12 @@ export function buildAdjustments(response: AggregatedResponse, lambdaTotal: numb
     if (typeof rest === 'number' && Number.isFinite(rest)) {
       let attack = 1;
       let defense = 1;
-      if (rest < 3) {
-        attack = 0.97;
-        defense = 1.02;
-      } else if (rest < 4) {
-        attack = 0.985;
-        defense = 1.01;
+      if (rest < knobs.restShortDays) {
+        attack = knobs.restShortAttack;
+        defense = knobs.restShortDefense;
+      } else if (rest < knobs.restMediumDays) {
+        attack = knobs.restMediumAttack;
+        defense = knobs.restMediumDefense;
       }
       if (attack !== 1) {
         target.attack *= attack;
@@ -127,10 +135,14 @@ export function buildAdjustments(response: AggregatedResponse, lambdaTotal: numb
 
     // Nivel del rival: un rival fuerte baja el ataque propio y exige más defensa.
     if (ownPpg !== null && opponentPpg !== null) {
-      const strength = clamp((opponentPpg - LEAGUE_PPG) / LEAGUE_PPG, -0.5, 0.5);
-      if (Math.abs(strength) > 0.05) {
-        const attack = 1 - 0.06 * strength;
-        const defense = 1 + 0.05 * strength;
+      const strength = clamp(
+        (opponentPpg - knobs.leaguePpg) / knobs.leaguePpg,
+        knobs.opponentStrengthMin,
+        knobs.opponentStrengthMax,
+      );
+      if (Math.abs(strength) > knobs.opponentStrengthThreshold) {
+        const attack = 1 - knobs.opponentAttackCoef * strength;
+        const defense = 1 + knobs.opponentDefenseCoef * strength;
         target.attack *= attack;
         target.defense *= defense;
         adjustments.push({
@@ -138,7 +150,7 @@ export function buildAdjustments(response: AggregatedResponse, lambdaTotal: numb
           label: 'Nivel del rival',
           side,
           deltaPct: (attack - 1) * 100,
-          detail: `Rival con ${opponentPpg.toFixed(2)} puntos por partido frente a la media ${LEAGUE_PPG.toFixed(2)}.`,
+          detail: `Rival con ${opponentPpg.toFixed(2)} puntos por partido frente a la media ${knobs.leaguePpg.toFixed(2)}.`,
         });
       }
     }
@@ -152,11 +164,14 @@ export function buildAdjustments(response: AggregatedResponse, lambdaTotal: numb
     const temperature = weather.temperature_c;
     let factor = 1;
     let reason: string | null = null;
-    if (precipitation >= 60 || wind >= 25) {
-      factor = 0.97;
+    if (precipitation >= knobs.weatherRainPct || wind >= knobs.weatherWindKmh) {
+      factor = knobs.weatherRainFactor;
       reason = `${precipitation} % de lluvia y viento ${wind} km/h.`;
-    } else if (temperature !== null && (temperature >= 32 || temperature <= 0)) {
-      factor = 0.98;
+    } else if (
+      temperature !== null &&
+      (temperature >= knobs.weatherTempHigh || temperature <= knobs.weatherTempLow)
+    ) {
+      factor = knobs.weatherTempFactor;
       reason = `Temperatura extrema (${temperature} °C).`;
     }
     if (reason) {
@@ -177,15 +192,19 @@ export function buildAdjustments(response: AggregatedResponse, lambdaTotal: numb
   const minSample = sample === null || sampleAway === null ? sample ?? sampleAway : Math.min(sample, sampleAway);
   const aggregate = pre?.h2h?.aggregate;
   if (
-    (minSample === null || minSample < 5) &&
+    (minSample === null || minSample < knobs.h2hSampleMax) &&
     aggregate &&
-    (aggregate.total_matches ?? 0) >= 3 &&
+    (aggregate.total_matches ?? 0) >= knobs.h2hMinMatches &&
     aggregate.home_goals !== null &&
     aggregate.away_goals !== null
   ) {
     const matches = aggregate.total_matches as number;
     const h2hTotal = (aggregate.home_goals + aggregate.away_goals) / matches;
-    const factor = clamp(1 + 0.1 * (h2hTotal / Math.max(0.5, lambdaTotal) - 1), 0.94, 1.06);
+    const factor = clamp(
+      1 + knobs.h2hCoef * (h2hTotal / Math.max(knobs.h2hLambdaFloor, lambdaTotal) - 1),
+      knobs.h2hMinFactor,
+      knobs.h2hMaxFactor,
+    );
     result.total *= factor;
     adjustments.push({
       key: 'h2h',
@@ -196,12 +215,12 @@ export function buildAdjustments(response: AggregatedResponse, lambdaTotal: numb
     });
   }
 
-  result.home.attack = clamp(result.home.attack, 0.85, 1.15);
-  result.home.defense = clamp(result.home.defense, 0.85, 1.15);
-  result.away.attack = clamp(result.away.attack, 0.85, 1.15);
-  result.away.defense = clamp(result.away.defense, 0.85, 1.15);
-  result.total = clamp(result.total, 0.9, 1.1);
-  result.sigmaBoost = clamp(result.sigmaBoost, 0, 0.08);
+  result.home.attack = clamp(result.home.attack, knobs.multiplierMin, knobs.multiplierMax);
+  result.home.defense = clamp(result.home.defense, knobs.multiplierMin, knobs.multiplierMax);
+  result.away.attack = clamp(result.away.attack, knobs.multiplierMin, knobs.multiplierMax);
+  result.away.defense = clamp(result.away.defense, knobs.multiplierMin, knobs.multiplierMax);
+  result.total = clamp(result.total, knobs.totalMin, knobs.totalMax);
+  result.sigmaBoost = clamp(result.sigmaBoost, 0, knobs.sigmaBoostMax);
 
   return result;
 }

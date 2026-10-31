@@ -22,16 +22,36 @@ function isAggregatedResponse(payload: unknown): payload is AggregatedResponse {
   );
 }
 
-function buildUrl(input: MatchInput): string {
+/**
+ * Valor de `?include=` (lista separada por comas). Se ignoran entradas vacías y
+ * se deduplica para no repetir el mismo bloque en la query.
+ */
+function includeParam(include?: string[]): string | null {
+  const values = Array.from(
+    new Set(
+      (include ?? [])
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0),
+    ),
+  );
+  return values.length > 0 ? values.join(',') : null;
+}
+
+function buildUrl(input: MatchInput, include?: string[]): string {
   const base = statsApiBaseUrl();
+  const includeValue = includeParam(include);
   if (input.matchId) {
-    return `${base}/api/v1/matches/${encodeURIComponent(input.matchId)}/stats`;
+    const url = `${base}/api/v1/matches/${encodeURIComponent(input.matchId)}/stats`;
+    if (!includeValue) return url;
+    return `${url}?${new URLSearchParams({ include: includeValue }).toString()}`;
   }
   const params = new URLSearchParams();
   params.set('home', input.home ?? '');
   params.set('away', input.away ?? '');
   if (input.date) params.set('date', input.date);
   if (input.league) params.set('league', input.league);
+  // `include` se añade al final para no alterar el orden de los parámetros existentes.
+  if (includeValue) params.set('include', includeValue);
   return `${base}/api/v1/matches/stats?${params.toString()}`;
 }
 
@@ -40,8 +60,20 @@ export interface FetchResult {
   latencyMs: number;
 }
 
-export async function fetchMatchStats(input: MatchInput, timeoutMs = 45_000): Promise<FetchResult> {
-  const url = buildUrl(input);
+export interface FetchMatchStatsOptions {
+  timeoutMs?: number;
+  /** Bloques opcionales del contrato, p. ej. `['post_match']`. */
+  include?: string[];
+}
+
+export async function fetchMatchStats(
+  input: MatchInput,
+  options: number | FetchMatchStatsOptions = {},
+): Promise<FetchResult> {
+  // Compatibilidad con la firma anterior `fetchMatchStats(input, timeoutMs)`.
+  const opts: FetchMatchStatsOptions = typeof options === 'number' ? { timeoutMs: options } : options;
+  const timeoutMs = opts.timeoutMs ?? 45_000;
+  const url = buildUrl(input, opts.include);
   const started = Date.now();
 
   let response: Response;

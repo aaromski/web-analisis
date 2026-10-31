@@ -430,8 +430,8 @@ del favorito ≤ 3 pp, MAE 1X2 ≤ 4 pp). Si existe `data/results.json` con
 marcadores reales, añade Brier, fiabilidad por tramos, ECE e isotónica; la
 isotónica se ajusta solo con muestras disponibles y nunca inventa resultados.
 
-`npm run tune` recorre escalas de peso del ancla (0,80…1,20 en pasos de 0,05) sobre
-la variante anclada, ordena por Brier medio y guarda el resultado en
+`npm run tune` recorre escalas de peso del ancla (0,80…1,15 en pasos de 0,05, hasta
+`anchor.scaleMax`) sobre la variante anclada, ordena por Brier medio y guarda el resultado en
 `data/tuning.json`; con menos de 20 partidos avisa de que la muestra no es
 concluyente. Los detalles, métricas y resultados vigentes están en
 `docs/MEDICION.md`.

@@ -1,5 +1,6 @@
 import type { CalibrationPoint, MarketOption, RiskLevel } from '../types/analysis';
 import { fairOdds } from './markets';
+import { DEFAULT_ENGINE_PARAMS, type EngineParams } from './params';
 import { clamp, handicapCover, poissonOver, poissonUnder, round, totalOver, totalUnder, type ScoreMatrix } from './poisson';
 
 export const TOTAL_LINES: number[] = Array.from({ length: 7 }, (_, index) => index + 0.5);
@@ -20,14 +21,34 @@ export function confidenceThreshold(
   quality: number,
   lambdaTotal: number,
   marketTotalLine: number | null,
-  base = 0.74,
+  base?: number,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
 ): number {
-  const disagreement = marketTotalLine !== null && Math.abs(lambdaTotal - marketTotalLine) > 0.35 ? 1 : 0;
-  return round(clamp(base + 0.08 * (1 - quality) + 0.02 * disagreement, base - 0.06, base + 0.12), 3);
+  const knobs = params.calibration;
+  const thresholdBase = base ?? knobs.thresholdBase;
+  const disagreement =
+    marketTotalLine !== null && Math.abs(lambdaTotal - marketTotalLine) > knobs.thresholdDisagreementGap ? 1 : 0;
+  return round(
+    clamp(
+      thresholdBase + knobs.thresholdQualityCoef * (1 - quality) + knobs.thresholdDisagreementCoef * disagreement,
+      thresholdBase + knobs.thresholdMinOffset,
+      thresholdBase + knobs.thresholdMaxOffset,
+    ),
+    3,
+  );
 }
 
-export function computeConfidence(probability: number, quality: number, agreement: number): number {
-  const value = 0.7 * probability + 0.18 * quality + 0.12 * agreement;
+export function computeConfidence(
+  probability: number,
+  quality: number,
+  agreement: number,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): number {
+  const knobs = params.calibration;
+  const value =
+    knobs.confidenceProbability * probability +
+    knobs.confidenceQuality * quality +
+    knobs.confidenceAgreement * agreement;
   return Math.round(clamp(value, 0, 1) * 100);
 }
 

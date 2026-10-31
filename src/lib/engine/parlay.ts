@@ -1,5 +1,6 @@
 import type { MarketKey, ParlaySuggestion } from '../types/analysis';
 import { fairOdds, jointMatrixProbability } from './markets';
+import { DEFAULT_ENGINE_PARAMS, type EngineParams } from './params';
 import type { ScoreMatrix } from './poisson';
 
 export interface ParlayCandidate {
@@ -10,9 +11,6 @@ export interface ParlayCandidate {
   predicate: (home: number, away: number) => boolean;
 }
 
-const MIN_LEG = 0.66;
-const MAX_LEG = 0.93;
-const MIN_JOINT = 0.45;
 const NEST_EPSILON = 1e-6;
 
 /**
@@ -35,9 +33,11 @@ function nestedLeg(matrix: ScoreMatrix, first: ParlayCandidate, second: ParlayCa
 export function buildParlay(
   matrix: ScoreMatrix,
   candidates: ParlayCandidate[],
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
 ): ParlaySuggestion | null {
+  const { minLeg, maxLeg, minJoint, maxLegs } = params.parlay;
   const eligible = candidates
-    .filter((candidate) => candidate.probability >= MIN_LEG && candidate.probability <= MAX_LEG)
+    .filter((candidate) => candidate.probability >= minLeg && candidate.probability <= maxLeg)
     .sort((a, b) => b.probability - a.probability);
 
   const chosen: ParlayCandidate[] = [];
@@ -46,9 +46,9 @@ export function buildParlay(
     if (chosen.some((item) => nestedLeg(matrix, item, candidate))) continue;
     const next = [...chosen, candidate];
     const joint = jointMatrixProbability(matrix, next.map((item) => item.predicate));
-    if (joint < MIN_JOINT) continue;
+    if (joint < minJoint) continue;
     chosen.push(candidate);
-    if (chosen.length === 3) break;
+    if (chosen.length === maxLegs) break;
   }
 
   if (chosen.length < 2) return null;

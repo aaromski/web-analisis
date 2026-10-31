@@ -8,14 +8,9 @@ import type {
 import type { ModelAdjustment, TeamModel } from '../types/analysis';
 import { buildAdjustments, lineupAverageRating, pointsPerMatch } from './adjustments';
 import { leagueBaseline, type LeagueBaseline } from './league';
+import { DEFAULT_ENGINE_PARAMS, type EngineParams } from './params';
 import { clamp, round } from './poisson';
 import { statDetail, statNumber, teamConfidence, teamSample } from './quality';
-
-/**
- * Peso con el que cada fuerza se acerca a 1 (media de liga). Se aplica en
- * espacio multiplicativo para no comprimir la supremacía entre equipos.
- */
-const STRENGTH_SHRINK = 0.15;
 
 interface BlendValue {
   value: number;
@@ -26,35 +21,53 @@ interface BlendValue {
   confidence: number;
 }
 
-function blendAttack(team: TeamPayload | undefined, fallback: number): BlendValue {
-  const xg = statDetail(team, 'xg');
-  const goals = statDetail(team, 'goals_scored');
-  const wx = xg.value === null ? 0 : 0.62 * xg.confidence;
-  const wg = goals.value === null ? 0 : 0.38 * goals.confidence;
+function blendAttack(
+  team: TeamPayload | undefined,
+  fallback: number,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): BlendValue {
+  const { xgWeight, goalsWeight } = params.lambda;
+  const xg = statDetail(team, 'xg', params);
+  const goals = statDetail(team, 'goals_scored', params);
+  const wx = xg.value === null ? 0 : xgWeight * xg.confidence;
+  const wg = goals.value === null ? 0 : goalsWeight * goals.confidence;
   if (wx + wg > 0) {
     return {
       value: (wx * (xg.value ?? 0) + wg * (goals.value ?? 0)) / (wx + wg),
       usedXg: xg.value !== null,
       usedGoals: goals.value !== null,
       fallback: false,
-      confidence: clamp(wx / 0.62 + wg / 0.38, 0, 1),
+      confidence: clamp(
+        (xgWeight > 0 ? wx / xgWeight : 0) + (goalsWeight > 0 ? wg / goalsWeight : 0),
+        0,
+        1,
+      ),
     };
   }
   return { value: fallback, usedXg: false, usedGoals: false, fallback: true, confidence: 0 };
 }
 
-function blendDefense(team: TeamPayload | undefined, fallback: number): BlendValue {
-  const xga = statDetail(team, 'xga');
-  const conceded = statDetail(team, 'goals_conceded');
-  const wx = xga.value === null ? 0 : 0.62 * xga.confidence;
-  const wg = conceded.value === null ? 0 : 0.38 * conceded.confidence;
+function blendDefense(
+  team: TeamPayload | undefined,
+  fallback: number,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): BlendValue {
+  const { xgWeight, goalsWeight } = params.lambda;
+  const xga = statDetail(team, 'xga', params);
+  const conceded = statDetail(team, 'goals_conceded', params);
+  const wx = xga.value === null ? 0 : xgWeight * xga.confidence;
+  const wg = conceded.value === null ? 0 : goalsWeight * conceded.confidence;
   if (wx + wg > 0) {
     return {
       value: (wx * (xga.value ?? 0) + wg * (conceded.value ?? 0)) / (wx + wg),
       usedXg: xga.value !== null,
       usedGoals: conceded.value !== null,
       fallback: false,
-      confidence: clamp(wx / 0.62 + wg / 0.38, 0, 1),
+      confidence: clamp(
+        (xgWeight > 0 ? wx / xgWeight : 0) + (goalsWeight > 0 ? wg / goalsWeight : 0),
+        0,
+        1,
+      ),
     };
   }
   return { value: fallback, usedXg: false, usedGoals: false, fallback: true, confidence: 0 };
@@ -91,12 +104,14 @@ function fromRecent(
   side: 'home' | 'away',
   ownPpg: number | null,
   opponentPpg: number | null,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
 ): FormNumbers {
   const empty: FormNumbers = { goalsFor: null, goalsAgainst: null, matches: null, form: null, source: null, window: null };
   const recent = team?.recent_form;
   if (recent) {
-    const stronger = ownPpg !== null && opponentPpg !== null && opponentPpg > ownPpg + 0.15;
-    const weaker = ownPpg !== null && opponentPpg !== null && opponentPpg < ownPpg - 0.15;
+    const band = params.lambda.ppgBand;
+    const stronger = ownPpg !== null && opponentPpg !== null && opponentPpg > ownPpg + band;
+    const weaker = ownPpg !== null && opponentPpg !== null && opponentPpg < ownPpg - band;
     const preferred = stronger
       ? splitNumbers(recent.splits?.vs_stronger, 'vs_stronger', recent.results.form)
       : weaker
@@ -151,25 +166,31 @@ function fromRecent(
   return empty;
 }
 
-function shrinkStrength(value: number, weight: number): number {
-  const w = clamp(weight, 0, 0.5);
+function shrinkStrength(value: number, weight: number, params: EngineParams = DEFAULT_ENGINE_PARAMS): number {
+  const w = clamp(weight, 0, params.lambda.strengthShrinkMax);
   return (1 - w) * value + w;
 }
 
-function scaleToTotal(lambdaHome: number, lambdaAway: number, caveats: string[]): { home: number; away: number } {
+function scaleToTotal(
+  lambdaHome: number,
+  lambdaAway: number,
+  caveats: string[],
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): { home: number; away: number } {
+  const { minTotal, maxTotal } = params.lambda;
   let home = lambdaHome;
   let away = lambdaAway;
   const total = home + away;
-  if (total > 7) {
-    const factor = 7 / total;
+  if (total > maxTotal) {
+    const factor = maxTotal / total;
     home *= factor;
     away *= factor;
-    caveats.push('El total proyectado se limitó a 7 goles.');
-  } else if (total < 0.8) {
-    const factor = 0.8 / total;
+    caveats.push(`El total proyectado se limitó a ${maxTotal} goles.`);
+  } else if (total < minTotal) {
+    const factor = minTotal / total;
     home *= factor;
     away *= factor;
-    caveats.push('El total proyectado se elevó al mínimo de 0.8 goles.');
+    caveats.push(`El total proyectado se elevó al mínimo de ${minTotal} goles.`);
   }
   return { home, away };
 }
@@ -191,29 +212,39 @@ export interface LambdaModel {
   sigmaBoost: number;
 }
 
-export function buildLambdas(response: AggregatedResponse): LambdaModel {
+export function buildLambdas(
+  response: AggregatedResponse,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): LambdaModel {
+  const knobs = params.lambda;
   const homeTeam = response.teams.home;
   const awayTeam = response.teams.away;
   const pre: PreMatchPayload | null | undefined = response.pre_match;
   const league: LeagueBaseline = leagueBaseline(response.match?.league?.id);
   const perTeam = Math.max(0.2, league.perTeam);
 
-  const attackHome = blendAttack(homeTeam, perTeam);
-  const defenseHome = blendDefense(homeTeam, perTeam);
-  const attackAway = blendAttack(awayTeam, perTeam);
-  const defenseAway = blendDefense(awayTeam, perTeam);
+  const attackHome = blendAttack(homeTeam, perTeam, params);
+  const defenseHome = blendDefense(homeTeam, perTeam, params);
+  const attackAway = blendAttack(awayTeam, perTeam, params);
+  const defenseAway = blendDefense(awayTeam, perTeam, params);
 
   const homeSample = teamSample(homeTeam);
   const awaySample = teamSample(awayTeam);
-  const extraHome = homeSample !== null && homeSample < 5 ? 0.2 * (1 - clamp(homeSample / 5, 0, 1)) : 0;
-  const extraAway = awaySample !== null && awaySample < 5 ? 0.2 * (1 - clamp(awaySample / 5, 0, 1)) : 0;
+  const extraHome =
+    homeSample !== null && homeSample < knobs.shortSampleMatches
+      ? knobs.shortSampleExtra * (1 - clamp(homeSample / knobs.shortSampleMatches, 0, 1))
+      : 0;
+  const extraAway =
+    awaySample !== null && awaySample < knobs.shortSampleMatches
+      ? knobs.shortSampleExtra * (1 - clamp(awaySample / knobs.shortSampleMatches, 0, 1))
+      : 0;
 
   // Fuerzas relativas a la media de la liga. Multiplicar evita que un ataque
   // fuerte contra una defensa débil se diluya en un promedio aritmético.
-  const attackStrengthHome = shrinkStrength(attackHome.value / perTeam, STRENGTH_SHRINK + extraHome);
-  const defenseStrengthHome = shrinkStrength(defenseHome.value / perTeam, STRENGTH_SHRINK + extraHome);
-  const attackStrengthAway = shrinkStrength(attackAway.value / perTeam, STRENGTH_SHRINK + extraAway);
-  const defenseStrengthAway = shrinkStrength(defenseAway.value / perTeam, STRENGTH_SHRINK + extraAway);
+  const attackStrengthHome = shrinkStrength(attackHome.value / perTeam, knobs.strengthShrink + extraHome, params);
+  const defenseStrengthHome = shrinkStrength(defenseHome.value / perTeam, knobs.strengthShrink + extraHome, params);
+  const attackStrengthAway = shrinkStrength(attackAway.value / perTeam, knobs.strengthShrink + extraAway, params);
+  const defenseStrengthAway = shrinkStrength(defenseAway.value / perTeam, knobs.strengthShrink + extraAway, params);
 
   let lambdaHome = attackStrengthHome * defenseStrengthAway * league.home;
   let lambdaAway = attackStrengthAway * defenseStrengthHome * league.away;
@@ -247,7 +278,7 @@ export function buildLambdas(response: AggregatedResponse): LambdaModel {
     [awayTeam.name, awaySample, extraAway],
   ] as const) {
     if (extra > 0) {
-      const weight = Math.round((STRENGTH_SHRINK + extra) * 100);
+      const weight = Math.round((knobs.strengthShrink + extra) * 100);
       caveats.push(`${name}: muestra corta (${sample ?? 0} partidos); las fuerzas se acercan un ${weight} % a la media de liga.`);
     }
   }
@@ -255,32 +286,48 @@ export function buildLambdas(response: AggregatedResponse): LambdaModel {
   // Ajustes contextuales (alineación, descanso, nivel del rival, clima, h2h).
   const homePpg = pointsPerMatch(pre?.teams?.home);
   const awayPpg = pointsPerMatch(pre?.teams?.away);
-  const contextual = buildAdjustments(response, lambdaHome + lambdaAway);
+  const contextual = buildAdjustments(response, lambdaHome + lambdaAway, params);
   lambdaHome *= contextual.home.attack * contextual.away.defense * contextual.total;
   lambdaAway *= contextual.away.attack * contextual.home.defense * contextual.total;
   if (contextual.adjustments.length > 0) sources.push('Ajustes contextuales');
 
   // Forma reciente: ataque propio y defensa propia (que afecta al rival).
-  const homeForm = fromRecent(pre?.teams?.home, 'home', homePpg, awayPpg);
-  const awayForm = fromRecent(pre?.teams?.away, 'away', awayPpg, homePpg);
+  const homeForm = fromRecent(pre?.teams?.home, 'home', homePpg, awayPpg, params);
+  const awayForm = fromRecent(pre?.teams?.away, 'away', awayPpg, homePpg, params);
   let formApplied = false;
 
   if (homeForm.goalsFor !== null) {
     const ratio = homeForm.goalsFor / perTeam;
-    lambdaHome *= clamp(1 + 0.15 * (ratio - 1), 0.85, 1.15);
+    lambdaHome *= clamp(
+      1 + knobs.formAttackCoef * (ratio - 1),
+      knobs.formAttackMin,
+      knobs.formAttackMax,
+    );
     formApplied = true;
   }
   if (awayForm.goalsFor !== null) {
     const ratio = awayForm.goalsFor / perTeam;
-    lambdaAway *= clamp(1 + 0.15 * (ratio - 1), 0.85, 1.15);
+    lambdaAway *= clamp(
+      1 + knobs.formAttackCoef * (ratio - 1),
+      knobs.formAttackMin,
+      knobs.formAttackMax,
+    );
     formApplied = true;
   }
   if (homeForm.goalsAgainst !== null) {
-    lambdaAway *= clamp(1 + 0.1 * (homeForm.goalsAgainst / perTeam - 1), 0.9, 1.1);
+    lambdaAway *= clamp(
+      1 + knobs.formDefenseCoef * (homeForm.goalsAgainst / perTeam - 1),
+      knobs.formDefenseMin,
+      knobs.formDefenseMax,
+    );
     formApplied = true;
   }
   if (awayForm.goalsAgainst !== null) {
-    lambdaHome *= clamp(1 + 0.1 * (awayForm.goalsAgainst / perTeam - 1), 0.9, 1.1);
+    lambdaHome *= clamp(
+      1 + knobs.formDefenseCoef * (awayForm.goalsAgainst / perTeam - 1),
+      knobs.formDefenseMin,
+      knobs.formDefenseMax,
+    );
     formApplied = true;
   }
   if (formApplied) sources.push('Forma reciente');
@@ -297,21 +344,22 @@ export function buildLambdas(response: AggregatedResponse): LambdaModel {
     Number.isFinite(predictedAway) &&
     predictedAway > 0
   ) {
-    lambdaHome = 0.65 * lambdaHome + 0.35 * predictedHome;
-    lambdaAway = 0.65 * lambdaAway + 0.35 * predictedAway;
+    const external = knobs.externalBlendWeight;
+    lambdaHome = (1 - external) * lambdaHome + external * predictedHome;
+    lambdaAway = (1 - external) * lambdaAway + external * predictedAway;
     predictionBlended = true;
     sources.push('Predicción externa');
   }
 
   const beforeClampHome = lambdaHome;
   const beforeClampAway = lambdaAway;
-  lambdaHome = clamp(lambdaHome, 0.15, 4.5);
-  lambdaAway = clamp(lambdaAway, 0.15, 4.5);
+  lambdaHome = clamp(lambdaHome, knobs.minLambda, knobs.maxLambda);
+  lambdaAway = clamp(lambdaAway, knobs.minLambda, knobs.maxLambda);
   if (beforeClampHome !== lambdaHome || beforeClampAway !== lambdaAway) {
     caveats.push('λ ajustada al límite operativo del motor.');
   }
 
-  const scaled = scaleToTotal(lambdaHome, lambdaAway, caveats);
+  const scaled = scaleToTotal(lambdaHome, lambdaAway, caveats, params);
   lambdaHome = round(scaled.home, 2);
   lambdaAway = round(scaled.away, 2);
 

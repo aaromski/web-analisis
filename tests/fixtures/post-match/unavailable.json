@@ -1,0 +1,46 @@
+{
+  "version": "1.0.0",
+  "status": "unavailable",
+  "generated_at": "2026-10-27T16:05:55.902Z",
+  "score": {
+    "ht": null,
+    "ft": null
+  },
+  "totals": null,
+  "periods": null,
+  "timeline": [],
+  "lineups": null,
+  "players": { "home": [], "away": [] },
+  "meta": {
+    "sources": [
+      {
+        "source": "fotmob",
+        "status": "not_found",
+        "duration_ms": 2310,
+        "sections": []
+      },
+      {
+        "source": "espn",
+        "status": "not_found",
+        "duration_ms": 71,
+        "sections": []
+      }
+    ],
+    "coverage": {
+      "sections": {
+        "score": false,
+        "halves": false,
+        "timeline": false,
+        "lineups": false,
+        "players": false,
+        "xg": false
+      },
+      "available": 0,
+      "total": 6
+    },
+    "conflicts": [],
+    "warnings": ["Ninguna fuente post-partido devolvió datos para el partido."],
+    "deadline_ms": 8000,
+    "timed_out": false
+  }
+}

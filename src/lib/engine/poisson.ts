@@ -1,6 +1,7 @@
 /**
  * Utilidades de distribución. Todo es puro y determinista.
  */
+import { MAX_GOALS, RHO } from './params';
 
 const LOG_FACTORIALS: number[] = [0];
 
@@ -56,7 +57,7 @@ export function buildScoreMatrix(
   lambdaAway: number,
   options: MatrixOptions = {},
 ): ScoreMatrix {
-  const { rho = -0.1, maxGoals = 12 } = options;
+  const { rho = RHO, maxGoals = MAX_GOALS } = options;
   const lh = Math.max(0.05, lambdaHome);
   const la = Math.max(0.05, lambdaAway);
   const cells: number[][] = [];

@@ -1,5 +1,6 @@
 import type { AggregatedResponse, CanonicalStat, StatStatus, TeamPayload } from '../types/api';
 import type { DataQuality } from '../types/analysis';
+import { DEFAULT_ENGINE_PARAMS, type EngineParams } from './params';
 import { clamp } from './poisson';
 
 export interface StatDetail {
@@ -22,7 +23,11 @@ export const KEY_STATS = [
   'possession_pct',
 ] as const;
 
-export function statDetail(team: TeamPayload | undefined, key: string): StatDetail {
+export function statDetail(
+  team: TeamPayload | undefined,
+  key: string,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): StatDetail {
   const stat: CanonicalStat | undefined = team?.stats?.[key];
   if (!stat || stat.status === 'missing') {
     return { value: null, confidence: 0, status: 'missing', source: stat?.source ?? null, derived: Boolean(stat?.derived) };
@@ -30,25 +35,38 @@ export function statDetail(team: TeamPayload | undefined, key: string): StatDeta
   if (typeof stat.value !== 'number' || !Number.isFinite(stat.value)) {
     return { value: null, confidence: 0, status: stat.status, source: stat.source ?? null, derived: Boolean(stat.derived) };
   }
-  const base = stat.status === 'observed' ? 1 : stat.status === 'projected' ? 0.65 : 0;
+  const { quality } = params;
+  const base =
+    stat.status === 'observed'
+      ? quality.statObservedConfidence
+      : stat.status === 'projected'
+        ? quality.statProjectedConfidence
+        : 0;
   return {
     value: stat.value,
-    confidence: base * (stat.derived ? 0.85 : 1),
+    confidence: base * (stat.derived ? quality.statDerivedFactor : 1),
     status: stat.status,
     source: stat.source ?? null,
     derived: Boolean(stat.derived),
   };
 }
 
-export function statNumber(team: TeamPayload | undefined, key: string): number | null {
-  return statDetail(team, key).value;
+export function statNumber(
+  team: TeamPayload | undefined,
+  key: string,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): number | null {
+  return statDetail(team, key, params).value;
 }
 
-export function teamConfidence(team: TeamPayload | undefined): { confidence: number; observedShare: number } {
+export function teamConfidence(
+  team: TeamPayload | undefined,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): { confidence: number; observedShare: number } {
   let confidence = 0;
   let observed = 0;
   for (const key of KEY_STATS) {
-    const detail = statDetail(team, key);
+    const detail = statDetail(team, key, params);
     confidence += detail.confidence;
     if (detail.status === 'observed') observed += 1;
   }
@@ -64,7 +82,10 @@ function present(team: TeamPayload | undefined, key: string): boolean {
   return statNumber(team, key) !== null;
 }
 
-export function assessQuality(response: AggregatedResponse): DataQuality {
+export function assessQuality(
+  response: AggregatedResponse,
+  params: EngineParams = DEFAULT_ENGINE_PARAMS,
+): DataQuality {
   const home = response.teams?.home;
   const away = response.teams?.away;
   let presentCount = 0;
@@ -73,7 +94,7 @@ export function assessQuality(response: AggregatedResponse): DataQuality {
   for (const key of KEY_STATS) {
     for (const team of [home, away]) {
       if (present(team, key)) presentCount += 1;
-      const detail = statDetail(team, key);
+      const detail = statDetail(team, key, params);
       confidenceSum += detail.confidence;
       if (detail.status === 'observed') observedCount += 1;
     }
@@ -86,7 +107,9 @@ export function assessQuality(response: AggregatedResponse): DataQuality {
   const homeSample = teamSample(home);
   const awaySample = teamSample(away);
   const sample = homeSample === null || awaySample === null ? (homeSample ?? awaySample) : Math.min(homeSample, awaySample);
-  const sampleScore = sample === null ? 0.25 : clamp(sample / 10, 0, 1);
+  const { quality: knobs } = params;
+  const sampleScore =
+    sample === null ? knobs.sampleMissingScore : clamp(sample / knobs.sampleSaturation, 0, 1);
 
   const preMatch = response.pre_match ?? null;
   const hasPrediction = Boolean(preMatch?.prediction?.expected_goals?.home && preMatch?.prediction?.expected_goals?.away);
@@ -101,11 +124,11 @@ export function assessQuality(response: AggregatedResponse): DataQuality {
   );
 
   const score = clamp(
-    0.45 * confidenceCoverage +
-      0.25 * sampleScore +
-      0.15 * (hasPrediction ? 1 : 0) +
-      0.1 * (odds ? 1 : 0) +
-      0.05 * (hasForm ? 1 : 0),
+    knobs.confidenceCoverageWeight * confidenceCoverage +
+      knobs.sampleWeight * sampleScore +
+      knobs.predictionWeight * (hasPrediction ? 1 : 0) +
+      knobs.oddsWeight * (odds ? 1 : 0) +
+      knobs.formWeight * (hasForm ? 1 : 0),
     0,
     1,
   );

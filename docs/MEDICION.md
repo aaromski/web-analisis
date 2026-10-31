@@ -108,7 +108,7 @@ cuota.
 npm run tune
 ```
 
-Recorre escalas del peso del ancla (`0,80 … 1,20`, paso `0,05`) sobre la variante
+Recorre escalas del peso del ancla (`0,80 … 1,15`, paso `0,05`) sobre la variante
 anclada de todos los snapshots, ordena por Brier medio y reporta log-loss y ECE
 antes y después de la isotónica. Guarda el resultado en `data/tuning.json`
 (ignorado por git). Sin `data/results.json` no hay Brier y el script solo confirma

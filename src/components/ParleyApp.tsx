@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import type {
   AiReport,
@@ -118,7 +118,12 @@ function mapError(status: number, payload: ApiErrorShape | null): UiError {
   };
 }
 
-export default function ParleyApp() {
+interface ParleyAppProps {
+  /** Sección experimental renderizada en servidor; se coloca tras el análisis de producción. */
+  shadow?: ReactNode;
+}
+
+export default function ParleyApp({ shadow }: ParleyAppProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const searchKey = searchParams.toString();
@@ -367,14 +372,17 @@ export default function ParleyApp() {
         ) : null}
 
         {request && phase === 'ready' && envelope ? (
-          <Dashboard
-            envelope={envelope}
-            aiState={aiState}
-            aiReport={aiReport}
-            aiError={aiError}
-            onGenerate={generateAi}
-            onNewSearch={goHome}
-          />
+          <>
+            <Dashboard
+              envelope={envelope}
+              aiState={aiState}
+              aiReport={aiReport}
+              aiError={aiError}
+              onGenerate={generateAi}
+              onNewSearch={goHome}
+            />
+            {shadow}
+          </>
         ) : null}
       </main>
 
@@ -406,6 +414,9 @@ function Dashboard({ envelope, aiState, aiReport, aiError, onGenerate, onNewSear
           <a href="#combinada">Combinada</a>
           <a href="#ia">Análisis IA</a>
           <a href="#contexto">Contexto</a>
+          <a className="dash-nav-muted" href="#sombra">
+            Sombra
+          </a>
         </nav>
         <span className="method">
           Modelo v{model.version} · ρ {model.rho} · {envelope.source.coverage ? `${envelope.source.coverage.available}/${envelope.source.coverage.total} secciones` : 'cobertura parcial'}

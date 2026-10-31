@@ -1,0 +1,99 @@
+{
+  "version": "1.0.0",
+  "status": "partial",
+  "generated_at": "2026-10-26T20:31:04.115Z",
+  "score": {
+    "ht": null,
+    "ft": { "home": 2, "away": 1 }
+  },
+  "totals": null,
+  "periods": null,
+  "timeline": [
+    {
+      "minute": 33,
+      "added_time": null,
+      "period": "first_half",
+      "type": "goal",
+      "side": "home",
+      "player_id": "espn:196190",
+      "player_name": "Lautaro Martínez",
+      "assist_id": "espn:172924",
+      "assist_name": "Federico Dimarco",
+      "player_in_id": null,
+      "player_in_name": null,
+      "player_out_id": null,
+      "player_out_name": null,
+      "score_after": { "home": 1, "away": 0 },
+      "detail": "Left footed shot"
+    },
+    {
+      "minute": 61,
+      "added_time": null,
+      "period": "second_half",
+      "type": "goal",
+      "side": "away",
+      "player_id": "espn:194188",
+      "player_name": "Christian Pulisic",
+      "assist_id": null,
+      "assist_name": null,
+      "player_in_id": null,
+      "player_in_name": null,
+      "player_out_id": null,
+      "player_out_name": null,
+      "score_after": { "home": 1, "away": 1 },
+      "detail": "Right footed shot"
+    },
+    {
+      "minute": 79,
+      "added_time": null,
+      "period": "second_half",
+      "type": "penalty_goal",
+      "side": "home",
+      "player_id": "espn:193588",
+      "player_name": "Hakan Çalhanoğlu",
+      "assist_id": null,
+      "assist_name": null,
+      "player_in_id": null,
+      "player_in_name": null,
+      "player_out_id": null,
+      "player_out_name": null,
+      "score_after": { "home": 2, "away": 1 },
+      "detail": "Penalty converted"
+    }
+  ],
+  "lineups": null,
+  "players": { "home": [], "away": [] },
+  "meta": {
+    "sources": [
+      {
+        "source": "espn",
+        "status": "ok",
+        "duration_ms": 84,
+        "sections": ["timeline"]
+      },
+      {
+        "source": "fotmob",
+        "status": "timeout",
+        "duration_ms": 8001,
+        "sections": [],
+        "detail": "Tiempo límite agotado en fotmob:post_match"
+      }
+    ],
+    "coverage": {
+      "sections": {
+        "score": true,
+        "halves": false,
+        "timeline": true,
+        "lineups": false,
+        "players": false,
+        "xg": false
+      },
+      "available": 2,
+      "total": 6
+    },
+    "conflicts": [],
+    "warnings": ["FotMob agotó el deadline; el bloque se construye solo con ESPN."],
+    "deadline_ms": 8000,
+    "timed_out": true
+  }
+}

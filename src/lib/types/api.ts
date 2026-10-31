@@ -262,10 +262,211 @@ export interface PreMatchPayload {
   };
 }
 
+/**
+ * Bloque post-partido (`post_match` v1.0.0). Solo aparece con
+ * `?include=post_match` en partidos `finished`; cualquier sección puede ser
+ * `null` y cualquier métrica puede faltar, así que el consumidor debe tolerarlo.
+ */
+export type PostMatchStatus = 'complete' | 'partial' | 'unavailable';
+
+export type PostMatchSourceId = 'fotmob' | 'espn';
+
+export type PostMatchSourceStatus = 'ok' | 'not_found' | 'error' | 'timeout';
+
+export type PostMatchSection = 'halves' | 'timeline' | 'lineups' | 'players' | 'xg';
+
+export interface PostMatchSourceRun {
+  source: PostMatchSourceId;
+  status: PostMatchSourceStatus;
+  duration_ms: number;
+  sections: PostMatchSection[];
+  detail?: string;
+}
+
+export interface PostMatchScoreValue {
+  home: number;
+  away: number;
+}
+
+export interface PostMatchScore {
+  ht: PostMatchScoreValue | null;
+  ft: PostMatchScoreValue | null;
+}
+
+export interface PostMatchTotalsTeam {
+  xg: number | null;
+  xga: number | null;
+}
+
+export interface PostMatchPeriodTeam {
+  xg: number | null;
+  non_penalty_xg: number | null;
+  shots: number | null;
+  shots_on_target: number | null;
+  shots_off_target: number | null;
+  blocked_shots: number | null;
+  big_chances: number | null;
+  big_chances_missed: number | null;
+  possession_pct: number | null;
+  accurate_passes: number | null;
+  passes_opposition_half: number | null;
+  corners: number | null;
+  fouls: number | null;
+  yellow_cards: number | null;
+  red_cards: number | null;
+  offsides: number | null;
+  saves: number | null;
+  tackles: number | null;
+  interceptions: number | null;
+  clearances: number | null;
+  duels_won: number | null;
+}
+
+export interface PostMatchPeriod {
+  home: PostMatchPeriodTeam;
+  away: PostMatchPeriodTeam;
+}
+
+export type PostMatchEventType =
+  | 'goal'
+  | 'own_goal'
+  | 'penalty_goal'
+  | 'penalty_missed'
+  | 'yellow_card'
+  | 'red_card'
+  | 'second_yellow'
+  | 'substitution';
+
+export type PostMatchPeriodName = 'first_half' | 'second_half' | 'extra_time';
+
+export interface PostMatchEvent {
+  minute: number;
+  added_time: number | null;
+  period: PostMatchPeriodName;
+  type: PostMatchEventType;
+  side: 'home' | 'away' | null;
+  player_id: string | null;
+  player_name: string | null;
+  assist_id: string | null;
+  assist_name: string | null;
+  player_in_id: string | null;
+  player_in_name: string | null;
+  player_out_id: string | null;
+  player_out_name: string | null;
+  score_after: PostMatchScoreValue | null;
+  detail: string | null;
+}
+
+export interface PostMatchLineupPlayer {
+  player_id: string | null;
+  name: string;
+  position: string | null;
+  position_id: number | null;
+  shirt_number: string | null;
+  rating: number | null;
+}
+
+export interface PostMatchLineupSide {
+  formation: string | null;
+  coach: string | null;
+  starters: PostMatchLineupPlayer[];
+  substitutes: PostMatchLineupPlayer[];
+}
+
+export interface PostMatchPlayerStats {
+  player_id: string | null;
+  name: string;
+  side: 'home' | 'away';
+  starter: boolean;
+  position: string | null;
+  position_id: number | null;
+  shirt_number: string | null;
+  minutes: number | null;
+  rating: number | null;
+  goals: number | null;
+  assists: number | null;
+  xg: number | null;
+  xa: number | null;
+  shots: number | null;
+  shots_on_target: number | null;
+  goals_conceded: number | null;
+  saves: number | null;
+  xgot_faced: number | null;
+  goals_prevented: number | null;
+  passes_accurate: number | null;
+  passes_total: number | null;
+  chances_created: number | null;
+  touches: number | null;
+  touches_opp_box: number | null;
+  tackles: number | null;
+  interceptions: number | null;
+  clearances: number | null;
+  duels_won: number | null;
+  duels_lost: number | null;
+  aerials_won: number | null;
+  fouls: number | null;
+  was_fouled: number | null;
+  yellow_cards: number;
+  red_cards: number;
+}
+
+export interface PostMatchCoverage {
+  sections: {
+    score: boolean;
+    halves: boolean;
+    timeline: boolean;
+    lineups: boolean;
+    players: boolean;
+    xg: boolean;
+  };
+  available: number;
+  total: number;
+}
+
+export interface PostMatchConflict {
+  field: string;
+  chosen_source: PostMatchSourceId;
+  chosen_value: number | string;
+  alternatives: Partial<Record<PostMatchSourceId, number | string>>;
+}
+
+export interface PostMatchOutput {
+  version: string;
+  status: PostMatchStatus;
+  generated_at: string;
+  score: PostMatchScore;
+  totals: {
+    home: PostMatchTotalsTeam;
+    away: PostMatchTotalsTeam;
+  } | null;
+  periods: {
+    first_half: PostMatchPeriod | null;
+    second_half: PostMatchPeriod | null;
+  } | null;
+  timeline: PostMatchEvent[];
+  lineups: {
+    home: PostMatchLineupSide | null;
+    away: PostMatchLineupSide | null;
+  } | null;
+  players: {
+    home: PostMatchPlayerStats[];
+    away: PostMatchPlayerStats[];
+  };
+  meta: {
+    sources: PostMatchSourceRun[];
+    coverage: PostMatchCoverage;
+    conflicts: PostMatchConflict[];
+    warnings: string[];
+    deadline_ms: number;
+    timed_out: boolean;
+  };
+}
+
 export interface AggregatedResponse {
   match: MatchPayload;
   teams: { home: TeamPayload; away: TeamPayload };
   pre_match?: PreMatchPayload | null;
+  post_match?: PostMatchOutput | null;
   meta: {
     canonical_version?: string;
     generated_at?: string;

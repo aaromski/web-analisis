@@ -337,3 +337,105 @@ Liverpool. Detalle en `docs/MEDICION.md`.
   evita comparar, pero no puede publicar valor en vivo.
 - Sigue pendiente la acción del usuario en Vercel: añadir `STATS_API_BASE_URL` al
   proyecto web y redesplegar para publicar esta versión.
+
+## 15. Ciclo de aprendizaje con Supabase (2026-10-31)
+
+### 15.1 Cambios
+
+- **Esquema.** Seis migraciones en `supabase/migrations/`: tablas
+  `matches`, `match_snapshots`, `engine_params`, `predictions` e
+  `ingestion_events`; RLS activo sin políticas (solo `service_role`), unicidad
+  por `(match_id, phase, payload_hash)`, un único post vigente, una única
+  versión promovida y trigger que exige snapshot pre para predecir. RPC
+  `record_snapshot` (idempotente, `partial → complete`, restaura el post
+  anterior al corregir) y `purge_post_payloads`; vista `v_match_backtest` con
+  `actual_result`, Brier y log-loss. Rollback en `supabase/rollback/`.
+- **Parámetros.** Todo el motor lee de `EngineParams`
+  (`src/lib/engine/params.ts`); los defaults reproducen 1.2.0 y
+  `tests/engine/params.test.ts` fija la identidad implícito vs explícito.
+- **Captura pre.** `persistPreAnalysis` escribe partido, snapshot canónico por
+  hash y predicción de producción; se invoca desde `after()` en
+  `/api/analyze`, con timeout propio y fail-open.
+- **Variante sombra v1.** `src/lib/engine/shadow.ts` define
+  `engine-1.3.0-shadow-noanchor`: los defaults de 1.2.0 con el ancla
+  neutralizada (`finalWeightMin/Max = 0` y los cinco pesos a cero; sin tocar
+  los mínimos el `weightScale` devolvía el peso a 0,25). La fila vive en
+  `engine_params` con `status = shadow` (migración
+  `20261031120500_learning_loop_shadow_params.sql`) y el código solo lee
+  overrides numéricos: claves o valores inválidos se ignoran. Tras guardar la
+  predicción de producción, `persistShadowAnalysis` lee la fila (caché de 60 s),
+  corre el motor y escribe `variant = shadow` con
+  `on_conflict (snapshot_id, variant, params_version)`; nunca lanza ni altera
+  la producción. `anchorLambdas` recibe ahora `params` desde `analyzeMatch`
+  (antes usaba siempre los defaults, lo que hacía que la sombra no pudiera
+  desactivar el ancla).
+- **Laboratorio real.** `getLabSummary` empareja la última captura pre con
+  ambas variantes por partido finalizado y publica filas `1x2_home`,
+  `1x2_draw`, `1x2_away` y `totals` (solo si comparten lado y línea): media de
+  cada motor, `deltaPp = sombra − producción`, `n` partidos e IC 95 % de la
+  diferencia cuando `n ≥ 2`. Estado `complete` con 100 partidos y filas,
+  `partial` con 100 sin filas comparables, `insufficient` por debajo.
+- **Retención.** `npm run purge [-- --keep días] [--dry-run]` llama a
+  `purge_post_payloads`, vacía solo el JSON de los post antiguos y deja una
+  traza `purge_payloads` en `ingestion_events`.
+- **Ingesta post.** `POST /api/ingest/post` (`x-ingest-token`, comparación en
+  tiempo constante) valida `post_match`, anula campos en conflicto, deriva el
+  marcador y registra el snapshot post. Solo persiste si el partido ya tiene
+  captura `pre` (409 `POST_MATCH_WITHOUT_PRE`, sin crear filas); el trigger
+  `match_snapshots_post_requires_pre` bloquea la misma escritura directa por RPC.
+- **UI.** Sección «Sombra vs. producción» al final del dashboard con la
+  compuerta de 100 partidos, estados explícitos y `GET /api/lab`.
+
+### 15.2 Verificación
+
+- `npm run typecheck` limpio; `npm test` **86/86**; `npm run build` correcto
+  con las rutas `/api/lab` y `/api/ingest/post`.
+- Sombra verificada en vivo contra Supabase: un análisis real de
+  Liverpool–Arsenal generó `production` 0,3069/0,2878/0,4053 y `shadow`
+  0,2576/0,3066/0,4357 con `params_version = engine-1.3.0-shadow-noanchor`,
+  evento `generate_predictions` `ok` (301 ms, `request_id = shadow`).
+- `GET /api/lab` contrastado con un partido finalizado de prueba (snapshot pre
+  + ambas variantes): 1/100, cuatro filas con delta +5,0 / −2,0 / −3,0 /
+  −3,0 pp y `n = 1`; con dos predicciones del mismo partido se conserva la
+  última captura y se deduplica. Filas de prueba eliminadas y laboratorio de
+  nuevo en 0/100. En navegador sobre el build de producción, la tabla muestra
+  los cuatro mercados con «Observación en curso».
+- `npm run purge -- --dry-run` valida la ventana; la purga real no se ejecutó
+  (no hay snapshots post todavía y requiere autorización).
+- `npm run audit` idéntico a §14.2 (motor |Δ| 0,71 · MAE 4,4 pp; anclado
+  |Δ| 0,16 · MAE 1,2 pp; sesgo 1,2 pp; valor 16/30; criterios OK): el refactor
+  de parámetros no cambió producción.
+- Migraciones aplicadas en PostgreSQL 17.11 y probadas en transacción:
+  duplicado detectado, `partial → complete`, post único vigente, corrección
+  restaura el anterior, trigger rechaza predicción sobre post, `anon` y
+  `authenticated` sin acceso a tablas ni funciones.
+- Persistencia real: primera captura `ok`, repetición `duplicate` con el mismo
+  `snapshot_id`; 1 snapshot + 1 predicción. Un análisis desde la UI con datos
+  actualizados generó un segundo snapshot (hash distinto) y su predicción, sin
+  duplicar eventos.
+- Post sin pre verificado en vivo: la capa devuelve `missing_pre` sin crear el
+  partido, el RPC directo falla con `23514` y, con un pre previo, el post se
+  registra como vigente. Filas de prueba eliminadas.
+- `GET /api/lab` 200 `insufficient` (0/100); `POST /api/ingest/post` 401 sin
+  token o con token incorrecto, 400 con cuerpo inválido y 409
+  `POST_MATCH_UNAVAILABLE` contra la API desplegada, que aún no sirve
+  `?include=post_match`.
+- Navegador sobre el build de producción: análisis Bayern–Dortmund 200 y
+  sección sombra visible con la compuerta en 0/100; sin errores de consola.
+
+### 15.3 Límites y pendientes
+
+- La sombra v1 es un brazo de control (sin ancla), no una candidata a
+  promoción. La comparación solo gana muestra con partidos finalizados que
+  tengan captura pre; el contador sigue en 0/100. Cambiar de candidata exige
+  una nueva fila `shadow` en `engine_params`, sin tocar código.
+- `n` e IC se calculan sobre partidos, no sobre predicciones sueltas: el lab
+  usa un snapshot por partido (el más reciente con ambas variantes) y no mide
+  calibración (Brier/log-loss) todavía; eso llegará con la vista de backtest.
+  La lectura asume una versión de producción y una sombra; al promover una
+  candidata habrá que filtrar por `params_version` para no mezclar motores.
+- La ingesta post devolverá 409 hasta que `../api` publique
+  `?include=post_match`; el contrato y la ruta ya están listos.
+- Sigue pendiente en Vercel: `STATS_API_BASE_URL` en el proyecto web y las
+  variables de Supabase/`INGEST_TOKEN` en el proyecto que ejecute ingesta.
+- Sin commits, pushes ni despliegues.

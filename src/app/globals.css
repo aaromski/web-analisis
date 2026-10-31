@@ -1700,3 +1700,431 @@ button {
     animation: none;
   }
 }
+
+/* ── Sombra · comparación experimental ───────────────────────────────
+   Anexo apagado al final del dashboard: gris y hairlines; lima solo para
+   producción, ámbar solo para la compuerta alcanzada. No compite con el
+   análisis de producción. */
+
+.shadow-section {
+  margin-top: 8px;
+  padding-block: 48px 56px;
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+  scroll-margin-top: 24px;
+}
+
+.shadow-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 320px);
+  align-items: end;
+  gap: 24px 48px;
+  padding-bottom: 28px;
+  border-bottom: 1px solid var(--line);
+}
+
+.shadow-title {
+  margin: 8px 0 0;
+  font-family: var(--serif);
+  font-size: clamp(28px, 3.2vw, 40px);
+  font-weight: 400;
+  line-height: 1.05;
+  letter-spacing: -0.015em;
+}
+
+.shadow-lead {
+  margin: 12px 0 0;
+  max-width: 62ch;
+  font-size: 15px;
+  color: var(--text-muted);
+}
+
+.shadow-engines {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 16px;
+}
+
+/* Texto en chip, borde discontinuo: nunca solo color. */
+.shadow-experimental {
+  border-style: dashed;
+}
+
+.shadow-gauge {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  max-width: 320px;
+  justify-self: end;
+}
+
+.shadow-gauge-label {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.shadow-gauge-label strong {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.shadow-gauge-track {
+  position: relative;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.shadow-gauge-fill {
+  display: block;
+  height: 100%;
+  background: var(--text-dim);
+  transition: width 320ms var(--ease);
+}
+
+.shadow-gauge-fill[data-complete="true"] {
+  background: var(--amber);
+}
+
+.shadow-state {
+  margin-top: 24px;
+  padding: 2px 0 2px 16px;
+  border-left: 2px solid var(--line-strong);
+}
+
+.shadow-state[data-state="complete"] {
+  border-left-color: var(--amber);
+}
+
+.shadow-state[data-state="error"] {
+  border-left-color: var(--coral);
+}
+
+.shadow-state-title {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 21px;
+  font-weight: 400;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+.shadow-state-body {
+  margin: 6px 0 0;
+  max-width: 74ch;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+.shadow-state-foot {
+  margin: 10px 0 0;
+  max-width: 74ch;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.shadow-partial-chip {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 3px 9px;
+}
+
+.shadow-retry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 16px;
+  margin-top: 16px;
+}
+
+.shadow-retry-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.shadow-table {
+  margin-top: 32px;
+}
+
+.shadow-table-head,
+.shadow-row {
+  display: grid;
+  align-items: center;
+  gap: 6px 20px;
+}
+
+.shadow-table-head {
+  grid-template-columns:
+    minmax(0, 1.7fr) minmax(88px, 0.7fr) minmax(88px, 0.7fr)
+    minmax(112px, 0.85fr) minmax(120px, 0.9fr) minmax(156px, 1fr);
+  grid-template-areas: "market production shadow delta sample status";
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.shadow-table-head > span:nth-child(1) {
+  grid-area: market;
+}
+
+.shadow-table-head > span:nth-child(2) {
+  grid-area: production;
+}
+
+.shadow-table-head > span:nth-child(3) {
+  grid-area: shadow;
+}
+
+.shadow-table-head > span:nth-child(4) {
+  grid-area: delta;
+}
+
+.shadow-table-head > span:nth-child(5) {
+  grid-area: sample;
+}
+
+.shadow-table-head > span:nth-child(6) {
+  grid-area: status;
+}
+
+.shadow-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.shadow-row {
+  grid-template-columns:
+    minmax(0, 1.7fr) minmax(88px, 0.7fr) minmax(88px, 0.7fr)
+    minmax(112px, 0.85fr) minmax(120px, 0.9fr) minmax(156px, 1fr);
+  grid-template-areas: "market production shadow delta sample status";
+  padding-block: 15px;
+  border-bottom: 1px solid var(--line);
+}
+
+.shadow-row:last-child {
+  border-bottom: 0;
+}
+
+.shadow-cell {
+  min-width: 0;
+}
+
+.shadow-market {
+  grid-area: market;
+}
+
+.shadow-production {
+  grid-area: production;
+}
+
+.shadow-shadow {
+  grid-area: shadow;
+}
+
+.shadow-delta {
+  grid-area: delta;
+}
+
+.shadow-sample {
+  grid-area: sample;
+}
+
+.shadow-status {
+  grid-area: status;
+}
+
+.shadow-market-label {
+  display: block;
+  font-size: 14px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* Las cabeceras de columna ya rotulan en escritorio; estas etiquetas solo
+   aparecen cuando la rejilla cambia. */
+.shadow-cell-label {
+  display: none;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.shadow-value {
+  display: block;
+  font-family: var(--mono);
+  font-size: 22px;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.shadow-value-production {
+  color: var(--lime);
+}
+
+.shadow-value-shadow {
+  color: var(--text-muted);
+}
+
+.shadow-value[data-empty="true"] {
+  color: var(--text-dim);
+}
+
+.shadow-delta-value {
+  display: block;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.shadow-delta-value[data-empty="true"] {
+  color: var(--text-dim);
+}
+
+.shadow-sample-line {
+  display: block;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.shadow-sub {
+  display: block;
+  margin-top: 3px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-dim);
+}
+
+.dash-nav a.dash-nav-muted {
+  color: var(--text-dim);
+  border-bottom: 1px dashed var(--line-strong);
+  border-radius: 0;
+  padding-bottom: 4px;
+}
+
+@media (max-width: 1199px) {
+  .shadow-head {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .shadow-gauge {
+    justify-self: start;
+    max-width: 360px;
+  }
+
+  .shadow-table-head {
+    display: none;
+  }
+
+  .shadow-table {
+    margin-top: 24px;
+  }
+
+  .shadow-row {
+    grid-template-columns:
+      minmax(0, 1.6fr) minmax(84px, 0.7fr) minmax(84px, 0.7fr)
+      minmax(120px, 0.9fr) minmax(140px, 0.9fr);
+    grid-template-areas:
+      "market production shadow delta status"
+      "market sample sample delta status";
+    gap: 6px 18px;
+    padding-block: 18px;
+  }
+
+  .shadow-cell-label {
+    display: block;
+    margin-bottom: 2px;
+  }
+
+  .shadow-status {
+    align-self: center;
+    justify-self: end;
+    text-align: right;
+  }
+}
+
+@media (max-width: 639px) {
+  .shadow-section {
+    padding-block: 36px 40px;
+  }
+
+  .shadow-head {
+    gap: 20px;
+    padding-bottom: 20px;
+  }
+
+  .shadow-state {
+    margin-top: 20px;
+    padding-left: 12px;
+  }
+
+  .shadow-table {
+    margin-top: 20px;
+  }
+
+  /* Sin tabla ni scroll horizontal: cuatro líneas por mercado. */
+  .shadow-row {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+      "market market"
+      "production shadow"
+      "delta delta"
+      "sample status";
+    gap: 10px 12px;
+    padding-block: 18px 20px;
+  }
+
+  .shadow-market-label {
+    font-size: 15px;
+  }
+
+  .shadow-production,
+  .shadow-shadow {
+    min-width: 0;
+  }
+
+  .shadow-delta-value {
+    font-size: 12px;
+  }
+
+  .shadow-sample-line {
+    display: inline;
+  }
+
+  .shadow-sample-line + .shadow-sample-line {
+    margin-left: 8px;
+  }
+
+  .shadow-status {
+    justify-self: end;
+    align-self: end;
+  }
+
+  /* Un chip largo puede ocupar dos líneas en lugar de desbordar. */
+  .shadow-status .chip {
+    white-space: normal;
+    line-height: 1.3;
+    text-align: right;
+  }
+}
