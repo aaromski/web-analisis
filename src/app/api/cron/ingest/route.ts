@@ -129,7 +129,7 @@ export async function GET(request: Request): Promise<Response> {
   if (60_000 - (Date.now() - started) < MIN_LEARNING_BUDGET_MS) {
     learning = { state: 'skipped', reason: 'budget' };
   } else {
-    learning = await runLearning();
+    learning = await runLearning(Date.now(), { deadlineMs: started + 55_000 });
   }
 
   return Response.json(

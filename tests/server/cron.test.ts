@@ -163,6 +163,10 @@ function dbHandler(postAvailable = true): FetchHandler {
         { snapshot_id: '33333333-3333-4333-8333-333333333333', inserted: true },
       ]);
     }
+    // Sin filas en `engine_params`: el aprendizaje no tiene versión promovida.
+    if (call.method === 'GET' && call.url.includes('/rest/v1/engine_params')) {
+      return Response.json([]);
+    }
     return new Response(null, { status: 201 });
   };
 }

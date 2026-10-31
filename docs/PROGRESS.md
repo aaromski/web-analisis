@@ -581,3 +581,138 @@ Liverpool. Detalle en `docs/MEDICION.md`.
 - El ajuste mueve solo la escala del ancla. Ampliar el vector (pesos por
   dominio, calibración) queda fuera hasta tener una muestra bastante mayor que
   la compuerta, para evitar sobreajuste.
+
+## 17. Mejora continua, segunda iteración (2026-10-31)
+
+Esta sección sustituye el ajuste 70/30 y la candidata única descritos en 16.1
+sin cambiar el esquema de la base (no hace falta migración nueva).
+
+### 17.1 Cambios
+
+- **Control fijo de referencia.** `REFERENCE_PARAMS_VERSION =
+  'baseline-1.2.0-defaults'` es una fila `shadow` con los defaults que la
+  primera pasada del aprendizaje siembra (`ensureReference`) y que nunca se
+  promociona ni se retira. `readShadowRows` consulta con
+  `or=(version.eq.<referencia>,status.eq.shadow)`, coloca la referencia primero
+  y recorta a `MAX_SHADOW_VERSIONS = 3` sombras evaluadas por análisis
+  (referencia + hasta dos candidatas). `persistShadowAnalysis` recorre todas y
+  un fallo en una versión no bloquea a las demás.
+- **Guardarraíl de deriva.** La producción se compara contra la referencia con
+  ≥ 50 partidos, Brier medio ≥ 0,004 peor y bootstrap determinista ≥ 95 %; si
+  se dispara, se inserta `auto-rollback-YYYYMMDD` con los defaults y se
+  promueve, dejando la referencia intacta como sombra. Es un límite superior a
+  la deriva acumulada entre promociones sucesivas.
+- **Varias candidatas en paralelo.** El ajuste crea hasta
+  `MAX_AUTO_CANDIDATES = 2` candidatas con escalas distintas. En la promoción
+  compiten todas las sombras automáticas, la confianza bootstrap exigida se
+  ajusta por Bonferroni (`1 − 0,05/n`), gana la de menor Brier medio y las que
+  pierden con ≥ 50 partidos se retiran.
+- **Walk-forward multi-fold.** Tres folds expansivos con validaciones
+  contiguas y disjuntas (tamaño `max(20, 20 % n)` al final de la serie). Cada
+  partido se valida una sola vez, una escala necesita ganar en al menos
+  2 de 3 folds y el Brier agregado de las validaciones debe mejorar ≥ 0,004
+  sin empeorar el log-loss más de 0,002.
+- **Guardarraíles por mercado.** En la promoción, el Brier de totales leyendo
+  `totals_line/side/probability` y el marcador de la vista; en la creación,
+  además, totales y BTTS recalculados sobre el payload. Margen 0,004 con un
+  mínimo de 10 observaciones; sin muestra el guardarraíl deja pasar porque la
+  decisión principal ya exige 50 partidos emparejados.
+- **Presupuesto del cron.** `runLearning(nowMs, { deadlineMs })` comprueba el
+  reloj antes de cada fold y antes de insertar candidatas; el cron pasa
+  `started + 55 s` y responde `{state:'skipped', reason:'budget'}` si no cabe.
+- **Auditoría en `metrics`.** Cada candidata guarda folds (entrenamiento,
+  ventana de validación, Brier base y escalas que ganan), rejilla por escala con
+  votos y guardarraíles, agregado de validación y línea base, semilla del
+  bootstrap y hash FNV-1a del conjunto de partidos.
+- **Lab/UI.** `engine` pasa de `candidate` a `candidates: string[]` más
+  `reference`; la sección sombra muestra los tres chips.
+
+### 17.2 Verificación
+
+- `npm run typecheck` limpio; `npm test` **115/115**; `npm run build`
+  correcto. Pruebas nuevas: ventanas walk-forward expansivas y disjuntas,
+  umbrales de deriva, guardarraíl con y sin muestra, Brier de totales con push,
+  siembra idempotente de la referencia, promoción entre dos candidatas con
+  retirada de la perdedora y vuelta a defaults por deriva.
+- Verificación read-only contra Supabase con `.env.local` mediante
+  `GET /api/lab`: `engine.candidates` incluye el control heredado y
+  `engine.reference` es `null` hasta la primera pasada del cron (no se
+  escribió nada en la base).
+- El cron de pruebas sigue publicando `learning`
+  (`{state:'skipped', reason:'no-promoted'}` sin fila promovida).
+
+### 17.3 Límites y pendientes
+
+- **Sin commit, push ni despliegue.** Para activarlo hay que subir los cambios
+  y redesplegar.
+- La referencia se crea en la primera pasada del cron (2026-11-01 06:00 UTC) y
+  desde entonces cada análisis pre calcula una versión sombra adicional.
+- El objetivo sigue midiendo 1X2 (Brier/log-loss). Totales y BTTS solo actúan
+  como guardarraíles; el marcador exacto y los córners no tienen objetivo
+  propio (los córners solo cambian de umbral vía λ total).
+- Con ~100 partidos el ajuste sigue siendo una sola dimensión (escala del
+  ancla). Los folds reducen el riesgo de elegir por ruido, pero no sustituyen
+  una muestra mayor para abrir el vector de parámetros.
+
+## 18. Objetivo compuesto y promoción secuencial (2026-10-31)
+
+Esta sección amplía la 17 sin cambiar el esquema: usa columnas que la vista ya
+exponía (`totals_*`, `anchor_weight`) y no requiere migración.
+
+### 18.1 Cambios
+
+- **Objetivo compuesto 1X2 + totales.** La creación walk-forward y la promoción
+  puntúan cada partido con `0,5 × (Brier 1X2 / 2) + 0,5 × Brier del total
+  publicado`; sin línea de totales se usa solo el 1X2 normalizado. El ancla
+  ahora se ajusta por su efecto en ambos mercados, no solo en el resultado.
+- **Guardarraíles en la promoción.** El 1X2 no puede empeorar más de 0,004
+  aunque el compuesto mejore por totales; totales mantiene el mismo margen.
+  Ambos exigen 10 observaciones y sin muestra dejan pasar.
+- **Segmento de ancla baja.** La vista publica `anchor_weight` y
+  `listScoredPredictions` la lee; la promoción exige que el compuesto no
+  empeore en los partidos donde producción tiene peso ≤ 0,4 (incluye los
+  partidos sin cuotas). Evita premiar una escala que solo gana por acercarse
+  más al mercado. La creación registra `anchorShare` (partidos anclados y peso
+  medio) en `metrics`.
+- **Promoción secuencial (SPRT).** Prueba de Wald sobre el signo del
+  diferencial compuesto emparejado: H0 50 % de aciertos, H1 65 %, α 0,05
+  repartido por Bonferroni entre candidatas, β 0,10. Puede promover desde 25
+  pares si la verosimilitud acumulada cruza `ln((1−β)/α)` y la media también
+  mejora ≥ 0,004. La vía fija de 50 pares con bootstrap sigue vigente; los
+  empates no votan pero cuentan para el mínimo y la media.
+- **Guardarraíl de marcador exacto.** Puntuación propia gruesa sobre el top de
+  la matriz y una categoría residual "otro" (`exactScoreBrier`), recalculada en
+  la creación porque la vista no guarda la matriz. Margen 0,02 y mínimo 10.
+- **Paginación.** `listScoredPredictions` pagina `v_match_backtest` de 1000 en
+  1000 con tope de 5000 filas por pasada; el cron conserva su presupuesto
+  aunque el histórico crezca.
+- **Auditoría ampliada.** `metrics.objective = 'walk_forward_composite'`,
+  pesos del objetivo, `anchorShare`, Brier compuesto por escala y guardarraíles
+  de 1X2/totales/BTTS/marcador.
+
+### 18.2 Verificación
+
+- `npm run typecheck` limpio; `npm test` **123/123**; `npm run build` correcto.
+  Pruebas nuevas: compuesto con y sin totales, Brier de marcador con categoría
+  "otro" y duplicados, SPRT (mínimo de muestra, señal fuerte, ruido, margen y
+  empates), segmento de ancla, promoción temprana a 30 pares, bloqueo por 1X2
+  degradado con totales mejor y bloqueo por segmento de ancla baja, y paginación
+  de la vista con lectura de `anchor_weight`.
+- Verificación read-only del build local con `.env.local`:
+  `GET /api/lab` responde `state:'insufficient'`, `engine.promoted:
+  'engine-1.2.0-defaults'`, candidata `engine-1.3.0-shadow-noanchor` y
+  `reference:null`; no se escribió nada en Supabase.
+
+### 18.3 Límites y pendientes
+
+- **Sin commit, push ni despliegue.** Para activarlo hay que subir los cambios y
+  redesplegar; hasta entonces la producción sigue con la lógica anterior.
+- La promoción secuencial puede adelantarse a los 50 pares; está acotada por α
+  pero con 25–30 observaciones sigue siendo sensible a rachas. El enfriamiento
+  de 30 días y el rollback automático son la red de seguridad.
+- El guardarraíl de marcador exacto solo se evalúa al crear candidatas: la
+  vista de backtest no expone la matriz de marcadores. Córners sigue sin
+  objetivo propio porque el post no guarda córners por partido.
+- El vector de parámetros sigue en una dimensión (escala del ancla) hasta reunir
+  250–300 partidos cerrados; con la muestra actual más perillas memorizarían
+  ruido.

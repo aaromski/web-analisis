@@ -101,6 +101,8 @@ function stubFetch(handler: FetchHandler): { calls: FetchCall[]; restore: () => 
 
 const PROMOTED = 'engine-1.2.0-defaults';
 const CANDIDATE = 'auto-anchor-s110-20261020';
+const CANDIDATE_B = 'auto-anchor-s100-20261020';
+const REFERENCE = 'baseline-1.2.0-defaults';
 const NOW = Date.parse('2026-10-31T06:00:00Z');
 
 function engineRow(
@@ -119,7 +121,12 @@ function engineRow(
 /** Filas de la vista de backtest: un par sombra/producción por partido. */
 function scoredRows(
   count: number,
-  options: { variant: 'shadow' | 'production'; version: string; brier: number },
+  options: {
+    variant: 'shadow' | 'production';
+    version: string;
+    brier: number;
+    extras?: Record<string, unknown>;
+  },
   startDays = 20,
 ): Array<Record<string, unknown>> {
   return Array.from({ length: count }, (_, index) => {
@@ -132,13 +139,30 @@ function scoredRows(
       brier: options.brier,
       log_loss: 0.6,
       pre_captured_at: captured.toISOString(),
+      ...options.extras,
     };
   });
 }
 
-function pairedRows(count: number): Array<Record<string, unknown>> {
-  const shadow = scoredRows(count, { variant: 'shadow', version: CANDIDATE, brier: 0.40 });
-  const production = scoredRows(count, { variant: 'production', version: PROMOTED, brier: 0.45 });
+function pairedRows(
+  count: number,
+  shadowVersion = CANDIDATE,
+  shadowBrier = 0.4,
+  productionBrier = 0.45,
+  extras: { shadow?: Record<string, unknown>; production?: Record<string, unknown> } = {},
+): Array<Record<string, unknown>> {
+  const shadow = scoredRows(count, {
+    variant: 'shadow',
+    version: shadowVersion,
+    brier: shadowBrier,
+    extras: extras.shadow,
+  });
+  const production = scoredRows(count, {
+    variant: 'production',
+    version: PROMOTED,
+    brier: productionBrier,
+    extras: extras.production,
+  });
   const pairs: Array<Record<string, unknown>> = [];
   for (let index = 0; index < count; index += 1) {
     pairs.push({
@@ -148,6 +172,44 @@ function pairedRows(count: number): Array<Record<string, unknown>> {
     });
   }
   return production.concat(pairs);
+}
+
+/** Pares con diferencias heterogéneas por partido (para guardarraíles). */
+function customPairs(
+  rows: Array<{
+    shadowBrier: number;
+    productionBrier: number;
+    shadowExtras?: Record<string, unknown>;
+    productionExtras?: Record<string, unknown>;
+  }>,
+): Array<Record<string, unknown>> {
+  const production: Array<Record<string, unknown>> = [];
+  const shadow: Array<Record<string, unknown>> = [];
+  rows.forEach((row, index) => {
+    const matchId = `test:custom-${String(index).padStart(4, '0')}`;
+    const snapshotId = `snap-custom-${String(index).padStart(4, '0')}`;
+    production.push({
+      match_id: matchId,
+      pre_snapshot_id: snapshotId,
+      variant: 'production',
+      params_version: PROMOTED,
+      brier: row.productionBrier,
+      log_loss: 0.6,
+      pre_captured_at: new Date(Date.parse('2026-09-01T00:00:00Z') + index * 86_400_000).toISOString(),
+      ...row.productionExtras,
+    });
+    shadow.push({
+      match_id: matchId,
+      pre_snapshot_id: snapshotId,
+      variant: 'shadow',
+      params_version: CANDIDATE,
+      brier: row.shadowBrier,
+      log_loss: 0.6,
+      pre_captured_at: new Date(Date.parse('2026-09-01T00:00:00Z') + index * 86_400_000).toISOString(),
+      ...row.shadowExtras,
+    });
+  });
+  return production.concat(shadow);
 }
 
 /** Payload canónico mínimo, sin cuotas: el ancla no aplica y todas las escalas empatan. */
@@ -261,6 +323,154 @@ test('pickBestScale elige el mejor Brier y desempata hacia 1', async () => {
   assert.deepEqual(ANCHOR_SCALES, [0.7, 0.8, 0.9, 1.0, 1.1]);
 });
 
+test('walkForwardWindows produce folds expansivos con validación disjunta', async () => {
+  const { walkForwardWindows } = await learning();
+  const windows = walkForwardWindows(100);
+  assert.deepEqual(
+    windows.map((window) => [window.trainMatches, window.validationStart, window.validationEnd]),
+    [
+      [40, 40, 60],
+      [60, 60, 80],
+      [80, 80, 100],
+    ],
+  );
+  // Con 60 partidos no hay dos folds válidos: se pospone el ajuste.
+  assert.deepEqual(walkForwardWindows(60), []);
+  const many = walkForwardWindows(200);
+  assert.equal(many.length, 3);
+  assert.ok(many.every((window, index) => index === 0 || window.validationStart >= many[index - 1].validationEnd));
+});
+
+test('evaluateDrift detecta degradación sostenida frente a la referencia', async () => {
+  const { evaluateDrift } = await learning();
+  assert.equal(evaluateDrift(Array.from({ length: 49 }, () => 0.05)).promote, false);
+  const decision = evaluateDrift(Array.from({ length: 50 }, () => 0.05));
+  assert.equal(decision.promote, true);
+  assert.equal(decision.matches, 50);
+  assert.equal(evaluateDrift(Array.from({ length: 50 }, () => 0.001)).promote, false);
+});
+
+test('evaluateGuardrail solo bloquea con muestra y degradación material', async () => {
+  const { evaluateGuardrail } = await learning();
+  assert.equal(evaluateGuardrail(Array.from({ length: 9 }, () => 0.2)).ok, true);
+  assert.equal(evaluateGuardrail(Array.from({ length: 10 }, () => 0.001)).ok, true);
+  assert.equal(evaluateGuardrail(Array.from({ length: 10 }, () => 0.05)).ok, false);
+  assert.equal(evaluateGuardrail(Array.from({ length: 10 }, () => -0.05)).ok, true);
+});
+
+test('totalsBrier puntúa la línea publicada y descarta push o datos incompletos', async () => {
+  const { totalsBrier } = await learning();
+  const row = (overrides: Record<string, unknown>) =>
+    ({
+      totalsLine: 2.5,
+      totalsSide: 'over',
+      totalsProbability: 0.6,
+      homeScore: 2,
+      awayScore: 1,
+      ...overrides,
+    }) as never;
+  assert.ok(Math.abs((totalsBrier(row({})) ?? -1) - 0.16) < 1e-12);
+  assert.ok(Math.abs((totalsBrier(row({ totalsSide: 'under' })) ?? -1) - 0.36) < 1e-12);
+  assert.equal(totalsBrier(row({ totalsLine: 3 })), null);
+  assert.equal(totalsBrier(row({ totalsSide: null })), null);
+  assert.equal(totalsBrier(row({ homeScore: null })), null);
+});
+
+test('compositeBrier mezcla 1X2 normalizado y totales al 50 %', async () => {
+  const { compositeBrier } = await learning();
+  const row = (overrides: Record<string, unknown>) =>
+    ({
+      brier: 0.4,
+      totalsLine: 2.5,
+      totalsSide: 'over',
+      totalsProbability: 0.6,
+      homeScore: 2,
+      awayScore: 1,
+      ...overrides,
+    }) as never;
+  // 0,5 × (0,4 / 2) + 0,5 × 0,16 = 0,18.
+  assert.ok(Math.abs(compositeBrier(row({})) - 0.18) < 1e-12);
+  // Sin totales se puntúa solo el 1X2 normalizado.
+  assert.ok(Math.abs(compositeBrier(row({ totalsLine: null })) - 0.2) < 1e-12);
+});
+
+test('exactScoreBrier castiga el marcador real y usa una categoría "otro"', async () => {
+  const { exactScoreBrier } = await learning();
+  const scores = [
+    { home: 1, away: 0, probability: 0.15 },
+    { home: 1, away: 1, probability: 0.12 },
+  ];
+  // Acierta el marcador: (0,15−1)² + 0,12² + resto² = 1,2698.
+  assert.ok(Math.abs((exactScoreBrier(scores, 1, 0) ?? -1) - 1.2698) < 1e-12);
+  // El marcador real cae en "otro": 0,15² + 0,12² + (0,73−1)² = 0,1098.
+  assert.ok(Math.abs((exactScoreBrier(scores, 0, 0) ?? -1) - 0.1098) < 1e-12);
+  assert.equal(exactScoreBrier([], 0, 0), null);
+  // Una lista con duplicados no cuenta dos veces la misma categoría.
+  assert.ok(
+    Math.abs(
+      (exactScoreBrier([...scores, { home: 1, away: 0, probability: 0.15 }], 1, 0) ?? -1) - 1.2698,
+    ) < 1e-12,
+  );
+});
+
+test('evaluateSequential promueve con evidencia de signo consistente antes de 50 pares', async () => {
+  const { evaluateSequential } = await learning();
+  // 24 triunfos aún no alcanzan el mínimo de muestra.
+  assert.equal(evaluateSequential(Array.from({ length: 24 }, () => -0.02)).promote, false);
+  const strong = evaluateSequential(Array.from({ length: 25 }, () => -0.02));
+  assert.equal(strong.promote, true);
+  assert.equal(strong.matches, 25);
+  assert.equal(strong.wins, 25);
+  assert.ok(strong.logLikelihood > 0);
+  // Con 2 candidatas α se divide: el mismo caso sigue pasando de sobra.
+  assert.equal(
+    evaluateSequential(Array.from({ length: 25 }, () => -0.02), { alpha: 0.025 }).promote,
+    true,
+  );
+  // Sin señal clara no hay promoción.
+  const noisy = [
+    ...Array.from({ length: 16 }, () => -0.02),
+    ...Array.from({ length: 14 }, () => 0.02),
+  ];
+  assert.equal(evaluateSequential(noisy).promote, false);
+  // La media debe superar el margen aunque el signo sea perfecto.
+  assert.equal(evaluateSequential(Array.from({ length: 30 }, () => -0.001)).promote, false);
+  // Los empates no votan y tampoco sirven para alcanzar el mínimo.
+  assert.equal(evaluateSequential(Array.from({ length: 40 }, () => 0)).promote, false);
+});
+
+test('lowAnchorDiffs solo mide partidos donde producción apenas se ancla', async () => {
+  const { lowAnchorDiffs } = await learning();
+  const row = (overrides: Record<string, unknown>) =>
+    ({
+      matchId: 'm1',
+      snapshotId: 's1',
+      variant: 'production',
+      paramsVersion: PROMOTED,
+      brier: 0.4,
+      logLoss: 0.6,
+      preCapturedAt: '2026-09-20T00:00:00Z',
+      totalsLine: null,
+      totalsSide: null,
+      totalsProbability: null,
+      homeScore: 1,
+      awayScore: 0,
+      anchorWeight: 0.3,
+      ...overrides,
+    }) as never;
+  const rows = [
+    row({}),
+    row({ variant: 'shadow', paramsVersion: CANDIDATE, brier: 0.32 }),
+    // Este par está muy anclado: queda fuera del segmento.
+    row({ matchId: 'm2', snapshotId: 's2', anchorWeight: 0.7, brier: 0.4 }),
+    row({ matchId: 'm2', snapshotId: 's2', variant: 'shadow', paramsVersion: CANDIDATE, brier: 0.2, anchorWeight: 0.7 }),
+  ];
+  const diffs = lowAnchorDiffs(rows, CANDIDATE, PROMOTED);
+  assert.equal(diffs.length, 1);
+  // (0,32 − 0,4) / 2 = −0,04.
+  assert.ok(Math.abs(diffs[0] + 0.04) < 1e-12);
+});
+
 // ---------------------------------------------------------------------------
 // Lectura de parámetros promovidos
 // ---------------------------------------------------------------------------
@@ -334,7 +544,7 @@ test('retirar y promover validan la versión y usan la ruta correcta', async () 
     assert.equal(stub.calls.length, 0);
 
     const listed = await getEngineConfigs();
-    assert.deepEqual(listed, { promoted: null, shadow: null });
+    assert.deepEqual(listed, { promoted: null, shadows: [] });
 
     assert.deepEqual(await retireEngineVersion(CANDIDATE), { ok: true });
     const patch = stub.calls.find((call) => call.method === 'PATCH');
@@ -375,6 +585,41 @@ test('las lecturas del backtest filtran las versiones pedidas', async () => {
   }
 });
 
+test('listScoredPredictions pagina la vista y lee el peso del ancla', async () => {
+  setEnv(ENABLED_ENV);
+  const makeRow = (index: number) => ({
+    match_id: `test:page-${index}`,
+    pre_snapshot_id: `snap-page-${index}`,
+    variant: 'production',
+    params_version: 'v1',
+    brier: 0.4,
+    log_loss: 0.6,
+    anchor_weight: index === 0 ? 0.55 : null,
+  });
+  const firstPage = Array.from({ length: 1000 }, (_, index) => makeRow(index));
+  const stub = stubFetch((call) => {
+    const offset = new URL(call.url).searchParams.get('offset');
+    if (offset === '0') return Response.json(firstPage);
+    if (offset === '1000') return Response.json([makeRow(1000)]);
+    throw new Error(`offset inesperado: ${offset}`);
+  });
+
+  try {
+    const { clearParamsCache, listScoredPredictions } = await db();
+    clearParamsCache();
+
+    const rows = await listScoredPredictions(['v1']);
+    assert.equal(rows?.length, 1001);
+    assert.equal(rows?.[0].anchorWeight, 0.55);
+    assert.equal(rows?.[1].anchorWeight, null);
+    assert.equal(stub.calls.length, 2);
+    assert.ok(stub.calls[1].url.includes('offset=1000'));
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Ciclo completo
 // ---------------------------------------------------------------------------
@@ -400,7 +645,9 @@ test('promueve la candidata cuando gana en sombra y venció el enfriamiento', as
     if (call.url.includes('status=eq.promoted')) {
       return Response.json([engineRow(PROMOTED, '2026-09-01T00:00:00Z')]);
     }
-    if (call.url.includes('status=eq.shadow')) return Response.json([engineRow(CANDIDATE, null)]);
+    if (call.url.includes('status.eq.shadow')) {
+      return Response.json([engineRow(CANDIDATE, null), engineRow(REFERENCE, null)]);
+    }
     if (call.url.includes('select=version,status')) {
       return Response.json([
         { version: PROMOTED, status: 'promoted', created_at: '2026-01-01T00:00:00Z', promoted_at: '2026-09-01T00:00:00Z', retired_at: null },
@@ -441,7 +688,9 @@ test('respeta el enfriamiento de 30 días sin promover', async () => {
     if (call.url.includes('status=eq.promoted')) {
       return Response.json([engineRow(PROMOTED, '2026-10-28T00:00:00Z')]);
     }
-    if (call.url.includes('status=eq.shadow')) return Response.json([engineRow(CANDIDATE, null)]);
+    if (call.url.includes('status.eq.shadow')) {
+      return Response.json([engineRow(CANDIDATE, null), engineRow(REFERENCE, null)]);
+    }
     if (call.url.includes('select=version,status')) {
       return Response.json([
         { version: PROMOTED, status: 'promoted', created_at: '2026-01-01T00:00:00Z', promoted_at: '2026-10-28T00:00:00Z', retired_at: null },
@@ -466,6 +715,122 @@ test('respeta el enfriamiento de 30 días sin promover', async () => {
   }
 });
 
+test('promueve con 30 pares si la evidencia secuencial es consistente', async () => {
+  setEnv(ENABLED_ENV);
+  const stub = stubFetch((call) => {
+    if (call.url.includes('/rest/v1/v_match_backtest')) return Response.json(pairedRows(30));
+    if (call.url.includes('status=eq.promoted')) {
+      return Response.json([engineRow(PROMOTED, '2026-09-01T00:00:00Z')]);
+    }
+    if (call.url.includes('status.eq.shadow')) {
+      return Response.json([engineRow(CANDIDATE, null), engineRow(REFERENCE, null)]);
+    }
+    if (call.url.includes('select=version,status')) return Response.json([]);
+    if (call.url.includes('/rpc/set_promoted_params')) {
+      return Response.json([{ promoted_version: CANDIDATE, retired_version: PROMOTED }]);
+    }
+    throw new Error(`llamada inesperada: ${call.method} ${call.url}`);
+  });
+
+  try {
+    const { clearParamsCache } = await db();
+    clearParamsCache();
+
+    // El bootstrap fijo exige 50 pares; el SPRT promueve a los 30 con 30/30.
+    assert.deepEqual(await runLearning(NOW), {
+      state: 'ok',
+      reason: 'promoted',
+      shadowMatches: 30,
+      promotion: { version: CANDIDATE, retired: PROMOTED },
+    });
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('no promueve si el 1X2 empeora aunque el compuesto mejore por totales', async () => {
+  setEnv(ENABLED_ENV);
+  const shared = { home_score: 2, away_score: 1, totals_line: 2.5, totals_side: 'over' };
+  const extras = {
+    production: { ...shared, totals_probability: 0.55 },
+    shadow: { ...shared, totals_probability: 0.95 },
+  };
+  const stub = stubFetch((call) => {
+    if (call.url.includes('/rest/v1/v_match_backtest')) {
+      // La sombra gana el total (Brier 0,0025 vs 0,2025) pero pierde el 1X2.
+      return Response.json(pairedRows(60, CANDIDATE, 0.5, 0.45, extras));
+    }
+    if (call.url.includes('status=eq.promoted')) {
+      return Response.json([engineRow(PROMOTED, '2026-09-01T00:00:00Z')]);
+    }
+    if (call.url.includes('status.eq.shadow')) {
+      return Response.json([engineRow(CANDIDATE, null), engineRow(REFERENCE, null)]);
+    }
+    if (call.url.includes('select=version,status')) return Response.json([]);
+    throw new Error(`llamada inesperada: ${call.method} ${call.url}`);
+  });
+
+  try {
+    const { clearParamsCache } = await db();
+    clearParamsCache();
+
+    assert.deepEqual(await runLearning(NOW), {
+      state: 'ok',
+      reason: 'candidate-kept',
+      shadowMatches: 60,
+    });
+    assert.equal(stub.calls.filter((call) => call.url.includes('/rpc/')).length, 0);
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('no promueve si el segmento de ancla baja se degrada', async () => {
+  setEnv(ENABLED_ENV);
+  const rows = [
+    ...Array.from({ length: 20 }, () => ({
+      shadowBrier: 0.5,
+      productionBrier: 0.4,
+      productionExtras: { anchor_weight: 0.3 },
+      shadowExtras: { anchor_weight: 0.3 },
+    })),
+    ...Array.from({ length: 40 }, () => ({
+      shadowBrier: 0.3,
+      productionBrier: 0.5,
+      productionExtras: { anchor_weight: 0.7 },
+      shadowExtras: { anchor_weight: 0.7 },
+    })),
+  ];
+  const stub = stubFetch((call) => {
+    if (call.url.includes('/rest/v1/v_match_backtest')) return Response.json(customPairs(rows));
+    if (call.url.includes('status=eq.promoted')) {
+      return Response.json([engineRow(PROMOTED, '2026-09-01T00:00:00Z')]);
+    }
+    if (call.url.includes('status.eq.shadow')) {
+      return Response.json([engineRow(CANDIDATE, null), engineRow(REFERENCE, null)]);
+    }
+    if (call.url.includes('select=version,status')) return Response.json([]);
+    throw new Error(`llamada inesperada: ${call.method} ${call.url}`);
+  });
+
+  try {
+    const { clearParamsCache } = await db();
+    clearParamsCache();
+
+    // En conjunto gana (−0,05), pero en el 33 % menos anclado pierde (+0,05).
+    assert.deepEqual(await runLearning(NOW), {
+      state: 'ok',
+      reason: 'candidate-kept',
+      shadowMatches: 60,
+    });
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
 test('el brazo de control acumula hasta la compuerta y no se promociona', async () => {
   setEnv(ENABLED_ENV);
   const control = 'engine-1.3.0-shadow-noanchor';
@@ -474,7 +839,9 @@ test('el brazo de control acumula hasta la compuerta y no se promociona', async 
       return Response.json(scoredRows(60, { variant: 'shadow', version: control, brier: 0.5 }));
     }
     if (call.url.includes('status=eq.promoted')) return Response.json([engineRow(PROMOTED, null)]);
-    if (call.url.includes('status=eq.shadow')) return Response.json([engineRow(control, null)]);
+    if (call.url.includes('status.eq.shadow')) {
+      return Response.json([engineRow(control, null), engineRow(REFERENCE, null)]);
+    }
     throw new Error(`llamada inesperada: ${call.method} ${call.url}`);
   });
 
@@ -501,7 +868,10 @@ test('sin la compuerta de 100 partidos no ajusta nada', async () => {
       return Response.json(scoredRows(3, { variant: 'production', version: PROMOTED, brier: 0.5 }));
     }
     if (call.url.includes('status=eq.promoted')) return Response.json([engineRow(PROMOTED, null)]);
-    if (call.url.includes('status=eq.shadow')) return Response.json([]);
+    if (call.url.includes('status.eq.shadow')) return Response.json([]);
+    if (call.method === 'POST' && call.url.includes('on_conflict=version')) {
+      return new Response(null, { status: 204 });
+    }
     throw new Error(`llamada inesperada: ${call.method} ${call.url}`);
   });
 
@@ -514,6 +884,13 @@ test('sin la compuerta de 100 partidos no ajusta nada', async () => {
       reason: 'insufficient-data',
       datasetMatches: 3,
     });
+    // La primera pasada siembra el control fijo con los defaults.
+    const insert = stub.calls.find((call) => call.method === 'POST');
+    assert.ok(insert);
+    const body = JSON.parse(insert.body ?? '{}') as { version?: string; status?: string; params?: unknown };
+    assert.equal(body.version, REFERENCE);
+    assert.equal(body.status, 'shadow');
+    assert.deepEqual(body.params, {});
     assert.ok(!stub.calls.some((call) => call.url.includes('/rest/v1/matches')));
   } finally {
     stub.restore();
@@ -550,7 +927,10 @@ test('con 100 partidos recorre el ajuste walk-forward sin crear candidata si no 
     if (call.url.includes('/rest/v1/match_snapshots')) return Response.json(snapshots);
     if (call.url.includes('/rest/v1/matches')) return Response.json(matches);
     if (call.url.includes('status=eq.promoted')) return Response.json([engineRow(PROMOTED, null)]);
-    if (call.url.includes('status=eq.shadow')) return Response.json([]);
+    if (call.url.includes('status.eq.shadow')) return Response.json([]);
+    if (call.method === 'POST' && call.url.includes('on_conflict=version')) {
+      return new Response(null, { status: 204 });
+    }
     throw new Error(`llamada inesperada: ${call.method} ${call.url}`);
   });
 
@@ -566,7 +946,104 @@ test('con 100 partidos recorre el ajuste walk-forward sin crear candidata si no 
       datasetMatches: 100,
       candidate: null,
     });
-    assert.equal(stub.calls.filter((call) => call.method === 'POST').length, 0);
+    assert.equal(
+      stub.calls.filter((call) => call.method === 'POST' && (call.body ?? '').includes('auto-anchor-')).length,
+      0,
+    );
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('con dos candidatas promueve la mejor y retira la que pierde', async () => {
+  setEnv(ENABLED_ENV);
+  const rows = pairedRows(50, CANDIDATE, 0.4).concat(pairedRows(50, CANDIDATE_B, 0.44));
+  const stub = stubFetch((call) => {
+    if (call.url.includes('/rest/v1/v_match_backtest')) return Response.json(rows);
+    if (call.url.includes('status=eq.promoted')) {
+      return Response.json([engineRow(PROMOTED, '2026-09-01T00:00:00Z')]);
+    }
+    if (call.url.includes('status.eq.shadow')) {
+      return Response.json([
+        engineRow(CANDIDATE, null),
+        engineRow(CANDIDATE_B, null),
+        engineRow(REFERENCE, null),
+      ]);
+    }
+    if (call.url.includes('select=version,status')) return Response.json([]);
+    if (call.url.includes('/rpc/set_promoted_params')) {
+      return Response.json([{ promoted_version: CANDIDATE, retired_version: PROMOTED }]);
+    }
+    if (call.method === 'PATCH') return new Response(null, { status: 204 });
+    throw new Error(`llamada inesperada: ${call.method} ${call.url}`);
+  });
+
+  try {
+    const { clearParamsCache } = await db();
+    clearParamsCache();
+
+    assert.deepEqual(await runLearning(NOW), {
+      state: 'ok',
+      reason: 'promoted',
+      shadowMatches: 50,
+      promotion: { version: CANDIDATE, retired: PROMOTED },
+    });
+
+    const patches = stub.calls.filter((call) => call.method === 'PATCH');
+    assert.equal(patches.length, 1);
+    assert.ok(patches[0].url.includes(`version=eq.${CANDIDATE_B}`));
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('vuelve a los defaults cuando la producción deriva de la referencia', async () => {
+  setEnv(ENABLED_ENV);
+  const promoted = 'auto-anchor-s090-20261020';
+  const production = scoredRows(50, { variant: 'production', version: promoted, brier: 0.5 });
+  const reference = scoredRows(50, { variant: 'shadow', version: REFERENCE, brier: 0.42 });
+  const pairs = reference.map((row, index) => ({
+    ...row,
+    pre_snapshot_id: production[index].pre_snapshot_id,
+    match_id: production[index].match_id,
+  }));
+
+  const stub = stubFetch((call) => {
+    if (call.url.includes('/rest/v1/v_match_backtest')) {
+      return Response.json(production.concat(pairs));
+    }
+    if (call.url.includes('status=eq.promoted')) {
+      return Response.json([engineRow(promoted, '2026-09-01T00:00:00Z')]);
+    }
+    if (call.url.includes('status.eq.shadow')) return Response.json([engineRow(REFERENCE, null)]);
+    if (call.url.includes('select=version,status')) return Response.json([]);
+    if (call.url.includes('/rpc/set_promoted_params')) {
+      return Response.json([{ promoted_version: 'auto-rollback-20261031', retired_version: promoted }]);
+    }
+    if (call.method === 'POST' && call.url.includes('on_conflict=version')) {
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`llamada inesperada: ${call.method} ${call.url}`);
+  });
+
+  try {
+    const { clearParamsCache } = await db();
+    clearParamsCache();
+
+    const summary = await runLearning(NOW);
+    assert.equal(summary.state, 'ok');
+    assert.equal(summary.reason, 'drifted');
+    assert.equal(summary.shadowMatches, 50);
+    assert.deepEqual(summary.rollback, {
+      version: 'auto-rollback-20261031',
+      retired: promoted,
+    });
+    assert.ok(summary.drift);
+    assert.equal(summary.drift?.matches, 50);
+    assert.ok((summary.drift?.mean ?? 0) > 0.07);
+    assert.equal(summary.drift?.probability, 1);
   } finally {
     stub.restore();
     clearEnv();

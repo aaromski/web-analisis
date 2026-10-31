@@ -174,8 +174,15 @@ export default function ShadowSection({ summary }: Props) {
             <div className="shadow-engines">
               <span className="chip">Activo {engine.promoted ?? `v${PRODUCTION_VERSION}`}</span>
               <span className="chip">
-                {engine.candidate ? `Candidata ${engine.candidate}` : 'Sin candidata'}
+                {engine.candidates.length > 0
+                  ? `Candidata${engine.candidates.length > 1 ? 's' : ''} ${engine.candidates.join(' · ')}`
+                  : 'Sin candidata'}
               </span>
+              {engine.reference ? (
+                <span className="chip" title="Control fijo: defaults de 1.2.0 como sombra permanente">
+                  Referencia {engine.reference}
+                </span>
+              ) : null}
               <span className="chip shadow-experimental">Experimental</span>
             </div>
           </div>

@@ -19,7 +19,7 @@ export async function GET(): Promise<Response> {
       required: LAB_REQUIRED_MATCHES,
       markets: [],
       backtest: null,
-      engine: { promoted: null, candidate: null },
+      engine: { promoted: null, candidates: [], reference: null },
     };
   }
 

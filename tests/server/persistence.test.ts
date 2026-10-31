@@ -221,7 +221,7 @@ test('sin configuración la persistencia queda desactivada y no usa la red', asy
       required: 100,
       markets: [],
       backtest: null,
-      engine: { promoted: null, candidate: null },
+      engine: { promoted: null, candidates: [], reference: null },
     });
 
     const result = await persistPreAnalysis({ response: scheduledFixture(), analysis: UNUSED_ANALYSIS });
@@ -391,7 +391,7 @@ test('sin pares producción/sombra la compuerta queda en cero', async () => {
       required: 100,
       markets: [],
       backtest: null,
-      engine: { promoted: null, candidate: null },
+      engine: { promoted: null, candidates: [], reference: null },
     });
   } finally {
     stub.restore();
@@ -411,7 +411,7 @@ test('un HTTP de error en la lectura del laboratorio se publica como error', asy
       required: 100,
       markets: [],
       backtest: null,
-      engine: { promoted: null, candidate: null },
+      engine: { promoted: null, candidates: [], reference: null },
     });
   } finally {
     stub.restore();

@@ -50,7 +50,10 @@ export interface LabSummary {
 
 export interface LabEngineState {
   promoted: string | null;
-  candidate: string | null;
+  /** Candidatas automáticas vivas (la referencia fija se informa aparte). */
+  candidates: string[];
+  /** Control fijo de referencia; acumula para detectar deriva frente a los defaults. */
+  reference: string | null;
 }
 
 export interface LabAccuracy {
@@ -239,7 +242,7 @@ function emptySummary(state: LabState): LabSummary {
     required: LAB_REQUIRED_MATCHES,
     markets: [],
     backtest: null,
-    engine: { promoted: null, candidate: null },
+    engine: { promoted: null, candidates: [], reference: null },
   };
 }
 
@@ -506,7 +509,13 @@ export async function getLabSummary(): Promise<LabSummary> {
           : null,
       engine: {
         promoted: engineConfigs?.promoted?.version ?? null,
-        candidate: engineConfigs?.shadow?.version ?? null,
+        candidates:
+          engineConfigs?.shadows
+            .map((shadow) => shadow.version)
+            .filter((version) => version !== REFERENCE_PARAMS_VERSION) ?? [],
+        reference:
+          engineConfigs?.shadows.find((shadow) => shadow.version === REFERENCE_PARAMS_VERSION)?.version ??
+          null,
       },
     };
   } catch {
@@ -849,58 +858,93 @@ export interface ShadowConfig {
   promotedAt: string | null;
 }
 
+/** Control fijo: los defaults de 1.2.0 como sombra permanente. */
+export const REFERENCE_PARAMS_VERSION = 'baseline-1.2.0-defaults';
+/** Tope de sombras evaluadas por análisis (referencia + candidatas). */
+export const MAX_SHADOW_VERSIONS = 3;
+const SHADOW_READ_LIMIT = 6;
+
 const PARAMS_CACHE_MS = 60_000;
 /** Un fallo de red cachea `null` poco tiempo para no añadir latencia al análisis. */
 const PARAMS_ERROR_BACKOFF_MS = 10_000;
 
-interface ParamsCacheEntry {
+interface ParamsCacheEntry<T> {
   at: number;
-  value: ShadowConfig | null;
+  value: T;
   ttl: number;
 }
 
-const paramsCache = new Map<'promoted' | 'shadow', ParamsCacheEntry>();
+let promotedCache: ParamsCacheEntry<ShadowConfig | null> | null = null;
+let shadowsCache: ParamsCacheEntry<ShadowConfig[] | null> | null = null;
+
+function parseParamsRow(raw: unknown): ShadowConfig | null {
+  const row = raw as
+    | { version?: unknown; params?: unknown; created_at?: unknown; promoted_at?: unknown }
+    | undefined;
+  const version = text(row?.version);
+  if (!version) return null;
+  return {
+    version,
+    params: resolveShadowParams(row?.params),
+    createdAt: toIsoTimestamp(row?.created_at),
+    promotedAt: toIsoTimestamp(row?.promoted_at),
+  };
+}
 
 /**
- * Fila más reciente de `engine_params` para un estado, cacheada un minuto por
- * instancia. Sin fila se usan los defaults; la captura no se ve afectada.
+ * Fila promovida, cacheada un minuto por instancia. Sin fila se usan los
+ * defaults; la captura no se ve afectada.
  */
-async function readParamsRow(
-  config: SupabaseConfig,
-  status: 'promoted' | 'shadow',
-): Promise<ShadowConfig | null> {
+async function readPromotedRow(config: SupabaseConfig): Promise<ShadowConfig | null> {
   const now = Date.now();
-  const cached = paramsCache.get(status);
-  if (cached && now - cached.at < cached.ttl) return cached.value;
+  if (promotedCache && now - promotedCache.at < promotedCache.ttl) return promotedCache.value;
 
   const res = await rest(config, {
     method: 'GET',
     path: '/rest/v1/engine_params',
-    query: `status=eq.${status}&select=version,params,created_at,promoted_at&order=created_at.desc&limit=1`,
+    query: 'status=eq.promoted&select=version,params,created_at,promoted_at&order=created_at.desc&limit=1',
   });
   if (res.errorCode) {
-    paramsCache.set(status, { at: now, value: null, ttl: PARAMS_ERROR_BACKOFF_MS });
+    promotedCache = { at: now, value: null, ttl: PARAMS_ERROR_BACKOFF_MS };
     return null;
   }
 
-  const row = Array.isArray(res.data)
-    ? (res.data[0] as { version?: unknown; params?: unknown; created_at?: unknown; promoted_at?: unknown } | undefined)
-    : undefined;
-  const version = text(row?.version);
-  const value: ShadowConfig | null = version
-    ? {
-        version,
-        params: resolveShadowParams(row?.params),
-        createdAt: toIsoTimestamp(row?.created_at),
-        promotedAt: toIsoTimestamp(row?.promoted_at),
-      }
-    : null;
-  paramsCache.set(status, { at: now, value, ttl: PARAMS_CACHE_MS });
+  const value = Array.isArray(res.data) ? parseParamsRow(res.data[0]) : null;
+  promotedCache = { at: now, value, ttl: PARAMS_CACHE_MS };
   return value;
 }
 
-async function readShadowConfig(config: SupabaseConfig): Promise<ShadowConfig | null> {
-  return readParamsRow(config, 'shadow');
+/**
+ * Todas las sombras vigentes (control fijo + candidatas), de la más reciente a
+ * la más antigua. `null` si no se pudo leer: el llamador omite la escritura.
+ */
+async function readShadowRows(config: SupabaseConfig): Promise<ShadowConfig[] | null> {
+  const now = Date.now();
+  if (shadowsCache && now - shadowsCache.at < shadowsCache.ttl) return shadowsCache.value;
+
+  const res = await rest(config, {
+    method: 'GET',
+    path: '/rest/v1/engine_params',
+    query:
+      'select=version,params,created_at,promoted_at' +
+      `&or=(version.eq.${REFERENCE_PARAMS_VERSION},status.eq.shadow)` +
+      `&order=created_at.desc&limit=${SHADOW_READ_LIMIT}`,
+  });
+  if (res.errorCode || !Array.isArray(res.data)) {
+    shadowsCache = { at: now, value: null, ttl: PARAMS_ERROR_BACKOFF_MS };
+    return null;
+  }
+
+  const parsed = res.data.flatMap((raw) => {
+    const config = parseParamsRow(raw);
+    return config ? [config] : [];
+  });
+  // La referencia va primero para que la ventana de análisis nunca la excluya.
+  const reference = parsed.find((config) => config.version === REFERENCE_PARAMS_VERSION) ?? null;
+  const others = parsed.filter((config) => config.version !== REFERENCE_PARAMS_VERSION);
+  const value = (reference ? [reference, ...others] : others).slice(0, MAX_SHADOW_VERSIONS);
+  shadowsCache = { at: now, value, ttl: PARAMS_CACHE_MS };
+  return value;
 }
 
 /**
@@ -911,28 +955,30 @@ async function readShadowConfig(config: SupabaseConfig): Promise<ShadowConfig | 
 export async function getPromotedConfig(): Promise<ShadowConfig | null> {
   const config = readConfig();
   if (!config) return null;
-  return readParamsRow(config, 'promoted');
+  return readPromotedRow(config);
 }
 
 /** Invalida la caché tras una promoción o rollback (proceso actual). */
 export function clearParamsCache(): void {
-  paramsCache.clear();
+  promotedCache = null;
+  shadowsCache = null;
 }
 
 export interface EngineConfigs {
   promoted: ShadowConfig | null;
-  shadow: ShadowConfig | null;
+  shadows: ShadowConfig[];
 }
 
-/** Configuración activa y candidata; `null` si la persistencia está apagada. */
+/** Configuración activa y sombras; `null` si la persistencia está apagada o falla. */
 export async function getEngineConfigs(): Promise<EngineConfigs | null> {
   const config = readConfig();
   if (!config) return null;
-  const [promoted, shadow] = await Promise.all([
-    readParamsRow(config, 'promoted'),
-    readParamsRow(config, 'shadow'),
+  const [promoted, shadows] = await Promise.all([
+    readPromotedRow(config),
+    readShadowRows(config),
   ]);
-  return { promoted, shadow };
+  if (shadows === null) return null;
+  return { promoted, shadows };
 }
 
 export interface EngineHistoryRow {
@@ -1052,24 +1098,50 @@ export interface ScoredPrediction {
   brier: number;
   logLoss: number;
   preCapturedAt: string | null;
+  /** Línea y lado del total publicado, para el guardarraíl por mercado. */
+  totalsLine: number | null;
+  totalsSide: 'over' | 'under' | null;
+  totalsProbability: number | null;
+  homeScore: number | null;
+  awayScore: number | null;
+  /** Peso final del ancla en esa predicción; 0 = motor puro sin mercado. */
+  anchorWeight: number | null;
 }
 
-/** Métricas por predicción ya calculadas por la vista (incluye versión). */
+const SCORED_PAGE_SIZE = 1_000;
+/** Tope defensivo: 5 páginas cubren años de compuerta sin agotar el cron. */
+const SCORED_MAX_ROWS = 5_000;
+
+/**
+ * Métricas por predicción ya calculadas por la vista (incluye versión).
+ * Pagina porque la vista crece con cada variante y cada reanálisis; el tope
+ * evita que una respuesta enorme tumbe el presupuesto del cron.
+ */
 export async function listScoredPredictions(versions: string[]): Promise<ScoredPrediction[] | null> {
   const config = readConfig();
   if (!config) return null;
   const safe = versions.map(validVersion).filter((value): value is string => Boolean(value));
   if (safe.length === 0) return [];
-  const res = await rest(config, {
-    method: 'GET',
-    path: '/rest/v1/v_match_backtest',
-    query:
-      'select=match_id,pre_snapshot_id,variant,params_version,brier,log_loss,pre_captured_at' +
-      `&params_version=in.(${safe.join(',')})&brier=not.is.null&log_loss=not.is.null&limit=2000`,
-    timeoutMs: 15_000,
-  });
-  if (res.errorCode || !Array.isArray(res.data)) return null;
-  return res.data.flatMap((raw) => {
+
+  const rows: unknown[] = [];
+  for (let offset = 0; offset < SCORED_MAX_ROWS; offset += SCORED_PAGE_SIZE) {
+    const res = await rest(config, {
+      method: 'GET',
+      path: '/rest/v1/v_match_backtest',
+      query:
+        'select=match_id,pre_snapshot_id,variant,params_version,brier,log_loss,pre_captured_at' +
+        ',totals_line,totals_side,totals_probability,home_score,away_score,anchor_weight' +
+        `&params_version=in.(${safe.join(',')})&brier=not.is.null&log_loss=not.is.null` +
+        '&order=pre_captured_at.asc,match_id.asc,variant.asc,params_version.asc' +
+        `&limit=${SCORED_PAGE_SIZE}&offset=${offset}`,
+      timeoutMs: 15_000,
+    });
+    if (res.errorCode || !Array.isArray(res.data)) return null;
+    rows.push(...res.data);
+    if (res.data.length < SCORED_PAGE_SIZE) break;
+  }
+
+  return rows.flatMap((raw) => {
     const row = raw as Record<string, unknown>;
     const matchId = text(row.match_id);
     const variant = text(row.variant);
@@ -1077,6 +1149,8 @@ export async function listScoredPredictions(versions: string[]): Promise<ScoredP
     const brier = typeof row.brier === 'number' ? row.brier : null;
     const logLoss = typeof row.log_loss === 'number' ? row.log_loss : null;
     if (!matchId || !variant || !paramsVersion || brier === null || logLoss === null) return [];
+    const side = row.totals_side;
+    const anchorWeight = finiteNumber(row.anchor_weight);
     return [{
       matchId,
       snapshotId: text(row.pre_snapshot_id),
@@ -1085,6 +1159,13 @@ export async function listScoredPredictions(versions: string[]): Promise<ScoredP
       brier,
       logLoss,
       preCapturedAt: toIsoTimestamp(row.pre_captured_at),
+      totalsLine: finiteNumber(row.totals_line),
+      totalsSide: side === 'over' || side === 'under' ? side : null,
+      totalsProbability: probability(row.totals_probability),
+      homeScore: Number.isInteger(row.home_score) ? (row.home_score as number) : null,
+      awayScore: Number.isInteger(row.away_score) ? (row.away_score as number) : null,
+      anchorWeight:
+        anchorWeight !== null && anchorWeight >= 0 && anchorWeight <= 1 ? anchorWeight : null,
     }];
   });
 }
@@ -1172,11 +1253,12 @@ export interface PersistShadowResult {
 }
 
 /**
- * Predicción de la variante sombra para un snapshot pre ya guardado.
+ * Predicciones de las variantes sombra para un snapshot pre ya guardado.
  *
- * Usa la fila `shadow` de `engine_params` (si existe), corre el motor con esos
- * parámetros e inserta una predicción `variant=shadow`. Nunca lanza y nunca
- * altera la predicción de producción.
+ * Evalúa la referencia fija y las candidatas vigentes (hasta
+ * `MAX_SHADOW_VERSIONS`), corre el motor con cada configuración e inserta una
+ * predicción `variant=shadow` por versión. Nunca lanza y nunca altera la
+ * predicción de producción: un fallo en una versión no bloquea a las demás.
  */
 export async function persistShadowAnalysis(input: {
   response: AggregatedResponse;
@@ -1192,58 +1274,64 @@ export async function persistShadowAnalysis(input: {
   if (!input?.response || !matchId || !snapshotId) return { status: 'skipped' };
 
   try {
-    const shadow = await readShadowConfig(config);
-    if (!shadow) return { status: 'skipped' };
+    const shadows = await readShadowRows(config);
+    if (!shadows || shadows.length === 0) return { status: 'skipped' };
 
-    const analysis = analyzeMatch(input.response, { params: shadow.params });
-    const prediction = predictionRow(snapshotId, analysis, 'shadow', shadow.version);
-    if (!prediction) {
-      await recordIngestionEvent(config, {
-        matchId,
-        snapshotId,
-        operation: 'generate_predictions',
-        status: 'error',
-        errorCode: 'invalid_analysis',
-        latencyMs: elapsedMs(started),
-        paramsVersion: shadow.version,
-        requestId: 'shadow',
+    let failure: string | null = null;
+    for (const shadow of shadows.slice(0, MAX_SHADOW_VERSIONS)) {
+      const analysis = analyzeMatch(input.response, { params: shadow.params });
+      const prediction = predictionRow(snapshotId, analysis, 'shadow', shadow.version);
+      if (!prediction) {
+        failure ??= 'invalid_analysis';
+        await recordIngestionEvent(config, {
+          matchId,
+          snapshotId,
+          operation: 'generate_predictions',
+          status: 'error',
+          errorCode: 'invalid_analysis',
+          latencyMs: elapsedMs(started),
+          paramsVersion: shadow.version,
+          requestId: 'shadow',
+        });
+        continue;
+      }
+
+      const write = await rest(config, {
+        method: 'POST',
+        path: '/rest/v1/predictions',
+        query: 'on_conflict=snapshot_id,variant,params_version',
+        prefer: 'resolution=ignore-duplicates,return=minimal',
+        body: prediction,
       });
-      return { status: 'error', errorCode: 'invalid_analysis' };
-    }
+      if (write.errorCode) {
+        failure ??= write.errorCode;
+        await recordIngestionEvent(config, {
+          matchId,
+          snapshotId,
+          operation: 'generate_predictions',
+          status: 'error',
+          errorCode: write.errorCode,
+          latencyMs: elapsedMs(started),
+          engineVersion: text(analysis.model?.version),
+          paramsVersion: shadow.version,
+          requestId: 'shadow',
+        });
+        continue;
+      }
 
-    const write = await rest(config, {
-      method: 'POST',
-      path: '/rest/v1/predictions',
-      query: 'on_conflict=snapshot_id,variant,params_version',
-      prefer: 'resolution=ignore-duplicates,return=minimal',
-      body: prediction,
-    });
-    if (write.errorCode) {
       await recordIngestionEvent(config, {
         matchId,
         snapshotId,
         operation: 'generate_predictions',
-        status: 'error',
-        errorCode: write.errorCode,
+        status: 'ok',
         latencyMs: elapsedMs(started),
         engineVersion: text(analysis.model?.version),
         paramsVersion: shadow.version,
         requestId: 'shadow',
       });
-      return { status: 'error', errorCode: write.errorCode };
     }
 
-    await recordIngestionEvent(config, {
-      matchId,
-      snapshotId,
-      operation: 'generate_predictions',
-      status: 'ok',
-      latencyMs: elapsedMs(started),
-      engineVersion: text(analysis.model?.version),
-      paramsVersion: shadow.version,
-      requestId: 'shadow',
-    });
-    return { status: 'ok' };
+    return failure ? { status: 'error', errorCode: failure } : { status: 'ok' };
   } catch {
     await recordIngestionEvent(config, {
       matchId,
