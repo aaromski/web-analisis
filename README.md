@@ -37,6 +37,7 @@ STATS_API_BASE_URL=http://localhost:3000 npm run dev
 | `SUPABASE_PERSISTENCE_ENABLED` | No | `true` por defecto; `false` desactiva todas las escrituras. |
 | `SUPABASE_TIMEOUT_MS` | No | Tiempo máximo por llamada a PostgREST. Por defecto `1200` (250–10000). |
 | `INGEST_TOKEN` | Para ingesta post | Token de `x-ingest-token` en `POST /api/ingest/post`. Sin él, la ruta responde 503 en producción. |
+| `CRON_SECRET` | Para cron | Secreto que Vercel Cron envía como `Authorization: Bearer …` a `GET /api/cron/ingest`. Sin él, la ruta responde 503 en producción. |
 
 `.env.local` está ignorado por git. Nunca se envía la clave de Gemini ni la `service_role` al navegador.
 La persistencia es fail-open: si Supabase falla o no está configurado, el análisis sigue funcionando.
@@ -48,7 +49,7 @@ npm run dev        # Next.js en 3100
 npm run build      # build de producción
 npm start          # servidor de producción en 3100
 npm run typecheck  # TypeScript estricto
-npm test           # 86 pruebas del motor, el arnés, la persistencia y el servidor con node:test
+npm test           # 93 pruebas del motor, el arnés, la persistencia y el servidor con node:test
 npm run snapshot -- --home "AC Milan" --away "Internazionale" --date 2026-10-31 --league ita.1
 npm run audit      # métricas de los snapshots (y de data/results.json si existe)
 npm run tune       # barrido del peso del ancla por Brier medio
@@ -64,7 +65,7 @@ npm run purge -- --keep 90   # vacía payloads post más antiguos que la ventana
 5. «Generar informe» envía el análisis a Gemini y muestra el markdown en el panel IA.
 6. Al final del panel aparece **Sombra vs. producción**: la compuerta de 100 partidos con resultado y, cuando exista, la comparación por mercado entre el motor de producción y la variante experimental. La sombra v1 es el mismo motor **sin ancla de mercado** (`engine-1.3.0-shadow-noanchor`): un brazo de control que compite contra la producción con resultados reales. Es informativa y nunca cambia la recomendación publicada.
 
-Cada análisis pre-partido se guarda en Supabase al terminar la respuesta (sin bloquear ni romper la UI): partido, snapshot pre por hash de contenido y dos predicciones con `engine_version`/`params_version` — `production` (1.2.0) y `shadow` (parámetros `status = shadow` de `engine_params`). Reanalizar un partido solo añade snapshot si los datos cambiaron; el resto se detecta como duplicado. `/api/lab` empareja la última captura pre de cada partido finalizado que tenga ambas variantes y publica, por mercado, medias, delta en puntos porcentuales, muestra y un IC 95 % cuando hay al menos dos partidos. La ingesta post solo acepta partidos con captura pre: si no existe, responde 409 `POST_MATCH_WITHOUT_PRE` y no crea filas, y un trigger en la base bloquea la misma escritura por RPC. `npm run purge` conserva filas y predicciones y solo vacía el JSON de los snapshots post antiguos.
+Cada análisis pre-partido se guarda en Supabase al terminar la respuesta (sin bloquear ni romper la UI): partido, snapshot pre por hash de contenido y dos predicciones con `engine_version`/`params_version` — `production` (1.2.0) y `shadow` (parámetros `status = shadow` de `engine_params`). Reanalizar un partido solo añade snapshot si los datos cambiaron; el resto se detecta como duplicado. `/api/lab` empareja la última captura pre de cada partido finalizado que tenga ambas variantes y publica, por mercado, medias, delta en puntos porcentuales, muestra y un IC 95 % cuando hay al menos dos partidos. La ingesta post solo acepta partidos con captura pre: si no existe, responde 409 `POST_MATCH_WITHOUT_PRE` y no crea filas, y un trigger en la base bloquea la misma escritura por RPC. En Vercel, `vercel.json` programa un cron diario (06:00 UTC) en `GET /api/cron/ingest`: busca los partidos con captura pre y sin post, pide el marcador a la API y lo registra, de modo que la compuerta avanza sin intervención manual; es idempotente y no repite snapshots. `npm run purge` conserva filas y predicciones y solo vacía el JSON de los snapshots post antiguos.
 
 La URL es la fuente de verdad: `/?id=…` o `/?home=…&away=…&date=YYYY-MM-DD&league=ita.1`. Recargar reproduce el análisis.
 
@@ -78,6 +79,7 @@ src/
     api/health    GET   salud de la API de estadísticas y configuración de Gemini
     api/lab       GET   comparación producción/sombra por mercado y compuerta de 100 partidos
     api/ingest/post POST registra el resultado post-partido (x-ingest-token)
+    api/cron/ingest GET  cierra automáticamente los partidos pendientes (Bearer CRON_SECRET)
     page.tsx            busca o muestra el dashboard según la URL
     globals.css         tokens, layout y componentes visuales
   components/          buscador, cabecera, resumen, mercados, curva, combinada, contexto, IA, sombra
@@ -99,6 +101,7 @@ scripts/
 supabase/
   migrations/          tablas, RLS, funciones y vista del ciclo de aprendizaje
   rollback/            desmontaje ordenado del esquema
+vercel.json            cron diario de ingesta post (06:00 UTC)
 data/snapshots/        capturas locales (ignoradas por git)
 data/results.json      marcadores reales para backtest (local, ignorado por git)
 ```

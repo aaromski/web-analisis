@@ -907,6 +907,106 @@ export type RecordPostMatchResult =
   | { status: 'missing_pre' }
   | { status: 'error'; errorCode: string };
 
+export interface PendingPostMatch {
+  matchId: string;
+  kickoffAt: string | null;
+}
+
+export interface ListPendingPostMatchesOptions {
+  /** Máximo de partidos a devolver (1–50). */
+  limit?: number;
+  /** Solo partidos ya iniciados hace al menos estas horas (1–168). */
+  minAgeHours?: number;
+}
+
+export type ListPendingPostMatchesResult =
+  | { status: 'ok'; matches: PendingPostMatch[] }
+  | { status: 'disabled' }
+  | { status: 'error'; errorCode: string };
+
+/** Filas de pre que se escanean para construir la lista de pendientes. */
+const PENDING_SCAN_CAP = 200;
+const DEFAULT_PENDING_LIMIT = 10;
+const DEFAULT_MIN_AGE_HOURS = 2;
+const PENDING_MATCH_ID = /^[A-Za-z0-9._:-]+$/;
+
+function clampInt(value: number | undefined, min: number, max: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(value as number)));
+}
+
+/**
+ * Partidos con captura `pre` y sin ningún snapshot `post`, ya iniciados.
+ *
+ * Se consultan snapshots, no la vista del laboratorio: el contrato de la
+ * ingesta solo exige la captura pre, aunque falten predicciones (por ejemplo
+ * si la escritura de `predictions` falló). Se deduplica porque un partido puede
+ * tener varias capturas pre, y se ordena por captura reciente para que un
+ * partido sin resultado disponible no bloquee a los demás.
+ */
+export async function listPendingPostMatches(
+  options: ListPendingPostMatchesOptions = {},
+): Promise<ListPendingPostMatchesResult> {
+  const config = readConfig();
+  if (!config) return { status: 'disabled' };
+
+  const limit = clampInt(options.limit, 1, 50, DEFAULT_PENDING_LIMIT);
+  const minAgeHours = clampInt(options.minAgeHours, 1, 24 * 7, DEFAULT_MIN_AGE_HOURS);
+  const cutoff = new Date(Date.now() - minAgeHours * 3_600_000).toISOString();
+
+  const pre = await rest(config, {
+    method: 'GET',
+    path: '/rest/v1/match_snapshots',
+    query: [
+      'select=match_id,captured_at,matches!inner(kickoff_at)',
+      'phase=eq.pre',
+      `matches.kickoff_at=lt.${encodeURIComponent(cutoff)}`,
+      'order=captured_at.desc',
+      `limit=${PENDING_SCAN_CAP}`,
+    ].join('&'),
+  });
+  if (pre.errorCode) return { status: 'error', errorCode: pre.errorCode };
+
+  const candidates = new Map<string, string | null>();
+  for (const row of Array.isArray(pre.data) ? pre.data : []) {
+    if (!row || typeof row !== 'object') continue;
+    const matchId = text((row as { match_id?: unknown }).match_id);
+    if (!matchId || !PENDING_MATCH_ID.test(matchId) || candidates.has(matchId)) continue;
+    const kickoff = (row as { matches?: { kickoff_at?: unknown } }).matches?.kickoff_at;
+    candidates.set(matchId, toIsoTimestamp(kickoff));
+  }
+  const ids = [...candidates.keys()];
+  if (ids.length === 0) return { status: 'ok', matches: [] };
+
+  // Un partido ya cerrado tiene al menos un snapshot post; no importa cuál sea
+  // el vigente para decidir si se reintenta la ingesta.
+  const closed = await rest(config, {
+    method: 'GET',
+    path: '/rest/v1/match_snapshots',
+    query: [
+      'select=match_id',
+      'phase=eq.post',
+      `match_id=in.(${ids.join(',')})`,
+      `limit=${PENDING_SCAN_CAP * 4}`,
+    ].join('&'),
+  });
+  if (closed.errorCode) return { status: 'error', errorCode: closed.errorCode };
+
+  const closedIds = new Set<string>();
+  for (const row of Array.isArray(closed.data) ? closed.data : []) {
+    const matchId = text((row as { match_id?: unknown })?.match_id);
+    if (matchId) closedIds.add(matchId);
+  }
+
+  const matches: PendingPostMatch[] = [];
+  for (const [matchId, kickoffAt] of candidates) {
+    if (closedIds.has(matchId)) continue;
+    matches.push({ matchId, kickoffAt });
+    if (matches.length >= limit) break;
+  }
+  return { status: 'ok', matches };
+}
+
 /** `true` si el partido ya tiene captura pre; `null` si no se pudo comprobar. */
 async function hasPreSnapshot(config: SupabaseConfig, matchId: string): Promise<boolean | null> {
   const res = await rest(config, {

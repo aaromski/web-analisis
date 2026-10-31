@@ -383,13 +383,26 @@ Liverpool. Detalle en `docs/MEDICION.md`.
   marcador y registra el snapshot post. Solo persiste si el partido ya tiene
   captura `pre` (409 `POST_MATCH_WITHOUT_PRE`, sin crear filas); el trigger
   `match_snapshots_post_requires_pre` bloquea la misma escritura directa por RPC.
+  El contrato vive en `src/lib/server/post-run.ts` (`ingestPostMatch`) y lo
+  comparten la ruta manual y el cron.
+- **Cron de cierre.** `GET /api/cron/ingest` con `Authorization: Bearer
+  CRON_SECRET` (comparación en tiempo constante; 503 `CRON_DISABLED` sin secreto
+  en producción) busca partidos con captura `pre` y sin ningún snapshot `post`,
+  ya iniciados hace ≥ 2 h, y registra el resultado de cada uno (máximo 10 por
+  pasada y 45 s de presupuesto). `listPendingPostMatches` consulta snapshots,
+  no `v_match_backtest`, para no depender de que existan predicciones; deduplica
+  capturas pre y ordena por captura reciente para que un partido sin marcador
+  disponible no bloquee al resto. Un fallo por partido no aborta la pasada y la
+  respuesta resume `inserted/duplicates/skipped/errors`. `vercel.json` lo
+  programa a diario (`0 6 * * *`); el plan Hobby solo admite una ejecución
+  diaria.
 - **UI.** Sección «Sombra vs. producción» al final del dashboard con la
   compuerta de 100 partidos, estados explícitos y `GET /api/lab`.
 
 ### 15.2 Verificación
 
-- `npm run typecheck` limpio; `npm test` **86/86**; `npm run build` correcto
-  con las rutas `/api/lab` y `/api/ingest/post`.
+- `npm run typecheck` limpio; `npm test` **93/93**; `npm run build` correcto
+  con las rutas `/api/lab`, `/api/ingest/post` y `/api/cron/ingest`.
 - Sombra verificada en vivo contra Supabase: un análisis real de
   Liverpool–Arsenal generó `production` 0,3069/0,2878/0,4053 y `shadow`
   0,2576/0,3066/0,4357 con `params_version = engine-1.3.0-shadow-noanchor`,
@@ -417,9 +430,34 @@ Liverpool. Detalle en `docs/MEDICION.md`.
   partido, el RPC directo falla con `23514` y, con un pre previo, el post se
   registra como vigente. Filas de prueba eliminadas.
 - `GET /api/lab` 200 `insufficient` (0/100); `POST /api/ingest/post` 401 sin
-  token o con token incorrecto, 400 con cuerpo inválido y 409
-  `POST_MATCH_UNAVAILABLE` contra la API desplegada, que aún no sirve
-  `?include=post_match`.
+  token o con token incorrecto, 400 con cuerpo inválido.
+- **Ingesta post desbloqueada (2026-10-31).** La instancia que usa la web,
+  `https://api-flame-chi-53.vercel.app` (proyecto `api` de la cuenta
+  `aaromski`, repo `github.com/aaromski/api`), ya sirve `?include=post_match`:
+  `espn:401874972` (Atalanta–Frosinone 4-4) devuelve `post_match.status =
+  complete`, 6/6 secciones. La primera sonda minutos antes daba 409 porque esa
+  instancia aún respondía con un build anterior (las respuestas de estadísticas
+  se cachean 30 s); tras el redespliegue responde `complete`. Con
+  `INGEST_TOKEN` definido: sin pre → 409 `POST_MATCH_WITHOUT_PRE`; con un pre
+  de prueba → 200, `inserted:true`, marcador 4-4, snapshot post vigente y
+  evento `ok` (769 ms); repetición → 200 `inserted:false` con el mismo
+  `snapshot_id`. Filas de prueba eliminadas. La instancia
+  `api-eta-two-64.vercel.app` (cuenta `lucesanderson`) también sirve el bloque,
+  pero no es la configurada en la web.
+- **Producción web verificada (2026-10-31).** En
+  `https://web-analisis-nu.vercel.app`: `/api/lab` → `insufficient` 0/100
+  (Supabase configurado), ingesta sin token → 401, con token y sin pre → 409
+  `POST_MATCH_WITHOUT_PRE`, con pre → 200 `complete` 4-4 con cobertura 6/6 y,
+  repetida, 200 `inserted:false` con el mismo snapshot; un análisis real
+  Liverpool–Arsenal desde el despliegue escribió las predicciones de producción
+  y de sombra.
+- **Cron verificado en vivo (2026-10-31).** Build de producción local con
+  `.env.local` y `CRON_SECRET` generado: sin cabecera → 401; con el secreto y un
+  pre de prueba para `espn:401874972` → 200,
+  `pending:1, inserted:1`, evento `capture_post` `ok` (534 ms) y snapshot post
+  vigente con marcador 4-4; segunda pasada → `pending:0` (la lista ya excluye el
+  partido cerrado). Fixture eliminado y contador del laboratorio de nuevo en
+  0/100.
 - Navegador sobre el build de producción: análisis Bayern–Dortmund 200 y
   sección sombra visible con la compuerta en 0/100; sin errores de consola.
 
@@ -434,8 +472,12 @@ Liverpool. Detalle en `docs/MEDICION.md`.
   calibración (Brier/log-loss) todavía; eso llegará con la vista de backtest.
   La lectura asume una versión de producción y una sombra; al promover una
   candidata habrá que filtrar por `params_version` para no mezclar motores.
-- La ingesta post devolverá 409 hasta que `../api` publique
-  `?include=post_match`; el contrato y la ruta ya están listos.
-- Sigue pendiente en Vercel: `STATS_API_BASE_URL` en el proyecto web y las
-  variables de Supabase/`INGEST_TOKEN` en el proyecto que ejecute ingesta.
+- Despliegue: en Vercel el proyecto web ya tiene `SUPABASE_URL`,
+  `SUPABASE_SERVICE_ROLE_KEY`, `INGEST_TOKEN` y `GEMINI_API_KEY`; comprobado en
+  producción (`/api/lab` responde `insufficient` y la ingesta 200/401/409 como
+  en local). Falta añadir `CRON_SECRET` (generado en `.env.local` el
+  2026-10-31, mismo valor que en el servidor) y redesplegar para que
+  `vercel.json` registre el cron: los cambios de variables y de configuración
+  no aplican a despliegues existentes. Con el plan Hobby el cierre corre una
+  vez al día; pasar a horario solo exige editar el `schedule`.
 - Sin commits, pushes ni despliegues.

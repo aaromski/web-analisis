@@ -508,3 +508,69 @@ test('con captura pre el post se registra una sola vez', async () => {
     clearEnv();
   }
 });
+
+test('sin configuración no hay partidos pendientes y no se usa la red', async () => {
+  clearEnv();
+  const stub = stubFetch(() => {
+    throw new Error('no debe usarse la red');
+  });
+
+  try {
+    const { listPendingPostMatches } = await db();
+    assert.deepEqual(await listPendingPostMatches(), { status: 'disabled' });
+    assert.equal(stub.calls.length, 0);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('los pendientes deduplican capturas pre, excluyen cerrados y respetan el tope', async () => {
+  setEnv(ENABLED_ENV);
+  const stub = stubFetch((call) => {
+    if (call.url.includes('phase=eq.post')) {
+      return Response.json([{ match_id: 'test:1' }]);
+    }
+    return Response.json([
+      { match_id: 'test:1', captured_at: '2026-10-31T09:00:00Z', matches: { kickoff_at: '2026-10-30T18:00:00Z' } },
+      { match_id: 'test:1', captured_at: '2026-10-30T09:00:00Z', matches: { kickoff_at: '2026-10-30T18:00:00Z' } },
+      { match_id: 'test:2', captured_at: '2026-10-31T08:00:00Z', matches: { kickoff_at: '2026-10-29T18:00:00Z' } },
+      { match_id: 'test:3', captured_at: '2026-10-31T07:00:00Z', matches: { kickoff_at: '2026-10-28T18:00:00Z' } },
+    ]);
+  });
+
+  try {
+    const { listPendingPostMatches } = await db();
+    const result = await listPendingPostMatches({ limit: 1, minAgeHours: 2 });
+    assert.deepEqual(result, {
+      status: 'ok',
+      matches: [{ matchId: 'test:2', kickoffAt: '2026-10-29T18:00:00.000Z' }],
+    });
+
+    assert.equal(stub.calls.length, 2);
+    const [preCall, closedCall] = stub.calls;
+    assert.ok(preCall.url.includes('/rest/v1/match_snapshots'));
+    assert.ok(preCall.url.includes('phase=eq.pre'));
+    assert.ok(preCall.url.includes('matches!inner(kickoff_at)'));
+    assert.ok(preCall.url.includes('matches.kickoff_at=lt.'));
+    assert.ok(preCall.url.includes('order=captured_at.desc'));
+    assert.ok(closedCall.url.includes('phase=eq.post'));
+    assert.ok(closedCall.url.includes('match_id=in.(test:1,test:2,test:3)'));
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('un error al leer los pendientes se publica como estado', async () => {
+  setEnv(ENABLED_ENV);
+  const stub = stubFetch(() => new Response(null, { status: 503 }));
+
+  try {
+    const { listPendingPostMatches } = await db();
+    const result = await listPendingPostMatches();
+    assert.equal(result.status, 'error');
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
