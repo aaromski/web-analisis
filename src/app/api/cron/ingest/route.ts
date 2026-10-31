@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { listPendingPostMatches } from '@/lib/server/db';
 import { StatsApiError } from '@/lib/server/errors';
 import { jsonError } from '@/lib/server/http';
+import { runLearning, type LearningSummary } from '@/lib/server/learning';
 import { ingestPostMatch } from '@/lib/server/post-run';
 
 export const runtime = 'nodejs';
@@ -12,6 +13,8 @@ export const maxDuration = 60;
 const MAX_MATCHES_PER_RUN = 10;
 /** Deja margen al límite de 60 s de la función. */
 const TIME_BUDGET_MS = 45_000;
+/** Por debajo de este margen el ajuste se pospone a la pasada siguiente. */
+const MIN_LEARNING_BUDGET_MS = 12_000;
 
 interface CronEntry {
   matchId: string;
@@ -120,6 +123,15 @@ export async function GET(request: Request): Promise<Response> {
   const count = (value: CronEntry['outcome']): number =>
     entries.filter((entry) => entry.outcome === value).length;
 
+  // El aprendizaje nunca puede tumbar la ingesta: si no cabe en el presupuesto
+  // o falla, se publica su estado y se reintenta en la pasada siguiente.
+  let learning: LearningSummary;
+  if (60_000 - (Date.now() - started) < MIN_LEARNING_BUDGET_MS) {
+    learning = { state: 'skipped', reason: 'budget' };
+  } else {
+    learning = await runLearning();
+  }
+
   return Response.json(
     {
       state: count('error') > 0 ? 'partial' : 'ok',
@@ -133,6 +145,7 @@ export async function GET(request: Request): Promise<Response> {
       stopReason,
       elapsedMs: Date.now() - started,
       results: entries,
+      learning,
     },
     { headers: { 'Cache-Control': 'no-store' } },
   );

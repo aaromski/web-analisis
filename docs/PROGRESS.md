@@ -342,7 +342,7 @@ Liverpool. Detalle en `docs/MEDICION.md`.
 
 ### 15.1 Cambios
 
-- **Esquema.** Seis migraciones en `supabase/migrations/`: tablas
+- **Esquema.** Siete migraciones en `supabase/migrations/`: tablas
   `matches`, `match_snapshots`, `engine_params`, `predictions` e
   `ingestion_events`; RLS activo sin políticas (solo `service_role`), unicidad
   por `(match_id, phase, payload_hash)`, un único post vigente, una única
@@ -486,8 +486,8 @@ Liverpool. Detalle en `docs/MEDICION.md`.
 
 - La sombra v1 es un brazo de control (sin ancla), no una candidata a
   promoción. La comparación solo gana muestra con partidos finalizados que
-  tengan captura pre; el contador sigue en 0/100. Cambiar de candidata exige
-  una nueva fila `shadow` en `engine_params`, sin tocar código.
+  tengan captura pre; el contador sigue en 0/100. La rotación de candidatas ya
+  es automática (§16); el brazo de control se retira al llegar a la compuerta.
 - `n` e IC se calculan sobre partidos, no sobre predicciones sueltas: el lab
   usa un snapshot por partido (el más reciente con ambas variantes). El
   backtest (Brier/log-loss) ya está publicado, pero ambos se calculan sobre
@@ -502,3 +502,82 @@ Liverpool. Detalle en `docs/MEDICION.md`.
 - La vista de backtest está implementada y verificada en local pero aún no
   desplegada: requiere un nuevo push y redespliegue del proyecto web.
 - Sin commits, pushes ni despliegues.
+
+## 16. Mejora automática con guardarraíles (2026-10-31)
+
+### 16.1 Cambios
+
+- **Producción lee la fila promovida.** `getPromotedConfig` consulta
+  `engine_params` con `status = promoted` (caché de 60 s por instancia y
+  backoff de 10 s si la lectura falla). `getAnalysisCapture` añade la versión a
+  la clave de caché y ejecuta `analyzeMatch(data, { params })`; sin fila o con
+  persistencia apagada se usan los defaults de 1.2.0. `persistPreAnalysis`
+  guarda esa misma versión en `predictions.params_version` y en
+  `ingestion_events`, de modo que cada predicción queda atribuida al motor que
+  la generó.
+- **RPC de promoción.** `20261031130000_learning_loop_promotion.sql` define
+  `set_promoted_params(p_version)` con bloqueo de la candidata y de la versión
+  promovida actual: valida que exista (`P0002` si no), no hace nada si ya está
+  promovida, retira la anterior (`retired_at = now()`) y promueve la nueva
+  (`promoted_at = now()`, `retired_at = null`) en la misma transacción, dejando
+  un evento `promote_params` `ok`. Ejecutable solo por `service_role`.
+- **Job de aprendizaje.** `src/lib/server/learning.ts` (`runLearning`) nunca
+  lanza: devuelve `disabled`, `skipped`, `ok` o `error`. Orden de la pasada:
+  1. **Rollback.** Si la versión promovida acumula ≥ 30 partidos posteriores a
+     su promoción con Brier ≥ 0,01 peor que la anterior y bootstrap ≥ 95 %, se
+     vuelve a promover la anterior.
+  2. **Brazo de control.** La sombra v1 (sin ancla) no es promocionable: se
+     retira al llegar a los 100 partidos y deja sitio a una candidata real.
+  3. **Promoción de la candidata.** Con ≥ 50 partidos emparejados por snapshot,
+     mejora media del Brier (sombra − producción) ≤ −0,004 y bootstrap
+     determinista (mulberry32, semilla 20261031, 2000 remuestreos) ≥ 95 %, y
+     enfriamiento de 30 días desde `promoted_at`, se promueve. Por debajo de 50
+     partidos se conserva hasta los 21 días y luego se retira.
+  4. **Ajuste.** Con ≥ 100 partidos cerrados, reconstruye el análisis desde el
+     payload canónico de cada snapshot (sin red), ordena por fecha y hace
+     walk-forward 70/30. La rejilla es una sola dimensión —escala del ancla
+     `0,7 · 0,8 · 0,9 · 1,0 · 1,1`— para no memorizar ruido con ~100 partidos.
+     Solo crea candidata si el Brier de validación mejora ≥ 0,004 sin empeorar
+     el log-loss más de 0,002; se guarda con estado `shadow`, métricas del
+     ajuste y nombre `auto-anchor-sNNN-YYYYMMDD`.
+- **Cron.** `GET /api/cron/ingest` ejecuta el aprendizaje después de cerrar
+  resultados si quedan ≥ 12 s del presupuesto de 60 s; la respuesta añade
+  `learning` con el estado y, si hubo decisión, la versión promovida o
+  revertida. Un fallo del aprendizaje no cambia el resultado de la ingesta.
+- **UI.** La sección sombra muestra dos chips: `Activo` (versión promovida) y
+  `Candidata` (o «Sin candidata»), leídos de `engine` en `/api/lab`.
+
+### 16.2 Verificación
+
+- `npm run typecheck` limpio; `npm test` **109/109** (16 pruebas nuevas del
+  ciclo: métricas puras, bootstrap determinista, umbrales de promoción y
+  rollback, desempate de la rejilla, caché y fail-open de la fila promovida,
+  formas de PATCH/RPC, promoción con 50 pares, enfriamiento, control,
+  compuerta y walk-forward completo con 100 partidos); `npm run build`
+  correcto.
+- Build de producción local: `GET /api/lab` devuelve
+  `"engine":{"promoted":"engine-1.2.0-defaults","candidate":"engine-1.3.0-shadow-noanchor"}`.
+- Verificación read-only con `.env.local`: la fila promovida tiene
+  `promotedAt = 2026-10-31T11:17:46Z` y parámetros idénticos a
+  `DEFAULT_ENGINE_PARAMS`; un análisis real de `espn:401879246` con
+  `paramsVersion = engine-1.2.0-defaults` produjo 0,3061/0,2891/0,4048, sin
+  regresión frente al cálculo previo (las cuotas habían variado ligeramente).
+- Migración de promoción aplicada en PostgreSQL 17.11 dentro de una
+  transacción: `set_promoted_params('engine-1.2.0-defaults')` respondió 200
+  con `{promoted_version: engine-1.2.0-defaults, retired_version: null}`
+  (no-op) y una versión inexistente falló con `P0002` sin mutar filas.
+- El cron de pruebas incorpora el bloque `learning`
+  (`{state:'skipped', reason:'no-promoted'}` sin fila promovida).
+
+### 16.3 Límites y pendientes
+
+- Todo este bloque está implementado y verificado en local pero **sin
+  commit, push ni despliegue**. Para activarlo en producción hace falta subir
+  los cambios y redesplegar el proyecto web.
+- La compuerta sigue en 0/100: la primera pasada automática del cron será el
+  2026-11-01 a las 06:00 UTC. La primera promoción posible exige ≥ 50 partidos
+  sombra emparejados, ≥ 100 partidos cerrados para el ajuste y que hayan
+  pasado 30 días desde `promoted_at` (2026-10-31).
+- El ajuste mueve solo la escala del ancla. Ampliar el vector (pesos por
+  dominio, calibración) queda fuera hasta tener una muestra bastante mayor que
+  la compuerta, para evitar sobreajuste.

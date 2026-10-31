@@ -149,7 +149,7 @@ interface Props {
 }
 
 export default function ShadowSection({ summary }: Props) {
-  const { state, matchesWithResult, required, markets, backtest } = summary;
+  const { state, matchesWithResult, required, markets, backtest, engine } = summary;
   const gateReached = required > 0 && matchesWithResult >= required;
   const covered = markets.filter((market) => market.shadow !== null).length;
   const totalMarkets = markets.length;
@@ -172,8 +172,10 @@ export default function ShadowSection({ summary }: Props) {
               recomendación de producción.
             </p>
             <div className="shadow-engines">
-              <span className="chip">Producción v{PRODUCTION_VERSION}</span>
-              <span className="chip">Sombra post-partido</span>
+              <span className="chip">Activo {engine.promoted ?? `v${PRODUCTION_VERSION}`}</span>
+              <span className="chip">
+                {engine.candidate ? `Candidata ${engine.candidate}` : 'Sin candidata'}
+              </span>
               <span className="chip shadow-experimental">Experimental</span>
             </div>
           </div>

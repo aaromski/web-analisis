@@ -21,12 +21,17 @@ export async function POST(request: Request): Promise<Response> {
 
   try {
     const input = parseMatchInput(body);
-    const { envelope, response } = await getAnalysisCapture(input);
+    const capture = await getAnalysisCapture(input);
+    const { envelope, response } = capture;
 
     // La captura corre después de enviar la respuesta y nunca puede romperla:
     // `persistPreAnalysis` es fail-open y respeta el interruptor de persistencia.
     after(async () => {
-      const saved = await persistPreAnalysis({ response, analysis: envelope.analysis });
+      const saved = await persistPreAnalysis({
+        response,
+        analysis: envelope.analysis,
+        paramsVersion: capture.paramsVersion,
+      });
       if (!saved.snapshotId) return;
       await persistShadowAnalysis({
         response,

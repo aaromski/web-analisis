@@ -178,6 +178,7 @@ interface CronSummary {
   remaining: number;
   stopReason: string;
   results: Array<{ matchId: string; outcome: string; code?: string }>;
+  learning: { state: string; reason?: string };
 }
 
 async function cronRoute(): Promise<typeof import('../../src/app/api/cron/ingest/route.ts')> {
@@ -248,6 +249,8 @@ test('con secreto cierra los pendientes e inserta el resultado', async () => {
     assert.equal(body.inserted, 1);
     assert.equal(body.errors, 0);
     assert.deepEqual(body.results, [{ matchId: 'test:900001', outcome: 'inserted' }]);
+    // Sin versión promovida en `engine_params` el aprendizaje no toca nada.
+    assert.deepEqual(body.learning, { state: 'skipped', reason: 'no-promoted' });
 
     const statsCall = stub.calls.find((call) => call.url.includes('/api/v1/matches/'));
     assert.ok(statsCall);

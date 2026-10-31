@@ -44,6 +44,13 @@ export interface LabSummary {
   markets: LabMarketRow[];
   /** Exactitud por variante sobre los mismos partidos; null sin muestra. */
   backtest: LabBacktest | null;
+  /** Versión promovida y candidata vigentes del ciclo automático. */
+  engine: LabEngineState;
+}
+
+export interface LabEngineState {
+  promoted: string | null;
+  candidate: string | null;
 }
 
 export interface LabAccuracy {
@@ -93,7 +100,7 @@ function readConfig(): SupabaseConfig | null {
   return { baseUrl, serviceKey, timeoutMs: persistenceTimeoutMs() };
 }
 
-type HttpMethod = 'GET' | 'HEAD' | 'POST';
+type HttpMethod = 'GET' | 'HEAD' | 'POST' | 'PATCH';
 
 interface RequestOptions {
   method: HttpMethod;
@@ -102,6 +109,8 @@ interface RequestOptions {
   query?: string;
   body?: unknown;
   prefer?: string;
+  /** Tiempo máximo propio para lecturas grandes (el default es 1,2 s). */
+  timeoutMs?: number;
 }
 
 interface HttpOutcome {
@@ -143,7 +152,7 @@ async function rest(config: SupabaseConfig, options: RequestOptions): Promise<Ht
       headers,
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
       cache: 'no-store',
-      signal: AbortSignal.timeout(config.timeoutMs),
+      signal: AbortSignal.timeout(options.timeoutMs ?? config.timeoutMs),
     });
 
     const contentRange = response.headers.get('content-range');
@@ -230,6 +239,7 @@ function emptySummary(state: LabState): LabSummary {
     required: LAB_REQUIRED_MATCHES,
     markets: [],
     backtest: null,
+    engine: { promoted: null, candidate: null },
   };
 }
 
@@ -483,6 +493,7 @@ export async function getLabSummary(): Promise<LabSummary> {
       actualByMatch,
     );
     const shadowAccuracy = accuracyOf(comparable, (pair) => pair.shadow!, actualByMatch);
+    const engineConfigs = await getEngineConfigs().catch(() => null);
 
     return {
       state,
@@ -493,6 +504,10 @@ export async function getLabSummary(): Promise<LabSummary> {
         productionAccuracy && shadowAccuracy && matchesWithResult > 0
           ? { matches: matchesWithResult, production: productionAccuracy, shadow: shadowAccuracy }
           : null,
+      engine: {
+        promoted: engineConfigs?.promoted?.version ?? null,
+        candidate: engineConfigs?.shadow?.version ?? null,
+      },
     };
   } catch {
     return emptySummary('error');
@@ -508,6 +523,8 @@ export interface PersistPreAnalysisResult {
 export interface PersistPreAnalysisInput {
   response: AggregatedResponse;
   analysis: AnalysisResult;
+  /** Versión con la que se calculó el análisis; por defecto, los defaults. */
+  paramsVersion?: string | null;
 }
 
 function text(value: unknown): string | null {
@@ -763,6 +780,7 @@ export async function persistPreAnalysis(
     }
 
     const engineVersion = text(input.analysis?.model?.version);
+    const paramsVersion = text(input.paramsVersion) ?? PARAMS_VERSION;
     const status: PersistPreAnalysisResult['status'] = snapshot.inserted ? 'ok' : 'duplicate';
 
     await recordIngestionEvent(config, {
@@ -772,11 +790,11 @@ export async function persistPreAnalysis(
       status,
       latencyMs: elapsedMs(started),
       engineVersion,
-      paramsVersion: PARAMS_VERSION,
+      paramsVersion,
     });
 
     // Un duplicado también intenta la predicción: pudo faltar en una corrida previa.
-    const prediction = predictionRow(snapshot.snapshotId, input.analysis);
+    const prediction = predictionRow(snapshot.snapshotId, input.analysis, PRODUCTION_VARIANT, paramsVersion);
     if (!prediction) {
       await recordIngestionEvent(config, {
         matchId,
@@ -786,7 +804,7 @@ export async function persistPreAnalysis(
         errorCode: 'invalid_analysis',
         latencyMs: elapsedMs(started),
         engineVersion,
-        paramsVersion: PARAMS_VERSION,
+        paramsVersion,
       });
       return { status, snapshotId: snapshot.snapshotId };
     }
@@ -807,7 +825,7 @@ export async function persistPreAnalysis(
         errorCode: predictionWrite.errorCode,
         latencyMs: elapsedMs(started),
         engineVersion,
-        paramsVersion: PARAMS_VERSION,
+        paramsVersion,
       });
     }
 
@@ -827,34 +845,325 @@ export async function persistPreAnalysis(
 export interface ShadowConfig {
   version: string;
   params: ReturnType<typeof resolveShadowParams>;
+  createdAt: string | null;
+  promotedAt: string | null;
 }
 
-const SHADOW_CACHE_MS = 60_000;
-let shadowCache: { at: number; value: ShadowConfig | null } | null = null;
+const PARAMS_CACHE_MS = 60_000;
+/** Un fallo de red cachea `null` poco tiempo para no añadir latencia al análisis. */
+const PARAMS_ERROR_BACKOFF_MS = 10_000;
+
+interface ParamsCacheEntry {
+  at: number;
+  value: ShadowConfig | null;
+  ttl: number;
+}
+
+const paramsCache = new Map<'promoted' | 'shadow', ParamsCacheEntry>();
 
 /**
- * Fila `shadow` más reciente de `engine_params`, cacheada un minuto por
- * instancia. Sin fila no hay sombra; la captura de producción no se afecta.
+ * Fila más reciente de `engine_params` para un estado, cacheada un minuto por
+ * instancia. Sin fila se usan los defaults; la captura no se ve afectada.
  */
-async function readShadowConfig(config: SupabaseConfig): Promise<ShadowConfig | null> {
+async function readParamsRow(
+  config: SupabaseConfig,
+  status: 'promoted' | 'shadow',
+): Promise<ShadowConfig | null> {
   const now = Date.now();
-  if (shadowCache && now - shadowCache.at < SHADOW_CACHE_MS) return shadowCache.value;
+  const cached = paramsCache.get(status);
+  if (cached && now - cached.at < cached.ttl) return cached.value;
 
   const res = await rest(config, {
     method: 'GET',
     path: '/rest/v1/engine_params',
-    query: 'status=eq.shadow&select=version,params&order=created_at.desc&limit=1',
+    query: `status=eq.${status}&select=version,params,created_at,promoted_at&order=created_at.desc&limit=1`,
   });
-  // Un fallo transitorio no se cachea: la sombra se reintenta en el próximo análisis.
-  if (res.errorCode) return null;
+  if (res.errorCode) {
+    paramsCache.set(status, { at: now, value: null, ttl: PARAMS_ERROR_BACKOFF_MS });
+    return null;
+  }
 
-  const row = Array.isArray(res.data) ? (res.data[0] as { version?: unknown; params?: unknown } | undefined) : undefined;
+  const row = Array.isArray(res.data)
+    ? (res.data[0] as { version?: unknown; params?: unknown; created_at?: unknown; promoted_at?: unknown } | undefined)
+    : undefined;
   const version = text(row?.version);
   const value: ShadowConfig | null = version
-    ? { version, params: resolveShadowParams(row?.params) }
+    ? {
+        version,
+        params: resolveShadowParams(row?.params),
+        createdAt: toIsoTimestamp(row?.created_at),
+        promotedAt: toIsoTimestamp(row?.promoted_at),
+      }
     : null;
-  shadowCache = { at: now, value };
+  paramsCache.set(status, { at: now, value, ttl: PARAMS_CACHE_MS });
   return value;
+}
+
+async function readShadowConfig(config: SupabaseConfig): Promise<ShadowConfig | null> {
+  return readParamsRow(config, 'shadow');
+}
+
+/**
+ * Parámetros con los que se publica el análisis de producción. `null` cuando
+ * la persistencia está desactivada o la base no responde: el llamador cae a
+ * los defaults del motor (comportamiento histórico).
+ */
+export async function getPromotedConfig(): Promise<ShadowConfig | null> {
+  const config = readConfig();
+  if (!config) return null;
+  return readParamsRow(config, 'promoted');
+}
+
+/** Invalida la caché tras una promoción o rollback (proceso actual). */
+export function clearParamsCache(): void {
+  paramsCache.clear();
+}
+
+export interface EngineConfigs {
+  promoted: ShadowConfig | null;
+  shadow: ShadowConfig | null;
+}
+
+/** Configuración activa y candidata; `null` si la persistencia está apagada. */
+export async function getEngineConfigs(): Promise<EngineConfigs | null> {
+  const config = readConfig();
+  if (!config) return null;
+  const [promoted, shadow] = await Promise.all([
+    readParamsRow(config, 'promoted'),
+    readParamsRow(config, 'shadow'),
+  ]);
+  return { promoted, shadow };
+}
+
+export interface EngineHistoryRow {
+  version: string;
+  status: string;
+  createdAt: string | null;
+  promotedAt: string | null;
+  retiredAt: string | null;
+}
+
+export async function listEngineHistory(limit = 20): Promise<EngineHistoryRow[] | null> {
+  const config = readConfig();
+  if (!config) return null;
+  const res = await rest(config, {
+    method: 'GET',
+    path: '/rest/v1/engine_params',
+    query: `select=version,status,created_at,promoted_at,retired_at&order=created_at.desc&limit=${clampLimit(limit, 1, 50)}`,
+  });
+  if (res.errorCode || !Array.isArray(res.data)) return null;
+  return res.data.flatMap((raw) => {
+    const row = raw as Record<string, unknown>;
+    const version = text(row.version);
+    const status = text(row.status);
+    if (!version || !status) return [];
+    return [{
+      version,
+      status,
+      createdAt: toIsoTimestamp(row.created_at),
+      promotedAt: toIsoTimestamp(row.promoted_at),
+      retiredAt: toIsoTimestamp(row.retired_at),
+    }];
+  });
+}
+
+const VERSION_PATTERN = /^[A-Za-z0-9._-]{1,40}$/;
+
+function validVersion(value: string | null | undefined): string | null {
+  const version = text(value);
+  return version && VERSION_PATTERN.test(version) ? version : null;
+}
+
+export async function retireEngineVersion(version: string): Promise<{ ok: boolean; errorCode?: string }> {
+  const config = readConfig();
+  const safe = validVersion(version);
+  if (!config) return { ok: false, errorCode: 'disabled' };
+  if (!safe) return { ok: false, errorCode: 'invalid_version' };
+  const res = await rest(config, {
+    method: 'PATCH',
+    path: '/rest/v1/engine_params',
+    query: `version=eq.${safe}&status=eq.shadow`,
+    prefer: 'return=minimal',
+    body: { status: 'retired', retired_at: new Date().toISOString() },
+  });
+  if (res.errorCode) return { ok: false, errorCode: res.errorCode };
+  clearParamsCache();
+  return { ok: true };
+}
+
+export async function insertEngineCandidate(input: {
+  version: string;
+  params: Record<string, unknown>;
+  metrics: Record<string, unknown>;
+  notes: string;
+}): Promise<{ ok: boolean; errorCode?: string }> {
+  const config = readConfig();
+  const safe = validVersion(input?.version);
+  if (!config) return { ok: false, errorCode: 'disabled' };
+  if (!safe) return { ok: false, errorCode: 'invalid_version' };
+  const res = await rest(config, {
+    method: 'POST',
+    path: '/rest/v1/engine_params',
+    query: 'on_conflict=version',
+    prefer: 'resolution=ignore-duplicates,return=minimal',
+    body: {
+      version: safe,
+      status: 'shadow',
+      params: input.params,
+      metrics: input.metrics,
+      notes: input.notes,
+    },
+    timeoutMs: 10_000,
+  });
+  if (res.errorCode) return { ok: false, errorCode: res.errorCode };
+  clearParamsCache();
+  return { ok: true };
+}
+
+export async function promoteParamsVersion(
+  version: string,
+): Promise<{ ok: boolean; promoted?: string; retired?: string | null; errorCode?: string }> {
+  const config = readConfig();
+  const safe = validVersion(version);
+  if (!config) return { ok: false, errorCode: 'disabled' };
+  if (!safe) return { ok: false, errorCode: 'invalid_version' };
+  const res = await rest(config, {
+    method: 'POST',
+    path: '/rest/v1/rpc/set_promoted_params',
+    prefer: 'return=representation',
+    body: { p_version: safe },
+    timeoutMs: 10_000,
+  });
+  if (res.errorCode) return { ok: false, errorCode: res.errorCode };
+  const row = Array.isArray(res.data) ? (res.data[0] as Record<string, unknown> | undefined) : undefined;
+  clearParamsCache();
+  return {
+    ok: true,
+    promoted: text(row?.promoted_version) ?? safe,
+    retired: text(row?.retired_version),
+  };
+}
+
+export interface ScoredPrediction {
+  matchId: string;
+  snapshotId: string | null;
+  variant: string;
+  paramsVersion: string;
+  brier: number;
+  logLoss: number;
+  preCapturedAt: string | null;
+}
+
+/** Métricas por predicción ya calculadas por la vista (incluye versión). */
+export async function listScoredPredictions(versions: string[]): Promise<ScoredPrediction[] | null> {
+  const config = readConfig();
+  if (!config) return null;
+  const safe = versions.map(validVersion).filter((value): value is string => Boolean(value));
+  if (safe.length === 0) return [];
+  const res = await rest(config, {
+    method: 'GET',
+    path: '/rest/v1/v_match_backtest',
+    query:
+      'select=match_id,pre_snapshot_id,variant,params_version,brier,log_loss,pre_captured_at' +
+      `&params_version=in.(${safe.join(',')})&brier=not.is.null&log_loss=not.is.null&limit=2000`,
+    timeoutMs: 15_000,
+  });
+  if (res.errorCode || !Array.isArray(res.data)) return null;
+  return res.data.flatMap((raw) => {
+    const row = raw as Record<string, unknown>;
+    const matchId = text(row.match_id);
+    const variant = text(row.variant);
+    const paramsVersion = text(row.params_version);
+    const brier = typeof row.brier === 'number' ? row.brier : null;
+    const logLoss = typeof row.log_loss === 'number' ? row.log_loss : null;
+    if (!matchId || !variant || !paramsVersion || brier === null || logLoss === null) return [];
+    return [{
+      matchId,
+      snapshotId: text(row.pre_snapshot_id),
+      variant,
+      paramsVersion,
+      brier,
+      logLoss,
+      preCapturedAt: toIsoTimestamp(row.pre_captured_at),
+    }];
+  });
+}
+
+export interface TuningMatch {
+  matchId: string;
+  kickoffAt: string;
+  homeScore: number;
+  awayScore: number;
+}
+
+export interface TuningSnapshot {
+  matchId: string;
+  capturedAt: string;
+  payload: Record<string, unknown>;
+}
+
+export interface TuningDataset {
+  matches: TuningMatch[];
+  snapshots: TuningSnapshot[];
+}
+
+const TUNING_MATCH_LIMIT = 150;
+const TUNING_SNAPSHOT_LIMIT = 450;
+
+/**
+ * Partidos cerrados y sus capturas pre para recalcular el motor sin red
+ * externa. El `payload` canónico reproduce el análisis original bit a bit.
+ */
+export async function listTuningDataset(): Promise<TuningDataset | null> {
+  const config = readConfig();
+  if (!config) return null;
+  const matchesRes = await rest(config, {
+    method: 'GET',
+    path: '/rest/v1/matches',
+    query:
+      'select=match_id,kickoff_at,home_score,away_score&home_score=not.is.null&away_score=not.is.null' +
+      `&order=kickoff_at.desc&limit=${TUNING_MATCH_LIMIT}`,
+    timeoutMs: 15_000,
+  });
+  if (matchesRes.errorCode || !Array.isArray(matchesRes.data)) return null;
+
+  const matches = matchesRes.data.flatMap((raw) => {
+    const row = raw as Record<string, unknown>;
+    const matchId = text(row.match_id);
+    const kickoffAt = toIsoTimestamp(row.kickoff_at);
+    const homeScore = typeof row.home_score === 'number' ? row.home_score : null;
+    const awayScore = typeof row.away_score === 'number' ? row.away_score : null;
+    if (!matchId || !kickoffAt || homeScore === null || awayScore === null) return [];
+    return [{ matchId, kickoffAt, homeScore, awayScore }];
+  });
+  if (matches.length === 0) return { matches, snapshots: [] };
+
+  const snapshotsRes = await rest(config, {
+    method: 'GET',
+    path: '/rest/v1/match_snapshots',
+    query:
+      'select=match_id,captured_at,payload&phase=eq.pre&payload=not.is.null' +
+      `&match_id=in.(${matches.map((match) => match.matchId).join(',')})` +
+      `&order=captured_at.desc&limit=${TUNING_SNAPSHOT_LIMIT}`,
+    timeoutMs: 25_000,
+  });
+  if (snapshotsRes.errorCode || !Array.isArray(snapshotsRes.data)) return null;
+
+  const snapshots = snapshotsRes.data.flatMap((raw) => {
+    const row = raw as Record<string, unknown>;
+    const matchId = text(row.match_id);
+    const capturedAt = toIsoTimestamp(row.captured_at);
+    const payload = row.payload;
+    if (!matchId || !capturedAt || !payload || typeof payload !== 'object' || Array.isArray(payload)) return [];
+    return [{ matchId, capturedAt, payload: payload as Record<string, unknown> }];
+  });
+  return { matches, snapshots };
+}
+
+function clampLimit(value: unknown, min: number, max: number): number {
+  const raw = Number(value);
+  if (!Number.isFinite(raw)) return min;
+  return Math.min(max, Math.max(min, Math.round(raw)));
 }
 
 export interface PersistShadowResult {
