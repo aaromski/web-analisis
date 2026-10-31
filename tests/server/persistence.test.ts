@@ -221,7 +221,21 @@ test('sin configuración la persistencia queda desactivada y no usa la red', asy
       required: 100,
       markets: [],
       backtest: null,
+      scoring: null,
+      calibration: null,
+      baseline: null,
+      dataHealth: {
+        pairedMatches: 0,
+        marketWin: 0,
+        recaptured: 0,
+        traceMissing: 0,
+        totalsAtLine: 0,
+        handicapAtLine: 0,
+        lastCaptureAt: null,
+      },
+      trackRecord: [],
       engine: { promoted: null, candidates: [], reference: null },
+      learning: { runs: [], versions: [] },
     });
 
     const result = await persistPreAnalysis({ response: scheduledFixture(), analysis: UNUSED_ANALYSIS });
@@ -341,6 +355,7 @@ test('getLabSummary compara producción y sombra con el último snapshot', async
     assert.equal(summary.state, 'insufficient');
     assert.equal(summary.matchesWithResult, 2);
     assert.equal(summary.required, 100);
+    assert.deepEqual(summary.learning, { runs: [], versions: [] });
 
     const byMarket = new Map(summary.markets.map((row) => [row.market, row]));
     assert.deepEqual([...byMarket.keys()], ['1x2_home', '1x2_draw', '1x2_away', 'totals']);
@@ -372,6 +387,147 @@ test('getLabSummary compara producción y sombra con el último snapshot', async
   }
 });
 
+test('el laboratorio mide mercado, calibración, línea exacta y CLV', async () => {
+  setEnv(ENABLED_ENV);
+  type Probs = {
+    home: number;
+    draw: number;
+    away: number;
+    totalOver: number;
+    handicap: number;
+    market: { home: number; draw: number; away: number; source: string } | null;
+  };
+  const row = (
+    snapshotId: string,
+    variant: 'production' | 'shadow',
+    matchId: string,
+    createdAt: string,
+    probs: Probs,
+  ) => ({
+    snapshot_id: snapshotId,
+    variant,
+    prob_home: probs.home,
+    prob_draw: probs.draw,
+    prob_away: probs.away,
+    totals_line: 2.5,
+    totals_side: 'over',
+    totals_probability: probs.totalOver,
+    model_totals: { line: 2.5, over: probs.totalOver, under: 1 - probs.totalOver, push: 0 },
+    model_handicap: { line: -0.5, home: probs.handicap, away: 1 - probs.handicap },
+    market_win: probs.market,
+    market_totals: { line: 2.5, over: 0.55, under: 0.45 },
+    market_spread: { line: -0.5, home: 0.52, away: 0.48 },
+    match_snapshots: {
+      match_id: matchId,
+      created_at: createdAt,
+      matches: { league_id: 'test.A' },
+    },
+  });
+  const productionProbs: Probs = {
+    home: 0.5,
+    draw: 0.3,
+    away: 0.2,
+    totalOver: 0.6,
+    handicap: 0.55,
+    market: { home: 0.45, draw: 0.3, away: 0.25, source: 'odds' },
+  };
+  const openProbs: Probs = {
+    ...productionProbs,
+    market: { home: 0.4, draw: 0.32, away: 0.28, source: 'odds' },
+  };
+  const shadowProbs: Probs = {
+    home: 0.6,
+    draw: 0.25,
+    away: 0.15,
+    totalOver: 0.5,
+    handicap: 0.6,
+    market: null,
+  };
+
+  const stub = stubFetch((call) => {
+    if (call.url.includes('/rest/v1/predictions')) {
+      return Response.json([
+        row('snap-0', 'production', 'test:1', '2026-10-01T10:00:00Z', openProbs),
+        row('snap-1', 'production', 'test:1', '2026-10-02T10:00:00Z', productionProbs),
+        row('snap-1', 'shadow', 'test:1', '2026-10-02T10:00:00Z', shadowProbs),
+        row('snap-2', 'production', 'test:2', '2026-10-02T11:00:00Z', {
+          ...productionProbs,
+          home: 0.4,
+          draw: 0.35,
+          away: 0.25,
+        }),
+        row('snap-2', 'shadow', 'test:2', '2026-10-02T11:00:00Z', {
+          ...shadowProbs,
+          home: 0.35,
+          draw: 0.35,
+          away: 0.3,
+          totalOver: 0.62,
+        }),
+      ]);
+    }
+    return Response.json([
+      { match_id: 'test:1', home_score: 2, away_score: 1 },
+      { match_id: 'test:2', home_score: 1, away_score: 1 },
+    ]);
+  });
+
+  try {
+    const { getLabSummary } = await db();
+    const summary = await getLabSummary();
+
+    const near = (actual: number | null, expected: number, tolerance = 1e-3) => {
+      assert.ok(actual !== null && Math.abs(actual - expected) < tolerance, `${actual} ≉ ${expected}`);
+    };
+
+    assert.ok(summary.baseline);
+    assert.equal(summary.baseline.matches, 2);
+    near(summary.baseline.productionBrier, 0.5125);
+    near(summary.baseline.shadowBrier, 0.44);
+    near(summary.baseline.marketBrier, 0.605);
+    near(summary.baseline.naiveBrier, 0.5);
+    near(summary.baseline.productionSkillVsMarket, 1 - 0.5125 / 0.605);
+    assert.equal(summary.baseline.clv.matches, 1);
+    near(summary.baseline.clv.mean, 0.05);
+    near(summary.baseline.clv.positiveShare, 1);
+
+    assert.ok(summary.scoring);
+    near(summary.scoring.totals!.production, 0.26);
+    near(summary.scoring.totals!.shadow, 0.3172);
+    near(summary.scoring.totals!.market, 0.2525);
+    near(summary.scoring.handicap!.production, 0.2525);
+    near(summary.scoring.handicap!.shadow, 0.26);
+    near(summary.scoring.handicap!.market, 0.2504);
+
+    assert.ok(summary.calibration);
+    near(summary.calibration.productionEce, 0.2833);
+    near(summary.calibration.shadowEce, 0.1333);
+    assert.equal(summary.calibration.guard.ok, true);
+    assert.equal(summary.calibration.isotonic, null);
+
+    assert.equal(summary.dataHealth.pairedMatches, 2);
+    assert.equal(summary.dataHealth.marketWin, 2);
+    assert.equal(summary.dataHealth.recaptured, 1);
+    assert.equal(summary.dataHealth.traceMissing, 0);
+    assert.equal(summary.dataHealth.totalsAtLine, 2);
+    assert.equal(summary.dataHealth.handicapAtLine, 2);
+    assert.ok(summary.dataHealth.lastCaptureAt?.startsWith('2026-10-02'));
+
+    const league = summary.trackRecord.find(
+      (entry) => entry.kind === 'league' && entry.key === 'test.A',
+    );
+    assert.ok(league);
+    assert.equal(league.matches, 2);
+    near(league.productionBrier, 0.5125);
+    near(league.shadowBrier, 0.44);
+    near(league.marketBrier, 0.605);
+    near(league.delta, 0.44 - 0.5125);
+    assert.equal(summary.trackRecord.filter((entry) => entry.kind === 'market').length, 3);
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
 test('sin pares producción/sombra la compuerta queda en cero', async () => {
   setEnv(ENABLED_ENV);
   const stub = stubFetch((call) => {
@@ -391,7 +547,21 @@ test('sin pares producción/sombra la compuerta queda en cero', async () => {
       required: 100,
       markets: [],
       backtest: null,
+      scoring: null,
+      calibration: null,
+      baseline: null,
+      dataHealth: {
+        pairedMatches: 0,
+        marketWin: 0,
+        recaptured: 0,
+        traceMissing: 0,
+        totalsAtLine: 0,
+        handicapAtLine: 0,
+        lastCaptureAt: null,
+      },
+      trackRecord: [],
       engine: { promoted: null, candidates: [], reference: null },
+      learning: { runs: [], versions: [] },
     });
   } finally {
     stub.restore();
@@ -411,7 +581,21 @@ test('un HTTP de error en la lectura del laboratorio se publica como error', asy
       required: 100,
       markets: [],
       backtest: null,
+      scoring: null,
+      calibration: null,
+      baseline: null,
+      dataHealth: {
+        pairedMatches: 0,
+        marketWin: 0,
+        recaptured: 0,
+        traceMissing: 0,
+        totalsAtLine: 0,
+        handicapAtLine: 0,
+        lastCaptureAt: null,
+      },
+      trackRecord: [],
       engine: { promoted: null, candidates: [], reference: null },
+      learning: { runs: [], versions: [] },
     });
   } finally {
     stub.restore();
@@ -583,6 +767,89 @@ test('un error al leer los pendientes se publica como estado', async () => {
     const { listPendingPostMatches } = await db();
     const result = await listPendingPostMatches();
     assert.equal(result.status, 'error');
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('el diario del ciclo lee solo backtest/learning y mapea el motivo', async () => {
+  setEnv(ENABLED_ENV);
+  const stub = stubFetch(() =>
+    Response.json([
+      {
+        occurred_at: '2026-10-31T06:05:00Z',
+        status: 'skipped',
+        error_code: 'candidate-accumulating',
+        params_version: null,
+      },
+      {
+        occurred_at: '2026-10-30T06:05:00Z',
+        status: 'ok',
+        error_code: 'promoted',
+        params_version: 'auto-anchor-s110-20261030',
+      },
+      { occurred_at: 'nope', status: 'ok', error_code: null, params_version: null },
+      { occurred_at: '2026-10-29T06:05:00Z', status: 'weird', error_code: null, params_version: null },
+    ]),
+  );
+
+  try {
+    const { listLearningRuns } = await db();
+    const runs = await listLearningRuns(8);
+    assert.deepEqual(runs, [
+      {
+        occurredAt: '2026-10-31T06:05:00.000Z',
+        status: 'skipped',
+        reason: 'candidate-accumulating',
+        paramsVersion: null,
+      },
+      {
+        occurredAt: '2026-10-30T06:05:00.000Z',
+        status: 'ok',
+        reason: 'promoted',
+        paramsVersion: 'auto-anchor-s110-20261030',
+      },
+    ]);
+    assert.equal(stub.calls.length, 1);
+    assert.ok(stub.calls[0].url.includes('/rest/v1/ingestion_events'));
+    assert.ok(stub.calls[0].url.includes('operation=eq.backtest'));
+    assert.ok(stub.calls[0].url.includes('request_id=eq.learning'));
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('el historial de versiones incluye notas y fechas', async () => {
+  setEnv(ENABLED_ENV);
+  const stub = stubFetch(() =>
+    Response.json([
+      {
+        version: 'engine-1.2.0-defaults',
+        status: 'promoted',
+        created_at: '2026-10-01T00:00:00Z',
+        promoted_at: '2026-10-01T00:00:00Z',
+        retired_at: null,
+        notes: 'Base de producción',
+      },
+      { version: null, status: 'shadow' },
+    ]),
+  );
+
+  try {
+    const { listEngineHistory } = await db();
+    const history = await listEngineHistory(6);
+    assert.deepEqual(history, [
+      {
+        version: 'engine-1.2.0-defaults',
+        status: 'promoted',
+        createdAt: '2026-10-01T00:00:00.000Z',
+        promotedAt: '2026-10-01T00:00:00.000Z',
+        retiredAt: null,
+        notes: 'Base de producción',
+      },
+    ]);
   } finally {
     stub.restore();
     clearEnv();

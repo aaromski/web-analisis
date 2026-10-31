@@ -2,6 +2,7 @@ import type { AggregatedResponse } from '../types/api';
 import type {
   AnalysisResult,
   ComparisonSource,
+  EngineTrace,
   MarketKey,
   MarketOption,
   MarketResult,
@@ -46,9 +47,13 @@ import {
   buildScoreMatrix,
   clamp,
   exactScores,
+  handicapCover,
   oddTotal,
   round,
   shiftMatrix,
+  totalOver,
+  totalPush,
+  totalUnder,
 } from './poisson';
 import { assessQuality, statNumber } from './quality';
 import { buildLiveMeta } from './live';
@@ -224,6 +229,11 @@ export function analyzeMatch(
     maxGoals: MAX_GOALS,
   });
   let win = resultOutcomes(matrix);
+  const preAnchorLambdas = {
+    home: lambdas.lambdaHome,
+    away: lambdas.lambdaAway,
+    total: lambdas.lambdaTotal,
+  };
 
   // Ancla al mercado: corrige la compresión de la supremacía y fija la escala
   // de goles con la expectativa agregada de las cuotas. En vivo se omite: las
@@ -872,6 +882,55 @@ export function analyzeMatch(
     }
   }
 
+  const trace: EngineTrace = {
+    preAnchorLambdas: {
+      home: round(preAnchorLambdas.home, 3),
+      away: round(preAnchorLambdas.away, 3),
+      total: round(preAnchorLambdas.total, 3),
+    },
+    marketWin: comparisonWin
+      ? {
+          home: round(comparisonWin.home, 4),
+          draw: round(comparisonWin.draw, 4),
+          away: round(comparisonWin.away, 4),
+          source: comparisonWin.source,
+        }
+      : null,
+    marketTotals:
+      !live && totalsMarket.line !== null
+        ? {
+            line: totalsMarket.line,
+            over: totalsMarket.over === null ? null : round(totalsMarket.over, 4),
+            under: totalsMarket.under === null ? null : round(totalsMarket.under, 4),
+          }
+        : null,
+    marketSpread:
+      !live && spreadMarket.line !== null
+        ? {
+            line: spreadMarket.line,
+            home: spreadMarket.home === null ? null : round(spreadMarket.home, 4),
+            away: spreadMarket.away === null ? null : round(spreadMarket.away, 4),
+          }
+        : null,
+    modelTotalsAtMarketLine:
+      !live && totalsMarket.line !== null
+        ? {
+            line: totalsMarket.line,
+            over: round(totalOver(matrix, totalsMarket.line), 4),
+            under: round(totalUnder(matrix, totalsMarket.line), 4),
+            push: round(totalPush(matrix, totalsMarket.line), 4),
+          }
+        : null,
+    modelHandicapAtMarketLine:
+      !live && spreadMarket.line !== null
+        ? {
+            line: spreadMarket.line,
+            home: round(handicapCover(matrix, 'home', spreadMarket.line), 4),
+            away: round(handicapCover(matrix, 'away', -spreadMarket.line), 4),
+          }
+        : null,
+  };
+
   return {
     match: {
       id: response.match.match_id,
@@ -932,6 +991,7 @@ export function analyzeMatch(
         totalSource: anchor.totalSource,
       },
       marketSignal: signal ?? EMPTY_MARKET_SIGNAL,
+      trace,
       adjustments: lambdas.adjustments,
       uncertainty,
       live,

@@ -133,12 +133,19 @@ function scoredRows(
     const captured = new Date(Date.parse('2026-09-01T00:00:00Z') + (startDays + index) * 86_400_000);
     return {
       match_id: `test:${options.variant}-${String(index).padStart(4, '0')}`,
+      league_id: 'test.1',
       pre_snapshot_id: `snap-${options.variant}-${String(index).padStart(4, '0')}`,
       variant: options.variant,
       params_version: options.version,
       brier: options.brier,
       log_loss: 0.6,
       pre_captured_at: captured.toISOString(),
+      // Totales pareados por defecto: el objetivo compuesto y su cobertura.
+      home_score: 2,
+      away_score: 1,
+      totals_line: 2.5,
+      totals_side: 'over',
+      totals_probability: 0.55,
       ...options.extras,
     };
   });
@@ -190,22 +197,34 @@ function customPairs(
     const snapshotId = `snap-custom-${String(index).padStart(4, '0')}`;
     production.push({
       match_id: matchId,
+      league_id: 'test.1',
       pre_snapshot_id: snapshotId,
       variant: 'production',
       params_version: PROMOTED,
       brier: row.productionBrier,
       log_loss: 0.6,
       pre_captured_at: new Date(Date.parse('2026-09-01T00:00:00Z') + index * 86_400_000).toISOString(),
+      home_score: 2,
+      away_score: 1,
+      totals_line: 2.5,
+      totals_side: 'over',
+      totals_probability: 0.55,
       ...row.productionExtras,
     });
     shadow.push({
       match_id: matchId,
+      league_id: 'test.1',
       pre_snapshot_id: snapshotId,
       variant: 'shadow',
       params_version: CANDIDATE,
       brier: row.shadowBrier,
       log_loss: 0.6,
       pre_captured_at: new Date(Date.parse('2026-09-01T00:00:00Z') + index * 86_400_000).toISOString(),
+      home_score: 2,
+      away_score: 1,
+      totals_line: 2.5,
+      totals_side: 'over',
+      totals_probability: 0.55,
       ...row.shadowExtras,
     });
   });
@@ -374,6 +393,148 @@ test('totalsBrier puntúa la línea publicada y descarta push o datos incompleto
   assert.equal(totalsBrier(row({ totalsLine: 3 })), null);
   assert.equal(totalsBrier(row({ totalsSide: null })), null);
   assert.equal(totalsBrier(row({ homeScore: null })), null);
+});
+
+test('recencyWeight reduce el peso a la mitad por cada vida media', async () => {
+  const { recencyWeight, RECENCY_HALF_LIFE_DAYS } = await learning();
+  const day = 86_400_000;
+  const anchor = Date.parse('2026-10-31T00:00:00Z');
+  assert.equal(recencyWeight(anchor, anchor), 1);
+  assert.ok(Math.abs(recencyWeight(anchor - RECENCY_HALF_LIFE_DAYS * day, anchor) - 0.5) < 1e-12);
+  assert.ok(Math.abs(recencyWeight(anchor - 2 * RECENCY_HALF_LIFE_DAYS * day, anchor) - 0.25) < 1e-12);
+  // Un kickoff futuro no supera el peso máximo.
+  assert.equal(recencyWeight(anchor + 5 * day, anchor), 1);
+});
+
+test('totalsCoverage mide los pares con lectura de totales en ambos lados', async () => {
+  const { totalsCoverage } = await learning();
+  const mapped = (rows: Array<Record<string, any>>) =>
+    rows.map((row) => ({
+      matchId: row.match_id,
+      leagueId: row.league_id,
+      snapshotId: row.pre_snapshot_id,
+      variant: row.variant,
+      paramsVersion: row.params_version,
+      brier: row.brier,
+      logLoss: row.log_loss,
+      preCapturedAt: row.pre_captured_at,
+      probHome: null,
+      probDraw: null,
+      probAway: null,
+      lambdaHome: null,
+      lambdaAway: null,
+      preAnchorLambdaHome: null,
+      preAnchorLambdaAway: null,
+      totalsLine: row.totals_line,
+      totalsSide: row.totals_side,
+      totalsProbability: row.totals_probability,
+      marketTotalLine: null,
+      marketWin: null,
+      marketSpread: null,
+      homeScore: row.home_score,
+      awayScore: row.away_score,
+      anchorWeight: null,
+    }));
+  assert.equal(totalsCoverage(mapped(pairedRows(10)), CANDIDATE, PROMOTED), 1);
+  const withoutTotals = mapped(
+    pairedRows(10, CANDIDATE, 0.4, 0.45, {
+      shadow: { totals_line: null },
+      production: { totals_line: null },
+    }),
+  );
+  assert.equal(totalsCoverage(withoutTotals, CANDIDATE, PROMOTED), 0);
+});
+
+test('sin cobertura de totales la candidata no se promociona', async () => {
+  setEnv(ENABLED_ENV);
+  const rows = pairedRows(60, CANDIDATE, 0.3, 0.45, {
+    shadow: { totals_line: null },
+    production: { totals_line: null },
+  });
+  const stub = stubFetch((call) => {
+    if (call.url.includes('/rest/v1/v_match_backtest')) return Response.json(rows);
+    if (call.url.includes('status=eq.promoted')) {
+      return Response.json([engineRow(PROMOTED, '2026-09-01T00:00:00Z')]);
+    }
+    if (call.url.includes('status.eq.shadow')) {
+      return Response.json([engineRow(CANDIDATE, null)]);
+    }
+    if (call.url.includes('select=version,status')) return Response.json([]);
+    if (call.method === 'POST' && call.url.includes('/rest/v1/ingestion_events')) {
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`llamada inesperada: ${call.method} ${call.url}`);
+  });
+
+  try {
+    const { clearParamsCache } = await db();
+    clearParamsCache();
+    assert.deepEqual(await runLearning(NOW), {
+      state: 'skipped',
+      reason: 'low-coverage',
+      shadowMatches: 60,
+      coverage: 0,
+    });
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('evaluateLeagueGuard bloquea una liga perdedora con muestra suficiente', async () => {
+  const { evaluateLeagueGuard } = await learning();
+  const decision = evaluateLeagueGuard(
+    new Map<string, number[]>([
+      ['test.A', Array.from({ length: 12 }, () => -0.02)],
+      ['test.B', Array.from({ length: 10 }, () => 0.03)],
+      ['test.C', Array.from({ length: 5 }, () => 0.5)],
+    ]),
+  );
+  assert.equal(decision.ok, false);
+  assert.deepEqual(decision.segments.map((segment) => segment.leagueId), ['test.A', 'test.B', 'test.C']);
+  const small = evaluateLeagueGuard(new Map([['test.A', Array.from({ length: 5 }, () => 0.5)]]));
+  assert.equal(small.ok, true);
+});
+
+test('una liga perdedora bloquea la promoción aunque la media global mejore', async () => {
+  setEnv(ENABLED_ENV);
+  // 50 partidos de la liga A mejoran; 10 de la B empeoran lo suficiente.
+  const rows = pairedRows(60, CANDIDATE, 0.25, 0.45).map((row) => {
+    const index = Number(String(row.match_id).slice(-4));
+    const leagueId = index < 50 ? 'test.A' : 'test.B';
+    if (row.variant === 'shadow') {
+      return { ...row, league_id: leagueId, brier: index < 50 ? 0.25 : 0.53 };
+    }
+    return { ...row, league_id: leagueId };
+  });
+  const stub = stubFetch((call) => {
+    if (call.url.includes('/rest/v1/v_match_backtest')) return Response.json(rows);
+    if (call.url.includes('status=eq.promoted')) {
+      return Response.json([engineRow(PROMOTED, '2026-09-01T00:00:00Z')]);
+    }
+    if (call.url.includes('status.eq.shadow')) {
+      return Response.json([engineRow(CANDIDATE, null)]);
+    }
+    if (call.url.includes('select=version,status')) return Response.json([]);
+    if (call.method === 'POST' && call.url.includes('/rest/v1/ingestion_events')) {
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`llamada inesperada: ${call.method} ${call.url}`);
+  });
+
+  try {
+    const { clearParamsCache } = await db();
+    clearParamsCache();
+    assert.deepEqual(await runLearning(NOW), {
+      state: 'ok',
+      reason: 'candidate-kept',
+      shadowMatches: 60,
+      guard: 'league',
+    });
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
 });
 
 test('compositeBrier mezcla 1X2 normalizado y totales al 50 %', async () => {
@@ -779,6 +940,7 @@ test('no promueve si el 1X2 empeora aunque el compuesto mejore por totales', asy
       state: 'ok',
       reason: 'candidate-kept',
       shadowMatches: 60,
+      guard: 'result',
     });
     assert.equal(stub.calls.filter((call) => call.url.includes('/rpc/')).length, 0);
   } finally {
@@ -824,6 +986,7 @@ test('no promueve si el segmento de ancla baja se degrada', async () => {
       state: 'ok',
       reason: 'candidate-kept',
       shadowMatches: 60,
+      guard: 'model-led',
     });
   } finally {
     stub.restore();
@@ -831,7 +994,7 @@ test('no promueve si el segmento de ancla baja se degrada', async () => {
   }
 });
 
-test('el brazo de control acumula hasta la compuerta y no se promociona', async () => {
+test('un control heredado bajo la compuerta no bloquea el ajuste', async () => {
   setEnv(ENABLED_ENV);
   const control = 'engine-1.3.0-shadow-noanchor';
   const stub = stubFetch((call) => {
@@ -842,6 +1005,59 @@ test('el brazo de control acumula hasta la compuerta y no se promociona', async 
     if (call.url.includes('status.eq.shadow')) {
       return Response.json([engineRow(control, null), engineRow(REFERENCE, null)]);
     }
+    if (call.method === 'POST' && call.url.includes('/rest/v1/ingestion_events')) {
+      return new Response(null, { status: 204 });
+    }
+    if (call.method === 'PATCH' && call.url.includes('/rest/v1/engine_params')) {
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`llamada inesperada: ${call.method} ${call.url}`);
+  });
+
+  try {
+    const { clearParamsCache } = await db();
+    clearParamsCache();
+
+    // El control sigue sumando, pero el ciclo avanza hasta la compuerta real.
+    assert.deepEqual(await runLearning(NOW), {
+      state: 'skipped',
+      reason: 'insufficient-data',
+      datasetMatches: 0,
+    });
+    // Sin promoción ni retiro: la única escritura es el diario del ciclo.
+    const writes = stub.calls.filter((call) => call.method !== 'GET');
+    assert.equal(writes.length, 1);
+    assert.ok(writes[0].url.includes('/rest/v1/ingestion_events'));
+    const body = JSON.parse(String(writes[0].body ?? '{}')) as Record<string, unknown>;
+    assert.equal(body.operation, 'backtest');
+    assert.equal(body.request_id, 'learning');
+    assert.equal(body.error_code, 'insufficient-data');
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('una candidata sin created_at caduca por su primera captura sombra', async () => {
+  setEnv(ENABLED_ENV);
+  // Capturas de hace 40 días: superan los 21 de retención aunque la fila no
+  // tenga created_at (versiones antiguas creadas antes de guardar la fecha).
+  const rows = scoredRows(10, { variant: 'shadow', version: CANDIDATE, brier: 0.45 });
+  const stub = stubFetch((call) => {
+    if (call.url.includes('/rest/v1/v_match_backtest')) return Response.json(rows);
+    if (call.url.includes('status=eq.promoted')) return Response.json([engineRow(PROMOTED, null)]);
+    if (call.url.includes('status.eq.shadow')) {
+      return Response.json([
+        { ...engineRow(CANDIDATE, null), created_at: null },
+        engineRow(REFERENCE, null),
+      ]);
+    }
+    if (call.method === 'PATCH' && call.url.includes('/rest/v1/engine_params')) {
+      return new Response(null, { status: 204 });
+    }
+    if (call.method === 'POST' && call.url.includes('/rest/v1/ingestion_events')) {
+      return new Response(null, { status: 204 });
+    }
     throw new Error(`llamada inesperada: ${call.method} ${call.url}`);
   });
 
@@ -851,10 +1067,48 @@ test('el brazo de control acumula hasta la compuerta y no se promociona', async 
 
     assert.deepEqual(await runLearning(NOW), {
       state: 'skipped',
-      reason: 'control-accumulating',
-      shadowMatches: 60,
+      reason: 'insufficient-data',
+      datasetMatches: 0,
     });
-    assert.equal(stub.calls.filter((call) => call.method !== 'GET').length, 0);
+
+    const patches = stub.calls.filter((call) => call.method === 'PATCH');
+    assert.equal(patches.length, 1);
+    assert.ok(patches[0].url.includes(`version=eq.${CANDIDATE}`));
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('una candidata reciente sin created_at sigue acumulando muestra', async () => {
+  setEnv(ENABLED_ENV);
+  // Primera captura hace 2 días (2026-09-01 + 58 días): aún no caduca.
+  const rows = scoredRows(10, { variant: 'shadow', version: CANDIDATE, brier: 0.45 }, 58);
+  const stub = stubFetch((call) => {
+    if (call.url.includes('/rest/v1/v_match_backtest')) return Response.json(rows);
+    if (call.url.includes('status=eq.promoted')) return Response.json([engineRow(PROMOTED, null)]);
+    if (call.url.includes('status.eq.shadow')) {
+      return Response.json([
+        { ...engineRow(CANDIDATE, null), created_at: null },
+        engineRow(REFERENCE, null),
+      ]);
+    }
+    if (call.method === 'POST' && call.url.includes('/rest/v1/ingestion_events')) {
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`llamada inesperada: ${call.method} ${call.url}`);
+  });
+
+  try {
+    const { clearParamsCache } = await db();
+    clearParamsCache();
+
+    assert.deepEqual(await runLearning(NOW), {
+      state: 'skipped',
+      reason: 'candidate-accumulating',
+      shadowMatches: 10,
+    });
+    assert.equal(stub.calls.filter((call) => call.method === 'PATCH').length, 0);
   } finally {
     stub.restore();
     clearEnv();
@@ -1042,7 +1296,8 @@ test('vuelve a los defaults cuando la producción deriva de la referencia', asyn
     });
     assert.ok(summary.drift);
     assert.equal(summary.drift?.matches, 50);
-    assert.ok((summary.drift?.mean ?? 0) > 0.07);
+    // Compuesto: medio peso del Brier 1X2, sin aporte de totales (iguales).
+    assert.ok((summary.drift?.mean ?? 0) > 0.015);
     assert.equal(summary.drift?.probability, 1);
   } finally {
     stub.restore();

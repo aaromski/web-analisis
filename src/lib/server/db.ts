@@ -4,6 +4,24 @@ import type { AggregatedResponse } from '../types/api';
 import type { AnalysisResult, MarketResult } from '../types/analysis';
 import { analyzeMatch } from '../engine/analyze';
 import { resolveShadowParams, SHADOW_PARAMS_VERSION } from '../engine/shadow';
+import {
+  binaryBrier,
+  brierScore,
+  brierSkill,
+  closingLineValue,
+  expectedCalibrationError,
+  fitIsotonic,
+  handicapOutcome,
+  logLoss,
+  outcomeCalibrationSamples,
+  reliabilityBins,
+  topPick,
+  totalOutcome,
+  type CalibrationSample,
+  type IsotonicCalibrator,
+  type Outcome,
+  type ReliabilityBin,
+} from '../audit/metrics';
 import { canonicalPreSnapshot, hashCanonical } from './canonical';
 
 /**
@@ -44,8 +62,90 @@ export interface LabSummary {
   markets: LabMarketRow[];
   /** Exactitud por variante sobre los mismos partidos; null sin muestra. */
   backtest: LabBacktest | null;
+  /** Scoring de totales y hándicap en la línea exacta de la casa. */
+  scoring: LabScoring | null;
+  /** Calibración 1X2: ECE, bins de fiabilidad e isotónica. */
+  calibration: LabCalibration | null;
+  /** Baseline sin vig, skill frente a mercado/azar y CLV del pick. */
+  baseline: LabBaseline | null;
+  /** Cobertura de la instrumentación; explica muestras pequeñas. */
+  dataHealth: LabDataHealth;
+  /** Rendimiento por liga y por signo del 1X2. */
+  trackRecord: LabTrackRow[];
   /** Versión promovida y candidata vigentes del ciclo automático. */
   engine: LabEngineState;
+  /** Memoria del ciclo: últimas pasadas y versiones creadas/promovidas. */
+  learning: LabLearningState;
+}
+
+export interface LabScoringRow {
+  matches: number;
+  production: number | null;
+  shadow: number | null;
+  /** Brier binario del mercado sin vig en la misma línea, si hay cuotas. */
+  market: number | null;
+}
+
+export interface LabScoring {
+  totals: LabScoringRow | null;
+  handicap: LabScoringRow | null;
+}
+
+export interface LabCalibration {
+  matches: number;
+  productionEce: number | null;
+  shadowEce: number | null;
+  bins: ReliabilityBin[];
+  shadowBins: ReliabilityBin[];
+  isotonic: IsotonicCalibrator | null;
+  /** La sombra no debe empeorar la calibración más de un punto porcentual. */
+  guard: { ok: boolean; margin: number };
+}
+
+export interface LabClv {
+  matches: number;
+  /** Cambio medio de probabilidad sin vig del pick, positivo = el mercado se movió a favor. */
+  mean: number | null;
+  /** Proporción de picks cuyo precio se acortó. */
+  positiveShare: number | null;
+}
+
+export interface LabBaseline {
+  /** Partidos con cuotas de mercado comparables en ambos lados. */
+  matches: number;
+  productionBrier: number | null;
+  shadowBrier: number | null;
+  marketBrier: number | null;
+  naiveBrier: number | null;
+  productionSkillVsMarket: number | null;
+  shadowSkillVsMarket: number | null;
+  productionSkillVsNaive: number | null;
+  clv: LabClv;
+}
+
+export interface LabDataHealth {
+  pairedMatches: number;
+  /** Partidos con cuotas de mercado en la traza. */
+  marketWin: number;
+  /** Partidos con más de una captura pre (permite CLV). */
+  recaptured: number;
+  /** Pares sin traza de motor (predicciones anteriores a la instrumentación). */
+  traceMissing: number;
+  totalsAtLine: number;
+  handicapAtLine: number;
+  lastCaptureAt: string | null;
+}
+
+export interface LabTrackRow {
+  key: string;
+  label: string;
+  kind: 'league' | 'market';
+  matches: number;
+  productionBrier: number | null;
+  shadowBrier: number | null;
+  marketBrier: number | null;
+  /** Sombra − producción; negativo significa que la sombra mejora. */
+  delta: number | null;
 }
 
 export interface LabEngineState {
@@ -54,6 +154,22 @@ export interface LabEngineState {
   candidates: string[];
   /** Control fijo de referencia; acumula para detectar deriva frente a los defaults. */
   reference: string | null;
+}
+
+export interface LabLearningVersion {
+  version: string;
+  status: string;
+  createdAt: string | null;
+  promotedAt: string | null;
+  retiredAt: string | null;
+  notes: string | null;
+}
+
+export interface LabLearningState {
+  /** Una fila por pasada del cron, la más reciente primero. */
+  runs: LearningRunRow[];
+  /** Versiones del motor de más reciente a más antigua. */
+  versions: LabLearningVersion[];
 }
 
 export interface LabAccuracy {
@@ -189,11 +305,18 @@ async function rest(config: SupabaseConfig, options: RequestOptions): Promise<Ht
   }
 }
 
-type IngestionOperation = 'capture_pre' | 'capture_post' | 'generate_predictions';
+type IngestionOperation =
+  | 'capture_pre'
+  | 'capture_post'
+  | 'generate_predictions'
+  | 'promote_params'
+  | 'purge_payloads'
+  | 'backtest';
 type IngestionStatus = 'ok' | 'duplicate' | 'skipped' | 'error';
 
 interface IngestionEvent {
-  matchId: string;
+  /** Vacío en eventos de proceso (p. ej. una pasada de aprendizaje). */
+  matchId?: string | null;
   operation: IngestionOperation;
   status: IngestionStatus;
   snapshotId?: string | null;
@@ -218,7 +341,7 @@ async function recordIngestionEvent(
     path: '/rest/v1/ingestion_events',
     prefer: 'return=minimal',
     body: {
-      match_id: event.matchId,
+      match_id: event.matchId ?? null,
       snapshot_id: event.snapshotId ?? null,
       operation: event.operation,
       status: event.status,
@@ -235,15 +358,116 @@ function elapsedMs(started: number): number {
   return Math.max(0, Math.round(Date.now() - started));
 }
 
-function emptySummary(state: LabState): LabSummary {
+export interface LearningRunRow {
+  occurredAt: string;
+  status: 'ok' | 'duplicate' | 'skipped' | 'error';
+  /** Motivo corto de la pasada, p. ej. `candidate-accumulating`. */
+  reason: string | null;
+  /** Versión promovida o revertida en esa pasada, si hubo. */
+  paramsVersion: string | null;
+}
+
+const LEARNING_REQUEST_ID = 'learning';
+
+/**
+ * Diario del ciclo: una fila por pasada de aprendizaje. Reutiliza la auditoría
+ * de ingesta (`operation = backtest`, `request_id = learning`) para no añadir
+ * esquema. Es best-effort: un fallo del diario nunca rompe el aprendizaje.
+ */
+export async function recordLearningRun(input: {
+  status: 'ok' | 'skipped' | 'error';
+  reason?: string | null;
+  paramsVersion?: string | null;
+  latencyMs?: number | null;
+}): Promise<void> {
+  const config = readConfig();
+  if (!config) return;
+  await recordIngestionEvent(config, {
+    operation: 'backtest',
+    status: input.status,
+    errorCode: input.reason ?? null,
+    latencyMs: input.latencyMs ?? null,
+    paramsVersion: input.paramsVersion ?? null,
+    requestId: LEARNING_REQUEST_ID,
+  });
+}
+
+/** Últimas pasadas del ciclo, de la más reciente a la más antigua. */
+export async function listLearningRuns(limit = 8): Promise<LearningRunRow[] | null> {
+  const config = readConfig();
+  if (!config) return null;
+  const res = await rest(config, {
+    method: 'GET',
+    path: '/rest/v1/ingestion_events',
+    query:
+      'select=occurred_at,status,error_code,params_version' +
+      `&operation=eq.backtest&request_id=eq.${LEARNING_REQUEST_ID}` +
+      `&order=occurred_at.desc&limit=${clampLimit(limit, 1, 20)}`,
+    timeoutMs: 10_000,
+  });
+  if (res.errorCode || !Array.isArray(res.data)) return null;
+  return res.data.flatMap((raw) => {
+    const row = raw as Record<string, unknown>;
+    const occurredAt = toIsoTimestamp(row.occurred_at);
+    const status = row.status;
+    if (!occurredAt) return [];
+    if (status !== 'ok' && status !== 'duplicate' && status !== 'skipped' && status !== 'error') return [];
+    return [{
+      occurredAt,
+      status,
+      reason: text(row.error_code),
+      paramsVersion: text(row.params_version),
+    }];
+  });
+}
+
+function emptyDataHealth(): LabDataHealth {
+  return {
+    pairedMatches: 0,
+    marketWin: 0,
+    recaptured: 0,
+    traceMissing: 0,
+    totalsAtLine: 0,
+    handicapAtLine: 0,
+    lastCaptureAt: null,
+  };
+}
+
+export function emptyLabSummary(state: LabState): LabSummary {
   return {
     state,
     matchesWithResult: 0,
     required: LAB_REQUIRED_MATCHES,
     markets: [],
     backtest: null,
+    scoring: null,
+    calibration: null,
+    baseline: null,
+    dataHealth: emptyDataHealth(),
+    trackRecord: [],
     engine: { promoted: null, candidates: [], reference: null },
+    learning: { runs: [], versions: [] },
   };
+}
+
+interface MarketWinProbability {
+  home: number;
+  draw: number;
+  away: number;
+  source: string | null;
+}
+
+interface TotalsAtLine {
+  line: number;
+  over: number;
+  under: number;
+  push: number;
+}
+
+interface HandicapAtLine {
+  line: number;
+  home: number;
+  away: number;
 }
 
 interface LabPrediction {
@@ -253,10 +477,16 @@ interface LabPrediction {
   totalsLine: number | null;
   totalsSide: 'over' | 'under' | null;
   totalsProbability: number | null;
+  totalsAtLine: TotalsAtLine | null;
+  handicapAtLine: HandicapAtLine | null;
+  marketWin: MarketWinProbability | null;
+  marketTotals: { line: number; over: number; under: number } | null;
+  marketSpread: { line: number | null; home: number | null; away: number | null } | null;
 }
 
 interface SnapshotPair {
   matchId: string;
+  leagueId: string | null;
   createdAt: number;
   production?: LabPrediction;
   shadow?: LabPrediction;
@@ -272,14 +502,72 @@ function finiteNumber(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function embeddedSnapshot(value: unknown): { matchId: string; createdAt: number } | null {
+function objectField(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function marketWinOf(value: unknown): MarketWinProbability | null {
+  const row = objectField(value);
+  if (!row) return null;
+  const home = probability(row.home);
+  const draw = probability(row.draw);
+  const away = probability(row.away);
+  if (home === null || draw === null || away === null) return null;
+  return { home, draw, away, source: text(row.source) };
+}
+
+function totalsAtLineOf(value: unknown): TotalsAtLine | null {
+  const row = objectField(value);
+  if (!row) return null;
+  const line = finiteNumber(row.line);
+  const over = probability(row.over);
+  const under = probability(row.under);
+  if (line === null || over === null || under === null) return null;
+  return { line, over, under, push: probability(row.push) ?? 0 };
+}
+
+function handicapAtLineOf(value: unknown): HandicapAtLine | null {
+  const row = objectField(value);
+  if (!row) return null;
+  const line = finiteNumber(row.line);
+  const home = probability(row.home);
+  const away = probability(row.away);
+  if (line === null || home === null || away === null) return null;
+  return { line, home, away };
+}
+
+function marketTotalsOf(value: unknown): LabPrediction['marketTotals'] {
+  const row = objectField(value);
+  if (!row) return null;
+  const line = finiteNumber(row.line);
+  const over = probability(row.over);
+  const under = probability(row.under);
+  if (line === null || over === null || under === null) return null;
+  return { line, over, under };
+}
+
+function marketSpreadOf(value: unknown): LabPrediction['marketSpread'] {
+  const row = objectField(value);
+  if (!row) return null;
+  return { line: finiteNumber(row.line), home: probability(row.home), away: probability(row.away) };
+}
+
+function embeddedSnapshot(
+  value: unknown,
+): { matchId: string; leagueId: string | null; createdAt: number } | null {
   const row = Array.isArray(value) ? value[0] : value;
   if (!row || typeof row !== 'object') return null;
   const matchId = (row as { match_id?: unknown }).match_id;
   if (typeof matchId !== 'string' || !matchId) return null;
   const raw = (row as { created_at?: unknown }).created_at;
   const createdAt = typeof raw === 'string' ? Date.parse(raw) : NaN;
-  return { matchId, createdAt: Number.isFinite(createdAt) ? createdAt : 0 };
+  const match = (row as { matches?: unknown }).matches;
+  const matchRow = Array.isArray(match) ? match[0] : match;
+  const leagueId = matchRow && typeof matchRow === 'object'
+    ? text((matchRow as { league_id?: unknown }).league_id)
+    : null;
+  return { matchId, leagueId, createdAt: Number.isFinite(createdAt) ? createdAt : 0 };
 }
 
 function mean(values: number[]): number {
@@ -364,6 +652,243 @@ function marketRow(
   };
 }
 
+const LAB_CALIBRATION_MARGIN = 0.01;
+/** Muestras mínimas para publicar la isotónica en el laboratorio. */
+const LAB_ISOTONIC_MIN_SAMPLES = 30;
+
+function rounded(value: number | null): number | null {
+  return value === null ? null : Math.round(value * 10_000) / 10_000;
+}
+
+/** Brier/log-loss del 1X2 sin vig de la casa; solo filas con cuotas reales. */
+function marketAccuracy(
+  pairs: SnapshotPair[],
+  actualByMatch: Map<string, ActualResult>,
+): LabAccuracy | null {
+  const briers: number[] = [];
+  const losses: number[] = [];
+  for (const pair of pairs) {
+    const actual = actualByMatch.get(pair.matchId);
+    const market = pair.production?.marketWin ?? pair.shadow?.marketWin ?? null;
+    if (!actual || !market || market.source !== 'odds') continue;
+    briers.push(brierScore(market, actual));
+    losses.push(logLoss(market, actual));
+  }
+  if (briers.length === 0) return null;
+  return { brier: rounded(mean(briers))!, logLoss: rounded(mean(losses))! };
+}
+
+/** Baseline trivial: frecuencias históricas de local/empate/visitante. */
+function naiveAccuracy(
+  pairs: SnapshotPair[],
+  actualByMatch: Map<string, ActualResult>,
+): LabAccuracy | null {
+  const outcomes = pairs
+    .map((pair) => actualByMatch.get(pair.matchId))
+    .filter((outcome): outcome is ActualResult => Boolean(outcome));
+  if (outcomes.length === 0) return null;
+  const counts: Record<ActualResult, number> = { home: 0, draw: 0, away: 0 };
+  for (const outcome of outcomes) counts[outcome] += 1;
+  const base = {
+    home: counts.home / outcomes.length,
+    draw: counts.draw / outcomes.length,
+    away: counts.away / outcomes.length,
+  };
+  return {
+    brier: rounded(mean(outcomes.map((outcome) => brierScore(base, outcome))))!,
+    logLoss: rounded(mean(outcomes.map((outcome) => logLoss(base, outcome))))!,
+  };
+}
+
+/** CLV por partido: apertura y cierre de la cuota sin vig sobre el pick vigente. */
+function clvOf(pairs: SnapshotPair[]): LabClv {
+  const byMatch = new Map<string, SnapshotPair[]>();
+  for (const pair of pairs) {
+    const market = pair.production?.marketWin;
+    if (!market || market.source !== 'odds') continue;
+    const bucket = byMatch.get(pair.matchId) ?? [];
+    bucket.push(pair);
+    byMatch.set(pair.matchId, bucket);
+  }
+  const values: number[] = [];
+  for (const snapshots of byMatch.values()) {
+    if (snapshots.length < 2) continue;
+    const ordered = [...snapshots].sort((left, right) => left.createdAt - right.createdAt);
+    const open = ordered[0].production!.marketWin;
+    const last = ordered[ordered.length - 1].production!;
+    const close = last.marketWin;
+    if (!open || !close) continue;
+    const value = closingLineValue(open, close, topPick(last));
+    if (value !== null) values.push(value);
+  }
+  if (values.length === 0) return { matches: 0, mean: null, positiveShare: null };
+  return {
+    matches: values.length,
+    mean: rounded(mean(values)),
+    positiveShare: rounded(values.filter((value) => value > 0).length / values.length),
+  };
+}
+
+function scoringOf(
+  pairs: SnapshotPair[],
+  scoresByMatch: Map<string, { home: number; away: number }>,
+): LabScoring | null {
+  const totals = { production: [] as number[], shadow: [] as number[], market: [] as number[] };
+  const handicap = { production: [] as number[], shadow: [] as number[], market: [] as number[] };
+
+  for (const pair of pairs) {
+    const score = scoresByMatch.get(pair.matchId);
+    const production = pair.production;
+    if (!score || !production) continue;
+
+    const totalsTrace = production.totalsAtLine;
+    if (totalsTrace) {
+      const outcome = totalOutcome(score.home + score.away, totalsTrace.line);
+      if (outcome !== 'push') {
+        const hit = outcome === 'over';
+        totals.production.push(binaryBrier(totalsTrace.over, hit));
+        const shadowTrace = pair.shadow?.totalsAtLine;
+        if (shadowTrace && Math.abs(shadowTrace.line - totalsTrace.line) < 1e-9) {
+          totals.shadow.push(binaryBrier(shadowTrace.over, hit));
+        }
+        const market = production.marketTotals;
+        if (market && Math.abs(market.line - totalsTrace.line) < 1e-9) {
+          totals.market.push(binaryBrier(market.over, hit));
+        }
+      }
+    }
+
+    const handicapTrace = production.handicapAtLine;
+    if (handicapTrace) {
+      const graded = handicapOutcome(score.home - score.away, handicapTrace.line);
+      handicap.production.push((handicapTrace.home - graded) ** 2);
+      const shadowTrace = pair.shadow?.handicapAtLine;
+      if (shadowTrace && Math.abs(shadowTrace.line - handicapTrace.line) < 1e-9) {
+        handicap.shadow.push((shadowTrace.home - graded) ** 2);
+      }
+      const spread = production.marketSpread;
+      if (spread && spread.home !== null && spread.line !== null && Math.abs(spread.line - handicapTrace.line) < 1e-9) {
+        handicap.market.push((spread.home - graded) ** 2);
+      }
+    }
+  }
+
+  const row = (bucket: { production: number[]; shadow: number[]; market: number[] }): LabScoringRow | null =>
+    bucket.production.length === 0
+      ? null
+      : {
+          matches: bucket.production.length,
+          production: rounded(mean(bucket.production)),
+          shadow: rounded(mean(bucket.shadow)),
+          market: rounded(mean(bucket.market)),
+        };
+
+  const totalsRow = row(totals);
+  const handicapRow = row(handicap);
+  if (!totalsRow && !handicapRow) return null;
+  return { totals: totalsRow, handicap: handicapRow };
+}
+
+function calibrationOf(
+  pairs: SnapshotPair[],
+  actualByMatch: Map<string, ActualResult>,
+): LabCalibration | null {
+  const productionSamples: CalibrationSample[] = [];
+  const shadowSamples: CalibrationSample[] = [];
+  for (const pair of pairs) {
+    const actual = actualByMatch.get(pair.matchId);
+    if (!actual) continue;
+    if (pair.production) productionSamples.push(...outcomeCalibrationSamples(pair.production, actual));
+    if (pair.shadow) shadowSamples.push(...outcomeCalibrationSamples(pair.shadow, actual));
+  }
+  if (productionSamples.length === 0) return null;
+  const productionEce = expectedCalibrationError(productionSamples);
+  const shadowEce = shadowSamples.length > 0 ? expectedCalibrationError(shadowSamples) : null;
+  const ok =
+    productionEce === null || shadowEce === null || shadowEce <= productionEce + LAB_CALIBRATION_MARGIN;
+  return {
+    matches: pairs.length,
+    productionEce,
+    shadowEce,
+    bins: reliabilityBins(productionSamples),
+    shadowBins: reliabilityBins(shadowSamples),
+    isotonic: productionSamples.length >= LAB_ISOTONIC_MIN_SAMPLES ? fitIsotonic(productionSamples) : null,
+    guard: { ok, margin: LAB_CALIBRATION_MARGIN },
+  };
+}
+
+const TRACK_RECORD_LEAGUE_CAP = 8;
+const MARKET_SIDE_LABELS: Record<Outcome, string> = {
+  home: 'Local',
+  draw: 'Empate',
+  away: 'Visitante',
+};
+
+function trackRecordOf(
+  pairs: SnapshotPair[],
+  actualByMatch: Map<string, ActualResult>,
+): LabTrackRow[] {
+  const byLeague = new Map<string, SnapshotPair[]>();
+  for (const pair of pairs) {
+    if (!pair.leagueId) continue;
+    const bucket = byLeague.get(pair.leagueId) ?? [];
+    bucket.push(pair);
+    byLeague.set(pair.leagueId, bucket);
+  }
+
+  const rows: LabTrackRow[] = [];
+  for (const [key, bucket] of byLeague) {
+    const production = accuracyOf(bucket, (pair) => pair.production!, actualByMatch);
+    const shadow = accuracyOf(bucket, (pair) => pair.shadow!, actualByMatch);
+    const market = marketAccuracy(bucket, actualByMatch);
+    rows.push({
+      key,
+      label: key,
+      kind: 'league',
+      matches: bucket.length,
+      productionBrier: production?.brier ?? null,
+      shadowBrier: shadow?.brier ?? null,
+      marketBrier: market?.brier ?? null,
+      delta: production && shadow ? rounded(shadow.brier - production.brier) : null,
+    });
+  }
+  rows.sort((left, right) => right.matches - left.matches || left.key.localeCompare(right.key));
+
+  const marketRows: LabTrackRow[] = [];
+  for (const side of ['home', 'draw', 'away'] as Outcome[]) {
+    const production: number[] = [];
+    const shadow: number[] = [];
+    const market: number[] = [];
+    for (const pair of pairs) {
+      const actual = actualByMatch.get(pair.matchId);
+      if (!actual) continue;
+      const hit = actual === side;
+      if (pair.production) production.push(binaryBrier(pair.production[side], hit));
+      if (pair.shadow) shadow.push(binaryBrier(pair.shadow[side], hit));
+      const marketWin = pair.production?.marketWin ?? pair.shadow?.marketWin;
+      if (marketWin && marketWin.source === 'odds') market.push(binaryBrier(marketWin[side], hit));
+    }
+    if (production.length === 0) continue;
+    const productionBrier = mean(production);
+    const shadowBrier = mean(shadow);
+    marketRows.push({
+      key: `1x2_${side}`,
+      label: MARKET_SIDE_LABELS[side],
+      kind: 'market',
+      matches: production.length,
+      productionBrier: rounded(productionBrier),
+      shadowBrier: rounded(shadowBrier),
+      marketBrier: rounded(mean(market)),
+      delta:
+        productionBrier !== null && shadowBrier !== null
+          ? rounded(shadowBrier - productionBrier)
+          : null,
+    });
+  }
+
+  return [...rows.slice(0, TRACK_RECORD_LEAGUE_CAP), ...marketRows];
+}
+
 /**
  * Estado de la sección de sombra para el dashboard.
  *
@@ -373,7 +898,7 @@ function marketRow(
  */
 export async function getLabSummary(): Promise<LabSummary> {
   const config = readConfig();
-  if (!config) return emptySummary('disabled');
+  if (!config) return emptyLabSummary('disabled');
 
   try {
     const [predictions, results] = await Promise.all([
@@ -381,8 +906,16 @@ export async function getLabSummary(): Promise<LabSummary> {
         method: 'GET',
         path: '/rest/v1/predictions',
         query:
-          'select=snapshot_id,variant,prob_home,prob_draw,prob_away,totals_line,totals_side,totals_probability,match_snapshots!inner(match_id,created_at)' +
+          'select=snapshot_id,variant,prob_home,prob_draw,prob_away,totals_line,totals_side,totals_probability' +
+          ',model_totals:payload->model->trace->modelTotalsAtMarketLine' +
+          ',model_handicap:payload->model->trace->modelHandicapAtMarketLine' +
+          ',market_win:payload->model->trace->marketWin' +
+          ',market_totals:payload->model->trace->marketTotals' +
+          ',market_spread:payload->model->trace->marketSpread' +
+          ',match_snapshots!inner(match_id,created_at,matches!inner(league_id))' +
           `&variant=in.(production,shadow)&limit=${LAB_COUNT_CAP}`,
+        // La traza y el embed de liga pesan más que una lectura simple.
+        timeoutMs: 3_500,
       }),
       rest(config, {
         method: 'GET',
@@ -390,11 +923,13 @@ export async function getLabSummary(): Promise<LabSummary> {
         query:
           'select=match_id,home_score,away_score&status=eq.finished' +
           `&home_score=not.is.null&away_score=not.is.null&limit=${LAB_COUNT_CAP}`,
+        timeoutMs: 3_500,
       }),
     ]);
-    if (predictions.errorCode || results.errorCode) return emptySummary('error');
+    if (predictions.errorCode || results.errorCode) return emptyLabSummary('error');
 
     const actualByMatch = new Map<string, ActualResult>();
+    const scoresByMatch = new Map<string, { home: number; away: number }>();
     for (const row of Array.isArray(results.data) ? results.data : []) {
       const record = row as { match_id?: unknown; home_score?: unknown; away_score?: unknown } | null;
       const matchId = record?.match_id;
@@ -405,6 +940,7 @@ export async function getLabSummary(): Promise<LabSummary> {
       const home = homeScore as number;
       const away = awayScore as number;
       actualByMatch.set(matchId, home > away ? 'home' : home < away ? 'away' : 'draw');
+      scoresByMatch.set(matchId, { home, away });
     }
 
     const bySnapshot = new Map<string, SnapshotPair>();
@@ -424,6 +960,7 @@ export async function getLabSummary(): Promise<LabSummary> {
 
       const pair = bySnapshot.get(snapshotId) ?? {
         matchId: snapshot.matchId,
+        leagueId: snapshot.leagueId,
         createdAt: snapshot.createdAt,
       };
       pair[variant] = {
@@ -433,6 +970,11 @@ export async function getLabSummary(): Promise<LabSummary> {
         totalsLine: finiteNumber(record.totals_line),
         totalsSide: side === 'over' || side === 'under' ? side : null,
         totalsProbability: probability(record.totals_probability),
+        totalsAtLine: totalsAtLineOf(record.model_totals),
+        handicapAtLine: handicapAtLineOf(record.model_handicap),
+        marketWin: marketWinOf(record.market_win),
+        marketTotals: marketTotalsOf(record.market_totals),
+        marketSpread: marketSpreadOf(record.market_spread),
       };
       bySnapshot.set(snapshotId, pair);
     }
@@ -496,7 +1038,63 @@ export async function getLabSummary(): Promise<LabSummary> {
       actualByMatch,
     );
     const shadowAccuracy = accuracyOf(comparable, (pair) => pair.shadow!, actualByMatch);
+
+    const marketPairs = comparable.filter((pair) => {
+      const market = pair.production?.marketWin ?? pair.shadow?.marketWin;
+      return market?.source === 'odds';
+    });
+    const marketBaseline = marketAccuracy(marketPairs, actualByMatch);
+    const naiveBaseline = naiveAccuracy(marketPairs, actualByMatch);
+    const productionOnMarket = accuracyOf(marketPairs, (pair) => pair.production!, actualByMatch);
+    const shadowOnMarket = accuracyOf(marketPairs, (pair) => pair.shadow!, actualByMatch);
+    // CLV usa todas las capturas pre, no solo la más reciente de cada partido.
+    const clv = clvOf([...bySnapshot.values()]);
+    const baseline: LabBaseline | null =
+      marketBaseline && naiveBaseline && productionOnMarket && shadowOnMarket
+        ? {
+            matches: marketPairs.length,
+            productionBrier: productionOnMarket.brier,
+            shadowBrier: shadowOnMarket.brier,
+            marketBrier: marketBaseline.brier,
+            naiveBrier: naiveBaseline.brier,
+            productionSkillVsMarket: brierSkill(productionOnMarket.brier, marketBaseline.brier),
+            shadowSkillVsMarket: brierSkill(shadowOnMarket.brier, marketBaseline.brier),
+            productionSkillVsNaive: brierSkill(productionOnMarket.brier, naiveBaseline.brier),
+            clv,
+          }
+        : null;
+
+    const scoring = scoringOf(comparable, scoresByMatch);
+    const calibration = calibrationOf(comparable, actualByMatch);
+    const trackRecord = trackRecordOf(comparable, actualByMatch);
+
+    const snapshotsByMatch = new Map<string, Set<number>>();
+    for (const pair of bySnapshot.values()) {
+      const bucket = snapshotsByMatch.get(pair.matchId) ?? new Set<number>();
+      bucket.add(pair.createdAt);
+      snapshotsByMatch.set(pair.matchId, bucket);
+    }
+    const lastCaptureAt = comparable.reduce(
+      (latestAt, pair) => (pair.createdAt > latestAt ? pair.createdAt : latestAt),
+      0,
+    );
+    const dataHealth: LabDataHealth = {
+      pairedMatches: comparable.length,
+      marketWin: marketPairs.length,
+      recaptured: [...snapshotsByMatch.values()].filter((set) => set.size > 1).length,
+      traceMissing: comparable.filter(
+        (pair) => !pair.production?.totalsAtLine && !pair.production?.marketWin,
+      ).length,
+      totalsAtLine: scoring?.totals?.matches ?? 0,
+      handicapAtLine: scoring?.handicap?.matches ?? 0,
+      lastCaptureAt: lastCaptureAt > 0 ? new Date(lastCaptureAt).toISOString() : null,
+    };
+
     const engineConfigs = await getEngineConfigs().catch(() => null);
+    const [learningRuns, versions] = await Promise.all([
+      listLearningRuns(8).catch(() => null),
+      listEngineHistory(6).catch(() => null),
+    ]);
 
     return {
       state,
@@ -507,6 +1105,11 @@ export async function getLabSummary(): Promise<LabSummary> {
         productionAccuracy && shadowAccuracy && matchesWithResult > 0
           ? { matches: matchesWithResult, production: productionAccuracy, shadow: shadowAccuracy }
           : null,
+      scoring,
+      calibration,
+      baseline,
+      dataHealth,
+      trackRecord,
       engine: {
         promoted: engineConfigs?.promoted?.version ?? null,
         candidates:
@@ -517,9 +1120,13 @@ export async function getLabSummary(): Promise<LabSummary> {
           engineConfigs?.shadows.find((shadow) => shadow.version === REFERENCE_PARAMS_VERSION)?.version ??
           null,
       },
+      learning: {
+        runs: learningRuns ?? [],
+        versions: versions ?? [],
+      },
     };
   } catch {
-    return emptySummary('error');
+    return emptyLabSummary('error');
   }
 }
 
@@ -987,6 +1594,8 @@ export interface EngineHistoryRow {
   createdAt: string | null;
   promotedAt: string | null;
   retiredAt: string | null;
+  /** Explicación legible de por qué existe la versión. */
+  notes: string | null;
 }
 
 export async function listEngineHistory(limit = 20): Promise<EngineHistoryRow[] | null> {
@@ -995,7 +1604,9 @@ export async function listEngineHistory(limit = 20): Promise<EngineHistoryRow[] 
   const res = await rest(config, {
     method: 'GET',
     path: '/rest/v1/engine_params',
-    query: `select=version,status,created_at,promoted_at,retired_at&order=created_at.desc&limit=${clampLimit(limit, 1, 50)}`,
+    query:
+      'select=version,status,created_at,promoted_at,retired_at,notes' +
+      `&order=created_at.desc&limit=${clampLimit(limit, 1, 50)}`,
   });
   if (res.errorCode || !Array.isArray(res.data)) return null;
   return res.data.flatMap((raw) => {
@@ -1009,6 +1620,7 @@ export async function listEngineHistory(limit = 20): Promise<EngineHistoryRow[] 
       createdAt: toIsoTimestamp(row.created_at),
       promotedAt: toIsoTimestamp(row.promoted_at),
       retiredAt: toIsoTimestamp(row.retired_at),
+      notes: text(row.notes),
     }];
   });
 }
@@ -1092,16 +1704,33 @@ export async function promoteParamsVersion(
 
 export interface ScoredPrediction {
   matchId: string;
+  /** Liga de la vista; null si la fila no la trae. */
+  leagueId: string | null;
   snapshotId: string | null;
   variant: string;
   paramsVersion: string;
   brier: number;
   logLoss: number;
   preCapturedAt: string | null;
+  /** Probabilidades publicadas del 1X2, para calibrar. */
+  probHome: number | null;
+  probDraw: number | null;
+  probAway: number | null;
+  /** λ final y λ pre-ancla (esta última solo con la vista v2). */
+  lambdaHome: number | null;
+  lambdaAway: number | null;
+  preAnchorLambdaHome: number | null;
+  preAnchorLambdaAway: number | null;
   /** Línea y lado del total publicado, para el guardarraíl por mercado. */
   totalsLine: number | null;
   totalsSide: 'over' | 'under' | null;
   totalsProbability: number | null;
+  /** Línea de totales de la casa. */
+  marketTotalLine: number | null;
+  /** 1X2 sin vig guardado en la traza (vista v2); null en filas antiguas. */
+  marketWin: { home: number; draw: number; away: number; source: string | null } | null;
+  /** Línea y precios del hándicap de la casa (vista v2). */
+  marketSpread: { line: number | null; home: number | null; away: number | null } | null;
   homeScore: number | null;
   awayScore: number | null;
   /** Peso final del ancla en esa predicción; 0 = motor puro sin mercado. */
@@ -1112,10 +1741,83 @@ const SCORED_PAGE_SIZE = 1_000;
 /** Tope defensivo: 5 páginas cubren años de compuerta sin agotar el cron. */
 const SCORED_MAX_ROWS = 5_000;
 
+/** Columnas disponibles desde la primera vista. */
+const SCORED_BASE_COLUMNS =
+  'match_id,league_id,pre_snapshot_id,variant,params_version,brier,log_loss,pre_captured_at' +
+  ',prob_home,prob_draw,prob_away,lambda_home,lambda_away' +
+  ',totals_line,totals_side,totals_probability,market_total_line,home_score,away_score,anchor_weight';
+
+/** Columnas de la vista v2 (traza de mercado). Se piden solo si existen. */
+const SCORED_TRACE_COLUMNS =
+  ',pre_anchor_lambda_home,pre_anchor_lambda_away,market_win,market_spread';
+
+let scoredTraceAvailable: boolean | null = null;
+
+/** Los tests que simulan PostgREST necesitan olvidar la capacidad detectada. */
+export function resetScoredPredictionCapability(): void {
+  scoredTraceAvailable = null;
+}
+
+async function fetchScoredPage(
+  config: SupabaseConfig,
+  columns: string,
+  versions: string[],
+  offset: number,
+): Promise<{ rows: unknown[] | null; errorCode: string | null }> {
+  const res = await rest(config, {
+    method: 'GET',
+    path: '/rest/v1/v_match_backtest',
+    query:
+      `select=${columns}` +
+      `&params_version=in.(${versions.join(',')})&brier=not.is.null&log_loss=not.is.null` +
+      '&order=pre_captured_at.asc,match_id.asc,variant.asc,params_version.asc' +
+      `&limit=${SCORED_PAGE_SIZE}&offset=${offset}`,
+    timeoutMs: 15_000,
+  });
+  if (res.errorCode || !Array.isArray(res.data)) {
+    return { rows: null, errorCode: res.errorCode ?? 'invalid_response' };
+  }
+  return { rows: res.data, errorCode: null };
+}
+
+async function collectScoredRows(
+  config: SupabaseConfig,
+  columns: string,
+  versions: string[],
+): Promise<unknown[] | null> {
+  const rows: unknown[] = [];
+  for (let offset = 0; offset < SCORED_MAX_ROWS; offset += SCORED_PAGE_SIZE) {
+    const page = await fetchScoredPage(config, columns, versions, offset);
+    if (!page.rows) return null;
+    rows.push(...page.rows);
+    if (page.rows.length < SCORED_PAGE_SIZE) break;
+  }
+  return rows;
+}
+
+function marketWinTrace(value: unknown): ScoredPrediction['marketWin'] {
+  const row = objectField(value);
+  if (!row) return null;
+  const home = probability(row.home);
+  const draw = probability(row.draw);
+  const away = probability(row.away);
+  if (home === null || draw === null || away === null) return null;
+  return { home, draw, away, source: text(row.source) };
+}
+
+function marketSpreadTrace(value: unknown): ScoredPrediction['marketSpread'] {
+  const row = objectField(value);
+  if (!row) return null;
+  return { line: finiteNumber(row.line), home: probability(row.home), away: probability(row.away) };
+}
+
 /**
  * Métricas por predicción ya calculadas por la vista (incluye versión).
  * Pagina porque la vista crece con cada variante y cada reanálisis; el tope
  * evita que una respuesta enorme tumbe el presupuesto del cron.
+ *
+ * La traza de mercado vive en la vista v2. Mientras no esté aplicada se cae a
+ * las columnas base y se recuerda la capacidad para no repetir el fallo.
  */
 export async function listScoredPredictions(versions: string[]): Promise<ScoredPrediction[] | null> {
   const config = readConfig();
@@ -1123,45 +1825,46 @@ export async function listScoredPredictions(versions: string[]): Promise<ScoredP
   const safe = versions.map(validVersion).filter((value): value is string => Boolean(value));
   if (safe.length === 0) return [];
 
-  const rows: unknown[] = [];
-  for (let offset = 0; offset < SCORED_MAX_ROWS; offset += SCORED_PAGE_SIZE) {
-    const res = await rest(config, {
-      method: 'GET',
-      path: '/rest/v1/v_match_backtest',
-      query:
-        'select=match_id,pre_snapshot_id,variant,params_version,brier,log_loss,pre_captured_at' +
-        ',totals_line,totals_side,totals_probability,home_score,away_score,anchor_weight' +
-        `&params_version=in.(${safe.join(',')})&brier=not.is.null&log_loss=not.is.null` +
-        '&order=pre_captured_at.asc,match_id.asc,variant.asc,params_version.asc' +
-        `&limit=${SCORED_PAGE_SIZE}&offset=${offset}`,
-      timeoutMs: 15_000,
-    });
-    if (res.errorCode || !Array.isArray(res.data)) return null;
-    rows.push(...res.data);
-    if (res.data.length < SCORED_PAGE_SIZE) break;
+  let rows: unknown[] | null = null;
+  if (scoredTraceAvailable !== false) {
+    rows = await collectScoredRows(config, `${SCORED_BASE_COLUMNS}${SCORED_TRACE_COLUMNS}`, safe);
+    scoredTraceAvailable = rows !== null;
   }
+  if (!rows) rows = await collectScoredRows(config, SCORED_BASE_COLUMNS, safe);
+  if (!rows) return null;
 
   return rows.flatMap((raw) => {
     const row = raw as Record<string, unknown>;
     const matchId = text(row.match_id);
     const variant = text(row.variant);
     const paramsVersion = text(row.params_version);
-    const brier = typeof row.brier === 'number' ? row.brier : null;
-    const logLoss = typeof row.log_loss === 'number' ? row.log_loss : null;
+    const brier = finiteNumber(row.brier);
+    const logLoss = finiteNumber(row.log_loss);
     if (!matchId || !variant || !paramsVersion || brier === null || logLoss === null) return [];
     const side = row.totals_side;
     const anchorWeight = finiteNumber(row.anchor_weight);
     return [{
       matchId,
+      leagueId: text(row.league_id),
       snapshotId: text(row.pre_snapshot_id),
       variant,
       paramsVersion,
       brier,
       logLoss,
       preCapturedAt: toIsoTimestamp(row.pre_captured_at),
+      probHome: probability(row.prob_home),
+      probDraw: probability(row.prob_draw),
+      probAway: probability(row.prob_away),
+      lambdaHome: finiteNumber(row.lambda_home),
+      lambdaAway: finiteNumber(row.lambda_away),
+      preAnchorLambdaHome: finiteNumber(row.pre_anchor_lambda_home),
+      preAnchorLambdaAway: finiteNumber(row.pre_anchor_lambda_away),
       totalsLine: finiteNumber(row.totals_line),
       totalsSide: side === 'over' || side === 'under' ? side : null,
       totalsProbability: probability(row.totals_probability),
+      marketTotalLine: finiteNumber(row.market_total_line),
+      marketWin: marketWinTrace(row.market_win),
+      marketSpread: marketSpreadTrace(row.market_spread),
       homeScore: Number.isInteger(row.home_score) ? (row.home_score as number) : null,
       awayScore: Number.isInteger(row.away_score) ? (row.away_score as number) : null,
       anchorWeight:
@@ -1470,6 +2173,61 @@ export async function listPendingPostMatches(
     matches.push({ matchId, kickoffAt });
     if (matches.length >= limit) break;
   }
+  return { status: 'ok', matches };
+}
+
+export interface RecaptureCandidate {
+  matchId: string;
+  kickoffAt: string;
+}
+
+export interface ListRecaptureCandidatesResult {
+  status: 'ok' | 'disabled' | 'error';
+  matches: RecaptureCandidate[];
+}
+
+/** Ventana por defecto: la última captura útil antes del cierre de cuotas. */
+export const RECAPTURE_WINDOW_MS = 3 * 3_600_000;
+
+/**
+ * Partidos ya analizados que empiezan dentro de la ventana y siguen
+ * programados. Recapturarlos cerca del inicio permite medir CLV entre la
+ * primera cuota guardada y el cierre, sin depender de que alguien reanalice.
+ */
+export async function listRecaptureCandidates(
+  options: { nowMs?: number; windowMs?: number; limit?: number } = {},
+): Promise<ListRecaptureCandidatesResult> {
+  const config = readConfig();
+  if (!config) return { status: 'disabled', matches: [] };
+
+  const now = options.nowMs ?? Date.now();
+  const windowMs = clampInt(options.windowMs, 60_000, 12 * 3_600_000, RECAPTURE_WINDOW_MS);
+  const limit = clampInt(options.limit, 1, 10, 3);
+  const end = now + windowMs;
+
+  const res = await rest(config, {
+    method: 'GET',
+    path: '/rest/v1/matches',
+    query: [
+      'select=match_id,kickoff_at',
+      'status=eq.scheduled',
+      `kickoff_at=gte.${encodeURIComponent(new Date(now).toISOString())}`,
+      `kickoff_at=lte.${encodeURIComponent(new Date(end).toISOString())}`,
+      'match_snapshots!inner(id)',
+      'match_snapshots.phase=eq.pre',
+      'order=kickoff_at.asc',
+      `limit=${limit}`,
+    ].join('&'),
+  });
+  if (res.errorCode) return { status: 'error', matches: [] };
+
+  const matches = (Array.isArray(res.data) ? res.data : []).flatMap((raw) => {
+    const row = raw as { match_id?: unknown; kickoff_at?: unknown } | null;
+    const matchId = text(row?.match_id);
+    const kickoffAt = toIsoTimestamp(row?.kickoff_at);
+    if (!matchId || !kickoffAt) return [];
+    return [{ matchId, kickoffAt }];
+  });
   return { status: 'ok', matches };
 }
 

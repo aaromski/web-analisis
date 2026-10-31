@@ -1,10 +1,38 @@
 import type { CalibrationPoint, MarketOption, RiskLevel } from '../types/analysis';
 import { fairOdds } from './markets';
 import { DEFAULT_ENGINE_PARAMS, type EngineParams } from './params';
-import { clamp, handicapCover, poissonOver, poissonUnder, round, totalOver, totalUnder, type ScoreMatrix } from './poisson';
+import { clamp, handicapCover, round, totalOver, totalUnder, type ScoreMatrix } from './poisson';
 
 export const TOTAL_LINES: number[] = Array.from({ length: 7 }, (_, index) => index + 0.5);
 export const CORNER_LINES: number[] = Array.from({ length: 9 }, (_, index) => index + 6.5);
+/**
+ * Dispersión de la binomial negativa de córners. Los conteos reales tienen una
+ * varianza cercana a 1,8× la media; con λ≈10–11, r=12 reproduce esa
+ * sobredispersión sin estimar un parámetro por liga con muestras pequeñas.
+ */
+export const CORNER_DISPERSION = 12;
+
+/**
+ * P(X > line) con binomial negativa de media λ y dispersión r
+ * (varianza = λ + λ²/r). r→∞ se acerca a Poisson; r menor engorda las colas.
+ */
+export function cornerOver(lambda: number, line: number, dispersion = CORNER_DISPERSION): number {
+  const safeLambda = Math.max(0, lambda);
+  const r = Math.max(0.1, dispersion);
+  const p = r / (r + safeLambda);
+  const threshold = Math.floor(line);
+  let pmf = Math.pow(p, r);
+  let cdf = 0;
+  for (let k = 0; k <= threshold; k += 1) {
+    if (k > 0) pmf *= ((k + r - 1) / k) * (1 - p);
+    cdf += pmf;
+  }
+  return clamp(1 - cdf, 0, 1);
+}
+
+export function cornerUnder(lambda: number, line: number, dispersion = CORNER_DISPERSION): number {
+  return clamp(1 - cornerOver(lambda, line, dispersion), 0, 1);
+}
 /**
  * Líneas que puede tomar el favorito. En el mercado real el favorito siempre
  * entrega goles (signo negativo); el no favorito recibe el espejo positivo.
@@ -371,8 +399,8 @@ export function calibrateCorners(
   const baseLine = nearestHalfLine(lambdaCorners, CORNER_LINES[0], CORNER_LINES[CORNER_LINES.length - 1]);
   const points = CORNER_LINES.map((line) => ({
     line,
-    over: poissonOver(lambdaCorners, line),
-    under: poissonUnder(lambdaCorners, line),
+    over: cornerOver(lambdaCorners, line),
+    under: cornerUnder(lambdaCorners, line),
   }));
   const overCandidates = points.filter((point) => point.over >= threshold);
   const underCandidates = points.filter((point) => point.under >= threshold);
@@ -430,7 +458,7 @@ export function calibrateCorners(
 
   const sideLabel = selection === 'over' ? 'Over' : 'Under';
   const marketModelProbability =
-    marketLine === null ? null : selection === 'over' ? poissonOver(lambdaCorners, marketLine) : poissonUnder(lambdaCorners, marketLine);
+    marketLine === null ? null : selection === 'over' ? cornerOver(lambdaCorners, marketLine) : cornerUnder(lambdaCorners, marketLine);
   const marketProbability = marketLine === null ? null : selection === 'over' ? marketOver : marketUnder;
   const edge =
     marketProbability !== null && marketProbability > 0 && marketModelProbability !== null

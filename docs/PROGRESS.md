@@ -716,3 +716,217 @@ exponía (`totals_*`, `anchor_weight`) y no requiere migración.
 - El vector de parámetros sigue en una dimensión (escala del ancla) hasta reunir
   250–300 partidos cerrados; con la muestra actual más perillas memorizarían
   ruido.
+
+## 19. Memoria del ciclo, recencia y cobertura (2026-10-31)
+
+Iteración sobre el ciclo de mejora continua sin migración nueva: el diario
+reutiliza `ingestion_events` y la vista ya exponía `league_id`.
+
+### 19.1 Cambios
+
+- **Diario de decisiones.** `runLearning` registra una fila por pasada en
+  `ingestion_events` con `operation = 'backtest'` y `request_id = 'learning'`:
+  estado (`ok/skipped/error`), motivo corto en `error_code`, versión
+  promovida/revertida en `params_version` y latencia. Es best-effort: un fallo
+  del diario nunca rompe ni cambia el resultado del aprendizaje.
+- **Estado del ciclo en `/api/lab`.** `LabSummary.learning` publica las últimas
+  8 pasadas y el historial de 6 versiones con notas. El panel deja de mostrar
+  solo chips y explica la última decisión.
+- **Ponderación por recencia.** El walk-forward puntúa cada partido con peso
+  `0,5^(edad/60 días)` respecto al kickoff más reciente de la muestra. Un
+  partido de hace dos meses pesa la mitad; la agregación de folds usa la suma
+  de pesos, no el conteo bruto, y `matches` sigue siendo la muestra real para
+  las compuertas.
+- **Cobertura de totales.** La promoción exige que ≥ 35 % de los pares tenga
+  lectura de totales en ambos lados; el ajuste exige la misma cobertura en la
+  muestra walk-forward. Sin ella el objetivo compuesto sería 1X2 disfrazado y
+  el resultado se publica como `low-coverage`.
+- **Guardarraíl por liga.** Con ≥ 8 pares por liga, ninguna liga puede perder
+  más de 0,01 de Brier compuesto frente a producción aunque la media global
+  mejore. El bloqueo se publica como `guard: 'league'` en el resumen; los
+  guardarraíles previos se identifican como `result`, `totals` y `model-led`.
+- **Tarjeta «Memoria del ciclo».** En `#sombra`, debajo del estado de la
+  compuerta: última pasada con fecha de Madrid, decisión traducida, próximo
+  paso deducido del motivo, historial breve de pasadas y versiones del motor.
+  Sin pasadas muestra un texto explicativo; en estados `disabled/error` no se
+  renderiza.
+
+### 19.2 Verificación
+
+- `npm run typecheck` limpio; `npm test` **130/130**; `npm run build` correcto.
+  Pruebas nuevas: diario (filtro y mapeo), historial con notas, media vida de
+  la recencia, cobertura de totales, bloqueo `low-coverage`, guardarraíl por
+  liga (unidad e integración con promoción bloqueada), y los motivos de
+  bloqueo `result`/`model-led` ahora expuestos en el resumen.
+- La tarjeta se verificó en el navegador con una ruta temporal de previsualización
+  (datos simulados, sin escribir en Supabase): DOM y textos accesibles correctos
+  (última pasada, decisión, próximo paso, 4 pasadas previas, 3 versiones). El
+  navegador integrado no expone superficie visible (viewport 0×0), así que no
+  fue posible validar píxeles ni capturas; el layout móvil queda pendiente de
+  revisión visual.
+- `/api/lab` no se consultó contra producción en esta iteración para no mezclar
+  lecturas en vivo con datos aún no desplegados.
+
+### 19.3 Límites
+
+- El diario comparte tabla con la auditoría de ingesta: no guarda el
+  guardarraíl exacto que bloqueó, solo el motivo. Para separarlo haría falta
+  una columna o tabla propia (migración pendiente de autorización).
+- La recencia cambia la escala del objetivo, no la compuerta de 100 partidos:
+  sin muestra real el ciclo sigue sin ajustar.
+- Sin commit, push ni despliegue: la producción mantiene la lógica anterior
+  hasta autorización explícita.
+
+## 20. Auditoría del ciclo 2 y correcciones (2026-10-31)
+
+Segunda pasada independiente sobre el ciclo 1: se revisó el flujo completo
+(`runLearning` → ajuste → promoción → diario → UI) buscando errores de lógica,
+no features nuevas.
+
+### 20.1 Hallazgos y correcciones
+
+- **El control heredado bloqueaba el aprendizaje.** Antes, un brazo de control
+  sin ancla con menos de 100 pares devolvía `control-accumulating` y terminaba
+  la pasada antes de evaluar candidatas o ajustar. Ahora el control solo se
+  retira al alcanzar la compuerta y nunca interrumpe el ciclo; su acumulación no
+  impide que el ajuste llegue a su propia compuerta.
+- **Candidatas sin `created_at` nunca caducaban.** La retención de 21 días
+  dependía de `created_at`; las versiones antiguas sin esa columna quedaban
+  activas para siempre. `candidateAgeMs` cae a la primera captura sombra y
+  devuelve `Infinity` sin fechas fiables, de modo que una versión huérfana
+  también se retira.
+- **Deriva y rollback medían solo 1X2.** Usaban el Brier crudo mientras la
+  promoción decide con el objetivo compuesto (1X2 + totales). Ahora ambos usan
+  `compositeBrier`, así que revertir y detectar deriva responden al mismo
+  criterio con el que se promueve.
+- **Constante muerta.** Se eliminó `CANDIDATE_MIN_AGE_MS`, que no tenía usos.
+
+### 20.2 Verificación
+
+- `npm run typecheck` limpio; `npm test` **132/132**; `npm run build` correcto.
+  Pruebas nuevas: candidata sin fecha caducada por su primera captura (PATCH de
+  retiro y paso a `insufficient-data`) y candidata sin fecha reciente que sigue
+  acumulando (`candidate-accumulating`, sin escrituras).
+- `/api/lab` verificado en vivo, solo lectura, con el build de producción
+  (`next start` en el puerto 3101, luego detenido): `learning.versions` devuelve
+  las dos filas reales de `engine_params` con notas, fechas y estado; `runs`
+  queda vacío porque el cron desplegado aún no escribe el diario. No se ejecutó
+  ninguna escritura ni se modificó Supabase.
+
+### 20.3 Límites vigentes
+
+- El guardarraíl bloqueante se publica en el resumen (`guard`) pero el diario
+  solo guarda el motivo; separarlo exige migración.
+- La tarjeta y el layout móvil siguen sin validación de píxeles por la
+  superficie oculta del navegador integrado.
+- La lógica corregida no está desplegada: producción sigue con el ciclo
+  anterior hasta autorización de commit/push.
+
+## 21. Instrumentación P0–P3: medir contra el mercado (2026-10-31)
+
+Cierre del backlog de medición propuesto en la auditoría objetiva. El orden fue
+P0 (medir bien) → P1 (córners) → P2 (guardarraíles) → P3 (superficie de
+resultados). Todo funciona sin cambiar el esquema de tablas.
+
+### 21.1 Cambios
+
+- **Traza del motor en el payload (P0.1).** Cada predicción guarda en
+  `payload.model.trace`: `preAnchorLambdas` (λ antes de mezclar con el mercado),
+  `marketWin` (1X2 sin vig con `source: 'odds'`), `marketTotals` y
+  `marketSpread` en su línea, y las probabilidades del modelo en la línea exacta
+  de la casa (`modelTotalsAtMarketLine`, `modelHandicapAtMarketLine`) para
+  producción y sombra. Las filas anteriores a esta instrumentación quedan sin
+  traza y se cuentan aparte; nunca se interpretan como cero.
+- **Scoring en la línea de mercado (P0.2).** Totales y hándicap se puntúan en la
+  línea que publicó la casa, no en la línea calibrada por el motor. Totales usa
+  Brier binario y descarta pushes; hándicap usa el Brier continuo de la
+  probabilidad de cubrir. El mercado sin vig se puntúa en la misma línea como
+  referencia.
+- **Calibración (P0.3).** `/api/lab` publica ECE, bins de fiabilidad e isotónica
+  (desde 30 muestras) para producción y sombra, con un punto por signo y
+  partido. El guardarraíl exige que la sombra no empeore el ECE de producción
+  más de 0,01, tanto en el resumen como en la elegibilidad de promoción
+  (`guard: 'calibration'`). La isotónica se publica, no se aplica todavía a las
+  probabilidades de producción.
+- **Baseline, skill y CLV (P0.4).** El laboratorio compara el Brier del motor con
+  el mercado sin vig y con una base trivial de frecuencias, y publica el skill
+  (`1 − Brier/Brier_base`) frente a ambos. El CLV por partido usa la primera y la
+  última captura pre con cuotas y el pick vigente; se publica la media y la
+  proporción de picks cuyo precio se acortó.
+- **Recaptura de cierre en el cron.** Antes del aprendizaje, el cron recaptura
+  hasta tres partidos que empiezan en ≤ 3 h, con presupuesto de 20 s. El
+  snapshot sigue siendo idempotente por contenido: sin cambios de cuotas no hay
+  fila nueva. La respuesta incluye `recapture` (intentados, insertados,
+  duplicados, omitidos, errores).
+- **Córners con binomial negativa (P1).** La varianza pasa de λ a λ + λ²/r con
+  `r = 12` fijo, lo que engorda la cola sin estimar dispersión por liga. Se usa
+  en la curva de calibración y en la probabilidad de mercado del córner.
+- **Guardarraíl de liga y salud de datos (P2).** Con ≥ 8 pares por liga, una
+  liga bloquea la promoción si su diferencial compuesto medio supera 0,01 y la
+  cota inferior normal del 95 % también es positiva. Se eligió la aproximación
+  normal, no bootstrap, por coste dentro del cron; es conservadora con muestras
+  pequeñas. `dataHealth` publica pares, partidos con cuotas, recapturados, filas
+  sin traza, lecturas en línea de totales/hándicap y última captura.
+- **Track record y tarjetas (P3).** El resumen agrupa el Brier de producción,
+  sombra y mercado por las ocho ligas con más muestra y por signo del 1X2. En
+  `#sombra` se añaden las tarjetas «Frente al mercado», «Calibración del 1X2»,
+  «Salud de los datos» e «Historial»; cada una se oculta si no hay muestra en
+  vez de mostrar ceros.
+- **Vista v2 aplicada.** `20261031180000_learning_trace_view.sql` recrea
+  `v_match_backtest` con las columnas derivadas de la traza. Se aplicó el
+  2026-10-31 dentro de una transacción. Como las columnas nuevas van en medio
+  del `SELECT`, `create or replace` no es válido (exige añadirlas al final), así
+  que la migración hace `drop view` + `create view`: no había objetos
+  dependientes, se re-otorga `select` solo a `service_role` y se conserva
+  `security_invoker`. La lectura del aprendizaje ya no necesita el fallback,
+  aunque se mantiene para filas antiguas sin traza.
+
+### 21.2 Verificación
+
+- `npm run typecheck` limpio; `npm test` **134/134**; `npm run build` correcto.
+  Pruebas nuevas o ampliadas: scoring en línea exacta y CLV en el resumen del
+  laboratorio, bins de fiabilidad con bordes flotantes, isotónica monótona y
+  corrección del ECE, binomial negativa (complementariedad, monotonía en la
+  línea y convergencia a Poisson con `r = 1e6`), y los objetos vacíos del
+  laboratorio con los campos nuevos.
+- `/api/lab` en vivo devuelve `state: insufficient` con los campos nuevos
+  (`baseline`, `scoring`, `calibration`, `dataHealth`, `trackRecord`) y
+  `dataHealth.recaptured = 1`; no se escribió nada para esta comprobación.
+- Análisis real de Liverpool–Arsenal (`espn:401879246`, 2026-11-01) desde la
+  página en el servidor de desarrollo. La captura persistió un snapshot pre y
+  dos predicciones con traza completa (mercado 1X2 sin vig, totales 2,5,
+  hándicap en 0,5, modelo 0,474/0,526 en totales y 0,5952/0,4048 en hándicap);
+  la captura anterior del mismo partido conserva `trace: null`, como se espera.
+- En el navegador, con el dashboard cargado, la sección sombra renderiza las
+  tarjetas «Frente al mercado» y «Salud de los datos»; calibración e historial
+  se ocultan por falta de muestra. Sin errores de consola (solo avisos de
+  React DevTools y Fast Refresh). La captura de píxeles sigue no disponible en
+  el navegador integrado.
+- La migración v2 se verificó en vivo tras aplicarla: la vista tiene 33
+  columnas, `security_invoker=true`, `select` solo para `service_role`, y
+  PostgREST responde 200 con la clave de servicio (401 sin ella). La captura de
+  Liverpool–Arsenal devuelve λ pre-ancla 0,95/1,30 y las probabilidades de
+  mercado, mientras las filas anteriores devuelven `null`. La consulta exacta
+  de `listScoredPredictions` con las columnas de traza responde 200.
+
+### 21.3 Límites y pendientes
+
+- El objetivo xG y la mezcla modelo–mercado por liga no se implementaron:
+  exigirían histórico de xG y más muestra cerrada; con la actual memorizarían
+  ruido. Tampoco el Dixon-Coles jerárquico, la calibración de sigma/confianza
+  ni el ajuste de rho, cuota de HT o peso xG: siguen detrás de la compuerta de
+  250–300 partidos cerrados.
+- Mercados de tarjetas, tiros, líneas asiáticas, combinada entre partidos y
+  simulador de escenarios no se añadieron; la medición nueva cubre 1X2, totales
+  y hándicap. Historial de picks con CLV, alertas, lista de seguimiento y
+  exportación siguen pendientes.
+- El CLV solo existe con ≥ 2 capturas pre con cuotas. En Hobby el cron es
+  diario y la recaptura es oportunista, así que la muestra de cierre crecerá
+  despacio.
+- La cota normal del guardarraíl de liga es una aproximación; un intervalo
+  bootstrap o empirical Bayes queda para cuando el volumen lo justifique.
+- La vista v2 ya está aplicada. Revertir solo la vista exige recrear a mano la
+  definición anterior; `supabase/rollback/learning_loop_down.sql` elimina el
+  esquema completo, no esta vista por separado.
+- Sin commit, push ni despliegue: producción mantiene la lógica anterior hasta
+  autorización explícita.

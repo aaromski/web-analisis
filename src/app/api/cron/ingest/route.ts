@@ -1,5 +1,11 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { listPendingPostMatches } from '@/lib/server/db';
+import { getAnalysisCapture } from '@/lib/server/analysis-service';
+import {
+  listPendingPostMatches,
+  listRecaptureCandidates,
+  persistPreAnalysis,
+  persistShadowAnalysis,
+} from '@/lib/server/db';
 import { StatsApiError } from '@/lib/server/errors';
 import { jsonError } from '@/lib/server/http';
 import { runLearning, type LearningSummary } from '@/lib/server/learning';
@@ -15,6 +21,64 @@ const MAX_MATCHES_PER_RUN = 10;
 const TIME_BUDGET_MS = 45_000;
 /** Por debajo de este margen el ajuste se pospone a la pasada siguiente. */
 const MIN_LEARNING_BUDGET_MS = 12_000;
+/** Capturas de cierre: pocas y acotadas para no consumir el presupuesto. */
+const MAX_RECAPTURES_PER_RUN = 3;
+const RECAPTURE_BUDGET_MS = 20_000;
+
+interface RecaptureSummary {
+  status: 'ok' | 'disabled' | 'error';
+  attempted: number;
+  inserted: number;
+  duplicates: number;
+  skipped: number;
+  errors: number;
+}
+
+/**
+ * Recaptura la última lectura pre de los partidos que empiezan pronto. El
+ * snapshot es idempotente por contenido: si las cuotas no cambiaron, no hay
+ * fila nueva. Así se puede medir CLV entre apertura y cierre.
+ */
+async function recaptureClosingLines(started: number, nowMs: number): Promise<RecaptureSummary> {
+  const summary: RecaptureSummary = {
+    status: 'ok',
+    attempted: 0,
+    inserted: 0,
+    duplicates: 0,
+    skipped: 0,
+    errors: 0,
+  };
+  const candidates = await listRecaptureCandidates({ nowMs, limit: MAX_RECAPTURES_PER_RUN });
+  summary.status = candidates.status;
+  if (candidates.status !== 'ok') return summary;
+
+  for (const candidate of candidates.matches) {
+    if (Date.now() - started >= RECAPTURE_BUDGET_MS) break;
+    summary.attempted += 1;
+    try {
+      const capture = await getAnalysisCapture({ matchId: candidate.matchId });
+      const saved = await persistPreAnalysis({
+        response: capture.response,
+        analysis: capture.envelope.analysis,
+        paramsVersion: capture.paramsVersion,
+      });
+      if (saved.snapshotId) {
+        await persistShadowAnalysis({
+          response: capture.response,
+          matchId: candidate.matchId,
+          snapshotId: saved.snapshotId,
+        });
+      }
+      if (saved.status === 'ok') summary.inserted += 1;
+      else if (saved.status === 'duplicate') summary.duplicates += 1;
+      else if (saved.status === 'skipped') summary.skipped += 1;
+      else summary.errors += 1;
+    } catch {
+      summary.errors += 1;
+    }
+  }
+  return summary;
+}
 
 interface CronEntry {
   matchId: string;
@@ -123,6 +187,10 @@ export async function GET(request: Request): Promise<Response> {
   const count = (value: CronEntry['outcome']): number =>
     entries.filter((entry) => entry.outcome === value).length;
 
+  // Cierre de cuotas: recalcula los partidos inminentes ya analizados para
+  // guardar la última lectura pre. Nunca bloquea la ingesta ni el aprendizaje.
+  const recapture = await recaptureClosingLines(started, Date.now());
+
   // El aprendizaje nunca puede tumbar la ingesta: si no cabe en el presupuesto
   // o falla, se publica su estado y se reintenta en la pasada siguiente.
   let learning: LearningSummary;
@@ -145,6 +213,7 @@ export async function GET(request: Request): Promise<Response> {
       stopReason,
       elapsedMs: Date.now() - started,
       results: entries,
+      recapture,
       learning,
     },
     { headers: { 'Cache-Control': 'no-store' } },

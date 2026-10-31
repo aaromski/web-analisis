@@ -279,6 +279,30 @@ export interface LiveMeta {
   remainingLambdaAway: number;
 }
 
+export interface MarketWinTrace {
+  home: number;
+  draw: number;
+  away: number;
+  source: 'odds' | 'prediction';
+}
+
+/**
+ * Traza auditable del paso por el mercado. Permite comparar el motor puro con
+ * la referencia sin vig y recalcular el valor en la línea exacta de la casa.
+ */
+export interface EngineTrace {
+  /** λ antes de mezclar con el mercado (motor propio). */
+  preAnchorLambdas: { home: number; away: number; total: number };
+  /** 1X2 de referencia sin vig; null en vivo o sin cuotas/predicción. */
+  marketWin: MarketWinTrace | null;
+  marketTotals: { line: number | null; over: number | null; under: number | null } | null;
+  marketSpread: { line: number | null; home: number | null; away: number | null } | null;
+  /** Probabilidad del modelo final en la línea de totales del mercado. */
+  modelTotalsAtMarketLine: { line: number; over: number; under: number; push: number } | null;
+  /** Cobertura del modelo en la línea de hándicap del mercado (perspectiva local). */
+  modelHandicapAtMarketLine: { line: number; home: number; away: number } | null;
+}
+
 export interface ModelMeta {
   version: string;
   generatedAt: string;
@@ -299,6 +323,7 @@ export interface ModelMeta {
   marketAgreement: number;
   marketAnchor: MarketAnchorMeta;
   marketSignal: MarketSignal;
+  trace: EngineTrace;
   adjustments: ModelAdjustment[];
   uncertainty: ModelUncertainty | null;
   live: LiveMeta | null;

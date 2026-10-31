@@ -1,4 +1,4 @@
-import { getLabSummary, LAB_REQUIRED_MATCHES, type LabSummary } from '@/lib/server/db';
+import { emptyLabSummary, getLabSummary, type LabSummary } from '@/lib/server/db';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -13,14 +13,7 @@ export async function GET(): Promise<Response> {
   try {
     summary = await getLabSummary();
   } catch {
-    summary = {
-      state: 'error',
-      matchesWithResult: 0,
-      required: LAB_REQUIRED_MATCHES,
-      markets: [],
-      backtest: null,
-      engine: { promoted: null, candidates: [], reference: null },
-    };
+    summary = emptyLabSummary('error');
   }
 
   return Response.json(summary, {

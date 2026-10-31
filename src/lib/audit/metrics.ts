@@ -70,6 +70,85 @@ export function logLoss(probabilities: OutcomeProbabilities, outcome: Outcome, e
   return -Math.log(Math.max(epsilon, probabilities[outcome]));
 }
 
+/** Brier binario de una selección; `hit` es el resultado real de esa apuesta. */
+export function binaryBrier(probability: number, hit: boolean): number {
+  return (probability - (hit ? 1 : 0)) ** 2;
+}
+
+export function binaryLogLoss(probability: number, hit: boolean, epsilon = 1e-12): number {
+  const picked = hit ? probability : 1 - probability;
+  return -Math.log(Math.max(epsilon, picked));
+}
+
+export type TotalOutcome = 'over' | 'under' | 'push';
+
+export function totalOutcome(total: number, line: number): TotalOutcome {
+  if (Math.abs(total - line) < 1e-9) return 'push';
+  return total > line ? 'over' : 'under';
+}
+
+/**
+ * Resultado de una apuesta de hándicap desde el margen del lado apostado.
+ * Devuelve 1 (gana), 0,5 (push) o 0 (pierde). Las líneas de cuarto se
+ * reparten a medias entre las dos líneas adyacentes, igual que en la casa.
+ */
+export function handicapOutcome(margin: number, line: number): number {
+  const twice = line * 2;
+  if (Math.abs(twice - Math.round(twice)) > 1e-9) {
+    const lower = Math.floor(twice) / 2;
+    const upper = Math.ceil(twice) / 2;
+    return (handicapOutcomeWhole(margin, lower) + handicapOutcomeWhole(margin, upper)) / 2;
+  }
+  return handicapOutcomeWhole(margin, line);
+}
+
+function handicapOutcomeWhole(margin: number, line: number): number {
+  const adjusted = margin + line;
+  if (adjusted > 1e-9) return 1;
+  if (Math.abs(adjusted) <= 1e-9) return 0.5;
+  return 0;
+}
+
+/**
+ * Habilidad relativa (skill score) frente a una referencia: 1 = perfecto,
+ * 0 = igual que la referencia, negativo = peor.
+ */
+export function brierSkill(modelBrier: number, referenceBrier: number): number | null {
+  if (!Number.isFinite(modelBrier) || !Number.isFinite(referenceBrier) || referenceBrier <= 0) return null;
+  return 1 - modelBrier / referenceBrier;
+}
+
+/**
+ * Valor de línea de cierre para el lado respaldado: cuánto subió su
+ * probabilidad sin vig entre la captura inicial y la final. Positivo = la
+ * cuota se acortó después de apostar, señal favorable de CLV.
+ */
+export function closingLineValue(
+  open: OutcomeProbabilities,
+  close: OutcomeProbabilities,
+  side: Outcome,
+): number | null {
+  const before = open[side];
+  const after = close[side];
+  if (!Number.isFinite(before) || !Number.isFinite(after)) return null;
+  return round(after - before, 4);
+}
+
+/** Muestras de calibración del 1X2: una por signo, con su acierto real. */
+export function outcomeCalibrationSamples(
+  probabilities: OutcomeProbabilities,
+  outcome: Outcome,
+): CalibrationSample[] {
+  return OUTCOMES.map((side) => ({
+    probability: probabilities[side],
+    hit: side === outcome,
+  }));
+}
+
+export function topPick(probabilities: OutcomeProbabilities): Outcome {
+  return favoriteSide(probabilities);
+}
+
 export function outcomeFromScore(score: { home: number | null; away: number | null } | null | undefined): Outcome | null {
   if (!score || typeof score.home !== 'number' || typeof score.away !== 'number') return null;
   if (score.home > score.away) return 'home';
@@ -120,7 +199,11 @@ export function reliabilityBins(samples: CalibrationSample[], binWidth = 0.1): R
   const width = clamp(binWidth, 0.02, 0.5);
   const bins = new Map<number, CalibrationSample[]>();
   for (const sample of samples) {
-    const index = Math.min(Math.floor(clamp(sample.probability, 0, 0.999999) / width), Math.ceil(1 / width) - 1);
+    // El epsilon evita que 0.3/0.1 = 2.9999 caiga en el bin anterior.
+    const index = Math.min(
+      Math.floor((clamp(sample.probability, 0, 0.999999) + 1e-9) / width),
+      Math.ceil(1 / width) - 1,
+    );
     const bucket = bins.get(index) ?? [];
     bucket.push(sample);
     bins.set(index, bucket);

@@ -1,11 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  CORNER_DISPERSION,
   CORNER_LINES,
   TOTAL_LINES,
   calibrateCorners,
   calibrateHandicap,
   calibrateTotals,
+  cornerOver,
+  cornerUnder,
 } from '../../src/lib/engine/calibration.ts';
 import { buildScoreMatrix, handicapCover, totalOver, totalUnder } from '../../src/lib/engine/poisson.ts';
 import { resultOutcomes } from '../../src/lib/engine/markets.ts';
@@ -68,9 +71,21 @@ test('el favorito nunca recibe una línea positiva', () => {
   for (const option of calibration.alternatives) assert.ok(!option.label.includes('+'));
 });
 
-test('córners calibra sobre Poisson 1D', () => {
+test('córners calibra sobre la binomial negativa', () => {
   const calibration = calibrateCorners(9.0, 0.75);
   assert.ok(calibration.probability >= 0.75);
   assert.equal(calibration.curve.filter((point) => point.selected).length, 1);
   assert.ok(CORNER_LINES.includes(calibration.line));
+});
+
+test('la binomial negativa reparte más cola que Poisson con la misma media', () => {
+  const lambda = 10;
+  const over = cornerOver(lambda, 9.5);
+  assert.ok(over > 0 && over < 1);
+  assert.ok(Math.abs(cornerOver(lambda, 9.5) + cornerUnder(lambda, 9.5) - 1) < 1e-12);
+  assert.ok(cornerOver(lambda, 12.5) < over);
+  // Con dispersión menor (colas más gordas) la cola alta crece.
+  assert.ok(cornerOver(lambda, 14.5, 6) > cornerOver(lambda, 14.5, CORNER_DISPERSION));
+  // Dispersión enorme se acerca a Poisson(10): P(X>14) ≈ 0,0835.
+  assert.ok(Math.abs(cornerOver(lambda, 14.5, 1e6) - 0.0835) < 0.002);
 });
