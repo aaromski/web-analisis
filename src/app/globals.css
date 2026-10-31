@@ -2015,6 +2015,51 @@ button {
   color: var(--text-dim);
 }
 
+.shadow-backtest {
+  margin-top: 28px;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.shadow-backtest-title {
+  margin: 0 0 10px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.shadow-backtest-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.shadow-backtest-row {
+  display: grid;
+  grid-template-columns: minmax(84px, 0.6fr) minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.shadow-backtest-metric {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.shadow-backtest-note {
+  margin: 10px 0 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-dim);
+}
+
 .dash-nav a.dash-nav-muted {
   color: var(--text-dim);
   border-bottom: 1px dashed var(--line-strong);

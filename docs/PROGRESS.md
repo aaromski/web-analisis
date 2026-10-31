@@ -398,6 +398,13 @@ Liverpool. Detalle en `docs/MEDICION.md`.
   diaria.
 - **UI.** Sección «Sombra vs. producción» al final del dashboard con la
   compuerta de 100 partidos, estados explícitos y `GET /api/lab`.
+- **Backtest del laboratorio.** `LabSummary` incorpora `backtest` (o `null`):
+  sobre el último análisis pre de cada partido cerrado y para cada variante,
+  `getLabSummary` calcula la media del Brier multiclase
+  `Σ(pᵢ − yᵢ)²` y del log-loss `−ln(p_real)` con suelo 1e-15, redondeadas a
+  4 decimales. La sección sombra muestra «Backtest · N partidos» con ambas
+  métricas por variante (menor es mejor) y la nota de alcance; sin partidos
+  cerrados el bloque no se renderiza.
 
 ### 15.2 Verificación
 
@@ -413,8 +420,10 @@ Liverpool. Detalle en `docs/MEDICION.md`.
   última captura y se deduplica. Filas de prueba eliminadas y laboratorio de
   nuevo en 0/100. En navegador sobre el build de producción, la tabla muestra
   los cuatro mercados con «Observación en curso».
-- `npm run purge -- --dry-run` valida la ventana; la purga real no se ejecutó
-  (no hay snapshots post todavía y requiere autorización).
+- `npm run purge -- --dry-run` valida la ventana; con autorización explícita
+  (ventana 90 días) la purga real se ejecutó: **0 payloads** de post
+  eliminados (todavía no hay snapshots post con JSON que superen la ventana),
+  traza `purge_payloads` en `ingestion_events` y 835 ms.
 - `npm run audit` idéntico a §14.2 (motor |Δ| 0,71 · MAE 4,4 pp; anclado
   |Δ| 0,16 · MAE 1,2 pp; sesgo 1,2 pp; valor 16/30; criterios OK): el refactor
   de parámetros no cambió producción.
@@ -460,6 +469,18 @@ Liverpool. Detalle en `docs/MEDICION.md`.
   0/100.
 - Navegador sobre el build de producción: análisis Bayern–Dortmund 200 y
   sección sombra visible con la compuerta en 0/100; sin errores de consola.
+- **Redespliegue verificado (2026-10-31).** En
+  `https://web-analisis-nu.vercel.app`, `/api/cron/ingest` responde 401 sin
+  cabecera y 200 `pending:0` con el Bearer de `CRON_SECRET` (la variable ya
+  existe en Vercel y `vercel.json` está registrado); `/api/lab` sigue
+  `insufficient` 0/100.
+- **Backtest verificado en vivo (2026-10-31).** Fixture
+  `test:lab-backtest` (pre + predicciones producción 0,50/0,30/0,20 y sombra
+  0,60/0,25/0,15; resultado local 2-1) sobre el build de producción:
+  `GET /api/lab` devolvió `matches: 1`, Brier 0,380 / 0,245 y log-loss
+  0,693 / 0,511 —coincide con el cálculo manual— y el HTML SSR incluyó el
+  bloque «Backtest · 1 partido» con ambos valores. Fixture eliminado y
+  laboratorio de nuevo en 0/100 con `backtest: null`.
 
 ### 15.3 Límites y pendientes
 
@@ -468,16 +489,16 @@ Liverpool. Detalle en `docs/MEDICION.md`.
   tengan captura pre; el contador sigue en 0/100. Cambiar de candidata exige
   una nueva fila `shadow` en `engine_params`, sin tocar código.
 - `n` e IC se calculan sobre partidos, no sobre predicciones sueltas: el lab
-  usa un snapshot por partido (el más reciente con ambas variantes) y no mide
-  calibración (Brier/log-loss) todavía; eso llegará con la vista de backtest.
-  La lectura asume una versión de producción y una sombra; al promover una
-  candidata habrá que filtrar por `params_version` para no mezclar motores.
+  usa un snapshot por partido (el más reciente con ambas variantes). El
+  backtest (Brier/log-loss) ya está publicado, pero ambos se calculan sobre
+  `latest` por partido, sin granularidad temporal ni por mercado. La lectura
+  asume una versión de producción y una sombra; al promover una candidata
+  habrá que filtrar por `params_version` para no mezclar motores.
 - Despliegue: en Vercel el proyecto web ya tiene `SUPABASE_URL`,
-  `SUPABASE_SERVICE_ROLE_KEY`, `INGEST_TOKEN` y `GEMINI_API_KEY`; comprobado en
-  producción (`/api/lab` responde `insufficient` y la ingesta 200/401/409 como
-  en local). Falta añadir `CRON_SECRET` (generado en `.env.local` el
-  2026-10-31, mismo valor que en el servidor) y redesplegar para que
-  `vercel.json` registre el cron: los cambios de variables y de configuración
-  no aplican a despliegues existentes. Con el plan Hobby el cierre corre una
-  vez al día; pasar a horario solo exige editar el `schedule`.
+  `SUPABASE_SERVICE_ROLE_KEY`, `INGEST_TOKEN`, `GEMINI_API_KEY` y
+  `CRON_SECRET`; comprobado en producción (`/api/lab` responde `insufficient`,
+  la ingesta 200/401/409 y el cron 401/200). Con el plan Hobby el cierre corre
+  una vez al día; pasar a horario solo exige editar el `schedule`.
+- La vista de backtest está implementada y verificada en local pero aún no
+  desplegada: requiere un nuevo push y redespliegue del proyecto web.
 - Sin commits, pushes ni despliegues.

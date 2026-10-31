@@ -42,6 +42,21 @@ export interface LabSummary {
   matchesWithResult: number;
   required: number;
   markets: LabMarketRow[];
+  /** Exactitud por variante sobre los mismos partidos; null sin muestra. */
+  backtest: LabBacktest | null;
+}
+
+export interface LabAccuracy {
+  /** Brier multiclase (suma de cuadrados por resultado); menor es mejor. */
+  brier: number;
+  /** Log-loss de la probabilidad del resultado real; menor es mejor. */
+  logLoss: number;
+}
+
+export interface LabBacktest {
+  matches: number;
+  production: LabAccuracy;
+  shadow: LabAccuracy;
 }
 
 /** Partidos con resultado que la compuerta exige antes de revisar la sombra. */
@@ -214,6 +229,7 @@ function emptySummary(state: LabState): LabSummary {
     matchesWithResult: 0,
     required: LAB_REQUIRED_MATCHES,
     markets: [],
+    backtest: null,
   };
 }
 
@@ -255,6 +271,41 @@ function embeddedSnapshot(value: unknown): { matchId: string; createdAt: number 
 
 function mean(values: number[]): number {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+type ActualResult = 'home' | 'draw' | 'away';
+
+const PROBABILITY_FLOOR = 1e-15;
+
+/**
+ * Brier multiclase y log-loss del resultado real, promediados sobre los
+ * partidos con ambas variantes. Ambas métricas son "menor es mejor".
+ */
+function accuracyOf(
+  pairs: SnapshotPair[],
+  pick: (pair: SnapshotPair) => LabPrediction,
+  actualByMatch: Map<string, ActualResult>,
+): LabAccuracy | null {
+  const briers: number[] = [];
+  const losses: number[] = [];
+  for (const pair of pairs) {
+    const actual = actualByMatch.get(pair.matchId);
+    if (!actual) continue;
+    const prediction = pick(pair);
+    const probabilities = [prediction.home, prediction.draw, prediction.away];
+    const actualIndex = actual === 'home' ? 0 : actual === 'draw' ? 1 : 2;
+    let brier = 0;
+    for (let index = 0; index < probabilities.length; index += 1) {
+      brier += (probabilities[index] - (index === actualIndex ? 1 : 0)) ** 2;
+    }
+    briers.push(brier);
+    losses.push(-Math.log(Math.max(probabilities[actualIndex], PROBABILITY_FLOOR)));
+  }
+  if (briers.length === 0) return null;
+  return {
+    brier: Math.round(mean(briers) * 10_000) / 10_000,
+    logLoss: Math.round(mean(losses) * 10_000) / 10_000,
+  };
 }
 
 /** IC 95 % de la diferencia media de probabilidad (fracción 0–1). */
@@ -330,10 +381,17 @@ export async function getLabSummary(): Promise<LabSummary> {
     ]);
     if (predictions.errorCode || results.errorCode) return emptySummary('error');
 
-    const finished = new Set<string>();
+    const actualByMatch = new Map<string, ActualResult>();
     for (const row of Array.isArray(results.data) ? results.data : []) {
-      const matchId = (row as { match_id?: unknown } | null)?.match_id;
-      if (typeof matchId === 'string' && matchId) finished.add(matchId);
+      const record = row as { match_id?: unknown; home_score?: unknown; away_score?: unknown } | null;
+      const matchId = record?.match_id;
+      const homeScore = record?.home_score;
+      const awayScore = record?.away_score;
+      if (typeof matchId !== 'string' || !matchId) continue;
+      if (!Number.isInteger(homeScore) || !Number.isInteger(awayScore)) continue;
+      const home = homeScore as number;
+      const away = awayScore as number;
+      actualByMatch.set(matchId, home > away ? 'home' : home < away ? 'away' : 'draw');
     }
 
     const bySnapshot = new Map<string, SnapshotPair>();
@@ -373,7 +431,7 @@ export async function getLabSummary(): Promise<LabSummary> {
       const previous = latest.get(pair.matchId);
       if (!previous || pair.createdAt > previous.createdAt) latest.set(pair.matchId, pair);
     }
-    const comparable = [...latest.values()].filter((pair) => finished.has(pair.matchId));
+    const comparable = [...latest.values()].filter((pair) => actualByMatch.has(pair.matchId));
 
     const rows = [
       marketRow('1x2_home', 'Local', comparable, (pair) => [
@@ -419,11 +477,22 @@ export async function getLabSummary(): Promise<LabSummary> {
           : 'partial'
         : 'insufficient';
 
+    const productionAccuracy = accuracyOf(
+      comparable,
+      (pair) => pair.production!,
+      actualByMatch,
+    );
+    const shadowAccuracy = accuracyOf(comparable, (pair) => pair.shadow!, actualByMatch);
+
     return {
       state,
       matchesWithResult,
       required: LAB_REQUIRED_MATCHES,
       markets: rows,
+      backtest:
+        productionAccuracy && shadowAccuracy && matchesWithResult > 0
+          ? { matches: matchesWithResult, production: productionAccuracy, shadow: shadowAccuracy }
+          : null,
     };
   } catch {
     return emptySummary('error');

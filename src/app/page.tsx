@@ -19,7 +19,7 @@ function BootFallback() {
 
 /** La sombra nunca debe tumbar el dashboard: si falla, se declara error de sección. */
 function fallbackSummary(): LabSummary {
-  return { state: 'error', matchesWithResult: 0, required: 100, markets: [] };
+  return { state: 'error', matchesWithResult: 0, required: 100, markets: [], backtest: null };
 }
 
 export default async function HomePage() {

@@ -10,6 +10,11 @@ const decimal = new Intl.NumberFormat('es-ES', {
   maximumFractionDigits: 1,
 });
 
+const metric = new Intl.NumberFormat('es-ES', {
+  minimumFractionDigits: 3,
+  maximumFractionDigits: 3,
+});
+
 /** deltaPp llega en puntos porcentuales: 1.4 → "Sombra +1,4 pp". */
 function signedPp(value: number | null): string | null {
   if (value === null || Number.isNaN(value)) return null;
@@ -144,7 +149,7 @@ interface Props {
 }
 
 export default function ShadowSection({ summary }: Props) {
-  const { state, matchesWithResult, required, markets } = summary;
+  const { state, matchesWithResult, required, markets, backtest } = summary;
   const gateReached = required > 0 && matchesWithResult >= required;
   const covered = markets.filter((market) => market.shadow !== null).length;
   const totalMarkets = markets.length;
@@ -264,6 +269,31 @@ export default function ShadowSection({ summary }: Props) {
             ) : null}
           </div>
         )}
+
+        {backtest ? (
+          <div className="shadow-backtest">
+            <p className="shadow-backtest-title">
+              Backtest · {backtest.matches} {backtest.matches === 1 ? 'partido' : 'partidos'} ·
+              menor es mejor
+            </p>
+            <ul className="shadow-backtest-rows" aria-label="Exactitud por variante">
+              <li className="shadow-backtest-row">
+                <span className="shadow-backtest-metric">Brier</span>
+                <span>Producción {metric.format(backtest.production.brier)}</span>
+                <span>Sombra {metric.format(backtest.shadow.brier)}</span>
+              </li>
+              <li className="shadow-backtest-row">
+                <span className="shadow-backtest-metric">Log-loss</span>
+                <span>Producción {metric.format(backtest.production.logLoss)}</span>
+                <span>Sombra {metric.format(backtest.shadow.logLoss)}</span>
+              </li>
+            </ul>
+            <p className="shadow-backtest-note">
+              Sobre el último análisis pre de cada partido cerrado; una métrica menor indica mejor
+              calibración.
+            </p>
+          </div>
+        ) : null}
 
         {showRows ? (
           <div className="shadow-table">

@@ -220,6 +220,7 @@ test('sin configuración la persistencia queda desactivada y no usa la red', asy
       matchesWithResult: 0,
       required: 100,
       markets: [],
+      backtest: null,
     });
 
     const result = await persistPreAnalysis({ response: scheduledFixture(), analysis: UNUSED_ANALYSIS });
@@ -356,6 +357,14 @@ test('getLabSummary compara producción y sombra con el último snapshot', async
     assert.ok(Math.abs(totals.production! - 0.575) < 1e-9);
     assert.ok(Math.abs(totals.shadow! - 0.56) < 1e-9);
     assert.equal(totals.n, 2);
+
+    assert.ok(summary.backtest);
+    assert.equal(summary.backtest.matches, 2);
+    // test:1 → home (2-1); test:2 → draw (1-1).
+    assert.equal(summary.backtest.production.brier, 0.5125);
+    assert.equal(summary.backtest.shadow.brier, 0.44);
+    assert.ok(Math.abs(summary.backtest.production.logLoss - 0.8715) < 1e-4);
+    assert.ok(Math.abs(summary.backtest.shadow.logLoss - 0.7803) < 1e-4);
   } finally {
     stub.restore();
     clearEnv();
@@ -380,6 +389,7 @@ test('sin pares producción/sombra la compuerta queda en cero', async () => {
       matchesWithResult: 0,
       required: 100,
       markets: [],
+      backtest: null,
     });
   } finally {
     stub.restore();
@@ -398,6 +408,7 @@ test('un HTTP de error en la lectura del laboratorio se publica como error', asy
       matchesWithResult: 0,
       required: 100,
       markets: [],
+      backtest: null,
     });
   } finally {
     stub.restore();

@@ -13,7 +13,13 @@ export async function GET(): Promise<Response> {
   try {
     summary = await getLabSummary();
   } catch {
-    summary = { state: 'error', matchesWithResult: 0, required: LAB_REQUIRED_MATCHES, markets: [] };
+    summary = {
+      state: 'error',
+      matchesWithResult: 0,
+      required: LAB_REQUIRED_MATCHES,
+      markets: [],
+      backtest: null,
+    };
   }
 
   return Response.json(summary, {
