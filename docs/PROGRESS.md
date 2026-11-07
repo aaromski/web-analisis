@@ -908,6 +908,14 @@ resultados). Todo funciona sin cambiar el esquema de tablas.
   Liverpool–Arsenal devuelve λ pre-ancla 0,95/1,30 y las probabilidades de
   mercado, mientras las filas anteriores devuelven `null`. La consulta exacta
   de `listScoredPredictions` con las columnas de traza responde 200.
+- **Corrección de la recaptura (2026-11-07).** Al ejecutar el cron manual para
+  cerrar 17 partidos jugados, la respuesta mostró `recapture.status = 'error'`.
+  La consulta de `listRecaptureCandidates` filtraba por `match_snapshots!inner`
+  sin incluir el recurso en el `select`, y PostgREST la rechaza con `PGRST108`.
+  Se añadió `match_snapshots!inner(id)` al `select`; la URL corregida responde
+  200 en vivo y se sumaron dos pruebas (forma de la consulta y modo
+  deshabilitado). `npm run typecheck` limpio y `npm test` **136/136**. El
+  arreglo no está desplegado.
 
 ### 21.3 Límites y pendientes
 

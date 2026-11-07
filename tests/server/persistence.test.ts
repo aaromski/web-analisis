@@ -773,6 +773,58 @@ test('un error al leer los pendientes se publica como estado', async () => {
   }
 });
 
+test('las recapturas piden el recurso embebido que filtran', async () => {
+  setEnv(ENABLED_ENV);
+  const stub = stubFetch((call) => {
+    if (call.url.includes('/rest/v1/matches')) {
+      return Response.json([
+        { match_id: 'test:5', kickoff_at: '2026-11-07T20:00:00Z' },
+        { match_id: null, kickoff_at: '2026-11-07T20:00:00Z' },
+      ]);
+    }
+    return new Response(null, { status: 201 });
+  });
+
+  try {
+    const { listRecaptureCandidates } = await db();
+    const result = await listRecaptureCandidates({
+      nowMs: Date.parse('2026-11-07T18:00:00Z'),
+      limit: 2,
+    });
+    assert.deepEqual(result, {
+      status: 'ok',
+      matches: [{ matchId: 'test:5', kickoffAt: '2026-11-07T20:00:00.000Z' }],
+    });
+
+    assert.equal(stub.calls.length, 1);
+    const url = stub.calls[0].url;
+    // PostgREST rechaza (PGRST108) filtrar por un recurso embebido si el
+    // `select` no lo incluye.
+    assert.ok(url.includes('select=match_id,kickoff_at,match_snapshots!inner(id)'));
+    assert.ok(url.includes('match_snapshots!inner(id)'));
+    assert.ok(url.includes('match_snapshots.phase=eq.pre'));
+    assert.ok(url.includes('status=eq.scheduled'));
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('sin configuración no hay recapturas y no se usa la red', async () => {
+  clearEnv();
+  const stub = stubFetch(() => {
+    throw new Error('no debe usarse la red');
+  });
+
+  try {
+    const { listRecaptureCandidates } = await db();
+    assert.deepEqual(await listRecaptureCandidates(), { status: 'disabled', matches: [] });
+    assert.equal(stub.calls.length, 0);
+  } finally {
+    stub.restore();
+  }
+});
+
 test('el diario del ciclo lee solo backtest/learning y mapea el motivo', async () => {
   setEnv(ENABLED_ENV);
   const stub = stubFetch(() =>

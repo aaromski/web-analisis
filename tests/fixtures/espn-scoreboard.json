@@ -1,0 +1,103 @@
+{
+  "leagues": [{ "slug": "eng.1", "name": "English Premier League" }],
+  "events": [
+    {
+      "id": "401878758",
+      "date": "2026-11-07T12:30Z",
+      "competitions": [
+        {
+          "date": "2026-11-07T12:30Z",
+          "status": { "type": { "name": "STATUS_FULL_TIME", "state": "post", "shortDetail": "FT" } },
+          "venue": { "fullName": "Elland Road" },
+          "competitors": [
+            {
+              "homeAway": "home",
+              "score": "2",
+              "team": { "displayName": "Leeds United" }
+            },
+            {
+              "homeAway": "away",
+              "score": "1",
+              "team": { "displayName": "Tottenham Hotspur" }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "401878760",
+      "date": "2026-11-07T15:00Z",
+      "competitions": [
+        {
+          "date": "2026-11-07T15:00Z",
+          "status": { "type": { "name": "STATUS_SCHEDULED", "state": "pre", "shortDetail": "Scheduled" } },
+          "competitors": [
+            {
+              "homeAway": "home",
+              "score": "0",
+              "team": { "displayName": "Arsenal" }
+            },
+            {
+              "homeAway": "away",
+              "score": "0",
+              "team": { "displayName": "Hull City" }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "401878899",
+      "date": "2026-11-08T00:30Z",
+      "competitions": [
+        {
+          "date": "2026-11-08T00:30Z",
+          "status": { "type": { "name": "STATUS_SCHEDULED", "state": "pre" } },
+          "competitors": [
+            { "homeAway": "home", "team": { "displayName": "Late Home" } },
+            { "homeAway": "away", "team": { "displayName": "Late Away" } }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "401878700",
+      "date": "2026-11-06T23:30Z",
+      "competitions": [
+        {
+          "date": "2026-11-06T23:30Z",
+          "status": { "type": { "name": "STATUS_SCHEDULED", "state": "pre" } },
+          "competitors": [
+            { "homeAway": "home", "team": { "displayName": "Early Home" } },
+            { "homeAway": "away", "team": { "displayName": "Early Away" } }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "401878799",
+      "date": "2026-11-07T18:00Z",
+      "competitions": [
+        {
+          "date": "2026-11-07T18:00Z",
+          "status": { "type": { "name": "STATUS_POSTPONED", "state": "post", "shortDetail": "PPD" } },
+          "competitors": [
+            { "homeAway": "home", "team": { "displayName": "Rained Off" } },
+            { "homeAway": "away", "team": { "displayName": "Waiting" } }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "401878701",
+      "date": "2026-11-07T20:00Z",
+      "competitions": [
+        {
+          "date": "2026-11-07T20:00Z",
+          "status": { "type": { "name": "STATUS_SCHEDULED", "state": "pre" } },
+          "competitors": [{ "homeAway": "home", "team": { "displayName": "Solo Home" } }]
+        }
+      ]
+    }
+  ]
+}

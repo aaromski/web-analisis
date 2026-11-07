@@ -278,7 +278,13 @@ export default function ParleyApp({ shadow }: ParleyAppProps) {
     }
   }, [request, searchKey]);
 
-  const mode: SearchMode = searchParams.get('modo') === 'id' || searchParams.get('id') ? 'id' : 'teams';
+  const modoParam = searchParams.get('modo');
+  const mode: SearchMode =
+    searchParams.get('id') || modoParam === 'id'
+      ? 'id'
+      : modoParam === 'teams' || searchParams.get('home') || searchParams.get('away')
+        ? 'teams'
+        : 'league';
   const initialForm = {
     mode,
     home: searchParams.get('home') ?? '',

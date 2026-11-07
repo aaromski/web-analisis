@@ -2,8 +2,11 @@
 
 import { useState, type FormEvent, type KeyboardEvent } from 'react';
 import { displayDate, parseDisplayDate } from '@/lib/ui/format';
+import LeagueMatchPicker from './LeagueMatchPicker';
 
-export type SearchMode = 'teams' | 'id';
+export type SearchMode = 'league' | 'teams' | 'id';
+
+const MODES: SearchMode[] = ['league', 'teams', 'id'];
 
 export interface SearchPayload {
   matchId?: string;
@@ -60,7 +63,9 @@ export default function SearchForm({ initial, busy, onSubmit }: Props) {
   function handleModeKey(event: KeyboardEvent<HTMLDivElement>) {
     if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
     event.preventDefault();
-    const next: SearchMode = mode === 'teams' ? 'id' : 'teams';
+    const index = MODES.indexOf(mode);
+    const delta = event.key === 'ArrowRight' ? 1 : -1;
+    const next = MODES[(index + delta + MODES.length) % MODES.length];
     switchMode(next);
     document.getElementById(`modo-${next}`)?.focus();
   }
@@ -68,6 +73,9 @@ export default function SearchForm({ initial, busy, onSubmit }: Props) {
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFormError(null);
+
+    // En modo liga el análisis se dispara al tocar un partido, no con el submit.
+    if (mode === 'league') return;
 
     const nextErrors: FieldErrors = {};
 
@@ -134,6 +142,16 @@ export default function SearchForm({ initial, busy, onSubmit }: Props) {
       >
         <button
           type="button"
+          id="modo-league"
+          role="radio"
+          aria-checked={mode === 'league'}
+          tabIndex={mode === 'league' ? 0 : -1}
+          onClick={() => switchMode('league')}
+        >
+          Por liga
+        </button>
+        <button
+          type="button"
           id="modo-teams"
           role="radio"
           aria-checked={mode === 'teams'}
@@ -154,7 +172,13 @@ export default function SearchForm({ initial, busy, onSubmit }: Props) {
         </button>
       </div>
 
-      {mode === 'teams' ? (
+      {mode === 'league' ? (
+        <LeagueMatchPicker
+          initialLeague={initial.league || undefined}
+          disabled={busy}
+          onSelect={(matchId) => onSubmit({ matchId })}
+        />
+      ) : mode === 'teams' ? (
         <div className="field-grid">
           <div className="field">
             <label htmlFor="buscar-home">Equipo local</label>
@@ -286,11 +310,17 @@ export default function SearchForm({ initial, busy, onSubmit }: Props) {
       ) : null}
 
       <div className="submit-row">
-        <button type="submit" className="btn btn-primary" disabled={busy}>
-          {busy ? 'Analizando…' : 'Analizar partido'}
-          <span aria-hidden="true">→</span>
-        </button>
-        <span className="method">Datos → matriz → línea calibrada</span>
+        {mode === 'league' ? (
+          <span className="method">Toca un partido programado para analizarlo · Pre-partido</span>
+        ) : (
+          <>
+            <button type="submit" className="btn btn-primary" disabled={busy}>
+              {busy ? 'Analizando…' : 'Analizar partido'}
+              <span aria-hidden="true">→</span>
+            </button>
+            <span className="method">Datos → matriz → línea calibrada</span>
+          </>
+        )}
       </div>
     </form>
   );

@@ -2209,7 +2209,7 @@ export async function listRecaptureCandidates(
     method: 'GET',
     path: '/rest/v1/matches',
     query: [
-      'select=match_id,kickoff_at',
+      'select=match_id,kickoff_at,match_snapshots!inner(id)',
       'status=eq.scheduled',
       `kickoff_at=gte.${encodeURIComponent(new Date(now).toISOString())}`,
       `kickoff_at=lte.${encodeURIComponent(new Date(end).toISOString())}`,
