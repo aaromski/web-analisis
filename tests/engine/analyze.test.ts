@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { AnalysisError, analyzeMatch } from '../../src/lib/engine/analyze.ts';
+import { DEFAULT_ENGINE_PARAMS } from '../../src/lib/engine/params.ts';
 import { buildScoreMatrix } from '../../src/lib/engine/poisson.ts';
 import type { AggregatedResponse } from '../../src/lib/types/api.ts';
 
@@ -27,6 +28,46 @@ function assertFiniteMarkets(response: ReturnType<typeof analyzeMatch>): void {
   }
   assert.ok(!JSON.stringify(response).includes('NaN'));
 }
+
+test('la escala de totales cambia la matriz de totales sin tocar el 1X2', () => {
+  const response = loadFixture('derby.json');
+  const base = analyzeMatch(response);
+  const params = {
+    ...DEFAULT_ENGINE_PARAMS,
+    anchor: { ...DEFAULT_ENGINE_PARAMS.anchor, totalsScale: 0.6 },
+  };
+  const scaled = analyzeMatch(response, { params });
+
+  // Producción (totalsScale = 1) mantiene las mismas λ y pesos.
+  assert.deepEqual(base.model.totalsLambdas, base.lambdas);
+  assert.equal(base.model.marketAnchor.totalsWeight, base.model.marketAnchor.weight);
+
+  // La candidata solo mueve el total: el 1X2 queda idéntico.
+  assert.deepEqual(scaled.winProbabilities, base.winProbabilities);
+  assert.deepEqual(scaled.lambdas, base.lambdas);
+  assert.ok(scaled.model.marketAnchor.totalsWeight < base.model.marketAnchor.weight);
+  assert.notEqual(scaled.model.totalsLambdas.total, base.model.totalsLambdas.total);
+
+  const rawTotal = base.model.trace.preAnchorLambdas.total;
+  const baseGap = Math.abs(base.model.totalsLambdas.total - rawTotal);
+  const scaledGap = Math.abs(scaled.model.totalsLambdas.total - rawTotal);
+  assert.ok(scaledGap < baseGap);
+});
+
+test('omitir el Monte Carlo no cambia probabilidades ni mercados', () => {
+  const response = loadFixture('derby.json');
+  const full = analyzeMatch(response);
+  const fast = analyzeMatch(response, { skipUncertainty: true });
+
+  assert.equal(fast.model.uncertainty, null);
+  assert.deepEqual(fast.winProbabilities, full.winProbabilities);
+  assert.deepEqual(fast.lambdas, full.lambdas);
+  assert.deepEqual(
+    fast.markets.map((market) => [market.key, market.probability, market.line]),
+    full.markets.map((market) => [market.key, market.probability, market.line]),
+  );
+  assert.ok(fast.markets.every((market) => market.interval === undefined));
+});
 
 test('el motor analiza el derbi real y publica los 10 mercados', () => {
   const analysis = analyzeMatch(loadFixture('derby.json'));

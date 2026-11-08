@@ -46,6 +46,11 @@ export interface AnchorInput {
 export interface AnchorResult extends MarketAnchor {
   lambdaHome: number;
   lambdaAway: number;
+  /** λ para el mercado de totales; difiere del 1X2 solo si `totalsScale` ≠ 1. */
+  totalsLambdaHome: number;
+  totalsLambdaAway: number;
+  /** Peso del ancla usado en la matriz de totales. */
+  totalsWeight: number;
 }
 
 function homeProbability(lambdaHome: number, lambdaAway: number): number {
@@ -201,6 +206,9 @@ export function anchorLambdas(
   const empty: AnchorResult = {
     lambdaHome: input.lambdaHome,
     lambdaAway: input.lambdaAway,
+    totalsLambdaHome: input.lambdaHome,
+    totalsLambdaAway: input.lambdaAway,
+    totalsWeight: 0,
     applied: false,
     weight: 0,
     source: 'none',
@@ -301,9 +309,27 @@ export function anchorLambdas(
     params,
   );
 
+  // La escala de totales reutiliza el mismo objetivo de mercado con otro peso.
+  // Con 1 el par de λ es exactamente el mismo y la producción no cambia.
+  const totalsWeight =
+    knobs.totalsScale === 1
+      ? weight
+      : clamp(weight * clamp(knobs.totalsScale, 0, 10), knobs.finalWeightMin, knobs.finalWeightMax);
+  const totalsBlended =
+    totalsWeight === weight
+      ? blended
+      : scaleToTotal(
+          (1 - totalsWeight) * input.lambdaHome + totalsWeight * marketHome,
+          (1 - totalsWeight) * input.lambdaAway + totalsWeight * marketAway,
+          params,
+        );
+
   return {
     lambdaHome: blended.home,
     lambdaAway: blended.away,
+    totalsLambdaHome: totalsBlended.home,
+    totalsLambdaAway: totalsBlended.away,
+    totalsWeight: round(totalsWeight, 3),
     applied: true,
     weight: round(weight, 3),
     source,

@@ -915,7 +915,8 @@ resultados). Todo funciona sin cambiar el esquema de tablas.
   Se añadió `match_snapshots!inner(id)` al `select`; la URL corregida responde
   200 en vivo y se sumaron dos pruebas (forma de la consulta y modo
   deshabilitado). `npm run typecheck` limpio y `npm test` **136/136**. El
-  arreglo no está desplegado.
+  arreglo quedó desplegado en el commit `fb0960e`; en la ejecución manual del
+  cron del 2026-11-07 la recaptura ya devuelve `status = 'ok'`.
 
 ### 21.3 Límites y pendientes
 
@@ -937,4 +938,63 @@ resultados). Todo funciona sin cambiar el esquema de tablas.
   definición anterior; `supabase/rollback/learning_loop_down.sql` elimina el
   esquema completo, no esta vista por separado.
 - Sin commit, push ni despliegue: producción mantiene la lógica anterior hasta
+  autorización explícita.
+
+## 22. Escala de ancla específica para totales (2026-11-08)
+
+Hipótesis surgida del análisis de los partidos cerrados: la desviación del λ
+total crudo frente al mercado correlaciona con el residual del total real
+(r ≈ 0,21; residual −0,82 cuando el crudo queda > 0,5 por debajo del mercado y
++0,68 cuando queda > 0,8 por encima). El ancla global aplica el mismo peso al
+1X2 y a los totales, y `gapBoost` sube ese peso justo cuando el modelo se aleja
+del mercado, que es el caso donde el dato sugiere lo contrario para totales.
+
+### 22.1 Cambios
+
+- **Knob `anchor.totalsScale`.** Multiplica solo el peso del ancla usado en la
+  matriz de totales; por defecto vale `1` y reproduce exactamente el
+  comportamiento de producción (misma matriz, mismos λ, mismas probabilidades).
+  El resultado se acota con `finalWeightMin`/`finalWeightMax` (0,25–0,85).
+- **Matriz de totales separada.** `anchorLambdas` devuelve además
+  `totalsLambdaHome/Away` y `totalsWeight`; `analyzeMatch` construye una segunda
+  matriz solo si esos λ difieren de los del 1X2. El mercado de totales y
+  `trace.modelTotalsAtMarketLine` usan esa matriz; `winProbabilities`, `lambdas`,
+  hándicap y el resto de mercados siguen sobre la matriz del 1X2.
+- **Trazabilidad.** `model.totalsLambdas` y `model.marketAnchor.totalsWeight`
+  registran qué λ y qué peso se usaron en totales. Con la escala neutra son
+  iguales a `model.lambdas` y `marketAnchor.weight`.
+- **Grilla de aprendizaje.** A las cinco escalas globales se suman cuatro de
+  totales (`0,6 / 0,8 / 1,0 / 1,2`). Las candidatas se versionan como
+  `auto-anchor-t###-fecha` y las globales como `auto-anchor-s###-fecha`; ambas
+  pasan por los mismos folds, guardarraíles, sombra y promoción. `<kind>` y
+  `scale` quedan en las métricas de la candidata.
+- **Menos cómputo en walk-forward.** `analyzeMatch` acepta
+  `skipUncertainty`, que omite el Monte Carlo (no interviene en el scoring). La
+  audición pasó de ~13,2 s a ~1,8 s con 100 partidos y nueve candidatas, dentro
+  del presupuesto de 12 s mínimo que exige el cron.
+
+### 22.2 Verificación
+
+- `npm run typecheck` limpio; `npm test` **147/147**.
+- Pruebas nuevas: identidad de la escala neutra, escala 0,5 que mueve solo los
+  λ de totales, clamps 0,25/0,85 en los extremos, invariancia del 1X2 ante
+  `totalsScale ≠ 1`, equivalencia de probabilidades y mercados con
+  `skipUncertainty`, y separación de la grilla (`kind`, versiones `s`/`t`,
+  `withCandidateScale` que solo toca su knob).
+- Sin migración: el knob vive en el JSON de `engine_params`; no cambian tablas,
+  vistas ni RPCs.
+
+### 22.3 Límites y pendientes
+
+- El walk-forward puntúa totales en la línea de mercado, mientras la promoción
+  por sombra puntúa el pick publicado en la línea recomendada. Una candidata
+  que mejore la calibración en la línea de mercado puede no ganar la métrica de
+  sombra; conviene unificarlas antes de ampliar la grilla.
+- Nueve candidatas aumentan el riesgo de comparaciones múltiples. Los folds
+  2-de-3 con margen y el Bonferroni de la promoción lo contienen, pero la
+  grilla no debería crecer sin revisar el margen.
+- Con la muestra actual (~100 partidos) es improbable que una escala de
+  totales supere la referencia y pase la compuerta; el valor está en tener la
+  hipótesis medida desde ya con riesgo nulo para producción.
+- Sin commit, push ni despliegue: producción mantiene `totalsScale = 1` hasta
   autorización explícita.

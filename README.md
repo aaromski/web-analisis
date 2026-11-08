@@ -49,7 +49,7 @@ npm run dev        # Next.js en 3100
 npm run build      # build de producción
 npm start          # servidor de producción en 3100
 npm run typecheck  # TypeScript estricto
-npm test           # 136 pruebas del motor, el arnés, la persistencia, el aprendizaje y el servidor con node:test
+npm test           # 147 pruebas del motor, el arnés, la persistencia, el aprendizaje y el servidor con node:test
 npm run snapshot -- --home "AC Milan" --away "Internazionale" --date 2026-10-31 --league ita.1
 npm run audit      # métricas de los snapshots (y de data/results.json si existe)
 npm run tune       # barrido del peso del ancla por Brier medio

@@ -10,6 +10,7 @@ import {
 import { buildLambdas } from '../../src/lib/engine/lambdas.ts';
 import { resultOutcomes } from '../../src/lib/engine/markets.ts';
 import { extractTotalsMarket, extractWinMarket, modelAgreement } from '../../src/lib/engine/odds.ts';
+import { DEFAULT_ENGINE_PARAMS } from '../../src/lib/engine/params.ts';
 import { buildScoreMatrix } from '../../src/lib/engine/poisson.ts';
 import { assessQuality } from '../../src/lib/engine/quality.ts';
 import { winMeanAbsoluteError } from '../../src/lib/audit/metrics.ts';
@@ -85,6 +86,74 @@ test('el ancla acerca λ y el 1X2 al mercado en el derbi', () => {
   const motorError = winMeanAbsoluteError(motorWin, winMarket as { home: number; draw: number; away: number });
   const anchoredError = winMeanAbsoluteError(anchoredWin, winMarket as { home: number; draw: number; away: number });
   assert.ok(anchoredError < motorError, `anclado ${anchoredError} vs motor ${motorError}`);
+});
+
+test('la escala de totales mueve solo la matriz de totales', () => {
+  const response = loadFixture('derby.json');
+  const lambdas = buildLambdas(response);
+  const quality = assessQuality(response);
+  const winMarket = extractWinMarket(response.pre_match);
+  const totals = extractTotalsMarket(response.pre_match);
+  const motorWin = resultOutcomes(buildScoreMatrix(lambdas.lambdaHome, lambdas.lambdaAway));
+  const agreement = modelAgreement(motorWin, winMarket);
+  const input = {
+    lambdaHome: lambdas.lambdaHome,
+    lambdaAway: lambdas.lambdaAway,
+    winMarket,
+    totalsMarket: totals,
+    quality: quality.score,
+    agreement,
+  };
+
+  const base = anchorLambdas(input);
+  assert.equal(base.totalsLambdaHome, base.lambdaHome);
+  assert.equal(base.totalsLambdaAway, base.lambdaAway);
+  assert.equal(base.totalsWeight, base.weight);
+
+  const params = {
+    ...DEFAULT_ENGINE_PARAMS,
+    anchor: { ...DEFAULT_ENGINE_PARAMS.anchor, totalsScale: 0.5 },
+  };
+  const scaled = anchorLambdas(input, params);
+  // El 1X2 no se toca: solo cambia el peso de la matriz de totales.
+  assert.equal(scaled.lambdaHome, base.lambdaHome);
+  assert.equal(scaled.lambdaAway, base.lambdaAway);
+  assert.ok(scaled.totalsWeight < base.weight);
+
+  const rawTotal = lambdas.lambdaHome + lambdas.lambdaAway;
+  const baseTotal = base.totalsLambdaHome + base.totalsLambdaAway;
+  const scaledTotal = scaled.totalsLambdaHome + scaled.totalsLambdaAway;
+  assert.ok(Math.abs(scaledTotal - rawTotal) < Math.abs(baseTotal - rawTotal));
+});
+
+test('la escala de totales respeta los clamps finales del peso', () => {
+  const response = loadFixture('derby.json');
+  const lambdas = buildLambdas(response);
+  const quality = assessQuality(response);
+  const winMarket = extractWinMarket(response.pre_match);
+  const totals = extractTotalsMarket(response.pre_match);
+  const motorWin = resultOutcomes(buildScoreMatrix(lambdas.lambdaHome, lambdas.lambdaAway));
+  const input = {
+    lambdaHome: lambdas.lambdaHome,
+    lambdaAway: lambdas.lambdaAway,
+    winMarket,
+    totalsMarket: totals,
+    quality: quality.score,
+    agreement: modelAgreement(motorWin, winMarket),
+  };
+  const params = (scale: number) => ({
+    ...DEFAULT_ENGINE_PARAMS,
+    anchor: { ...DEFAULT_ENGINE_PARAMS.anchor, totalsScale: scale },
+  });
+
+  assert.equal(
+    anchorLambdas(input, params(0)).totalsWeight,
+    DEFAULT_ENGINE_PARAMS.anchor.finalWeightMin,
+  );
+  assert.equal(
+    anchorLambdas(input, params(10)).totalsWeight,
+    DEFAULT_ENGINE_PARAMS.anchor.finalWeightMax,
+  );
 });
 
 test('sin cuotas el ancla no se aplica', () => {

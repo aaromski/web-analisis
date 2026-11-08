@@ -96,6 +96,7 @@ test('DEFAULT_ENGINE_PARAMS fija los valores del motor 1.2.0', () => {
       gapWeight: 0.18,
       scaleMin: 0.6,
       scaleMax: 1.15,
+      totalsScale: 1,
       finalWeightMin: 0.25,
       finalWeightMax: 0.85,
       supremacyTotalMin: 0.4,

@@ -225,6 +225,8 @@ export interface MarketAnchorMeta {
   applied: boolean;
   /** Peso del mercado en λ (0–1). */
   weight: number;
+  /** Peso aplicado solo a la matriz de totales (0–1). */
+  totalsWeight: number;
   source: 'moneyline+totals' | 'moneyline+prediction' | 'moneyline' | 'totals' | 'prediction' | 'none';
   marketTotal: number | null;
   marketHome: number | null;
@@ -322,6 +324,8 @@ export interface ModelMeta {
   leagueBaseline: number;
   marketAgreement: number;
   marketAnchor: MarketAnchorMeta;
+  /** λ de la matriz de totales; iguales a `lambdas` salvo escala de totales ≠ 1. */
+  totalsLambdas: { home: number; away: number; total: number };
   marketSignal: MarketSignal;
   trace: EngineTrace;
   adjustments: ModelAdjustment[];

@@ -132,6 +132,12 @@ export interface EngineParams {
     /** Escala de `movementWeightScale` sobre el peso. */
     scaleMin: number;
     scaleMax: number;
+    /**
+     * Multiplicador del peso aplicado solo a la matriz de totales. Permite
+     * desacoplar la confianza en el total de la que se aplica al 1X2.
+     * 1 = mismo ancla para ambos mercados (comportamiento de producción).
+     */
+    totalsScale: number;
     /** Clamps finales del peso del ancla. */
     finalWeightMin: number;
     finalWeightMax: number;
@@ -275,6 +281,7 @@ export const DEFAULT_ENGINE_PARAMS: EngineParams = {
     gapWeight: 0.18,
     scaleMin: 0.6,
     scaleMax: 1.15,
+    totalsScale: 1,
     finalWeightMin: 0.25,
     finalWeightMax: 0.85,
     supremacyTotalMin: 0.4,

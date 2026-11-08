@@ -65,6 +65,11 @@ export { MAX_GOALS, RHO } from './params';
 /** Opciones de `analyzeMatch`; `params` permite inyectar una variante sombra. */
 export interface AnalyzeOptions {
   params?: EngineParams;
+  /**
+   * Omite el Monte Carlo de incertidumbre. El ajuste walk-forward solo consume
+   * probabilidades y mercados, así que no necesita simular intervalos.
+   */
+  skipUncertainty?: boolean;
 }
 
 export class AnalysisError extends Error {
@@ -244,6 +249,9 @@ export function analyzeMatch(
     ? {
         lambdaHome: lambdas.lambdaHome,
         lambdaAway: lambdas.lambdaAway,
+        totalsLambdaHome: lambdas.lambdaHome,
+        totalsLambdaAway: lambdas.lambdaAway,
+        totalsWeight: 0,
         applied: false,
         weight: 0,
         source: 'none' as const,
@@ -303,6 +311,18 @@ export function analyzeMatch(
     lambdas.caveats.push('En vivo no se compara el modelo con cuotas previas al partido.');
   }
 
+  // La escala de totales desacopla la matriz de goles del 1X2: solo alimenta
+  // el mercado de totales y su traza, nunca las probabilidades de resultado.
+  const totalsLambdas = {
+    home: anchor.applied ? anchor.totalsLambdaHome : lambdas.lambdaHome,
+    away: anchor.applied ? anchor.totalsLambdaAway : lambdas.lambdaAway,
+  };
+  const totalsLambdaTotal = round(totalsLambdas.home + totalsLambdas.away, 2);
+  const totalsMatrix =
+    totalsLambdas.home === lambdas.lambdaHome && totalsLambdas.away === lambdas.lambdaAway
+      ? matrix
+      : buildScoreMatrix(totalsLambdas.home, totalsLambdas.away, { rho: RHO, maxGoals: MAX_GOALS });
+
   const threshold = confidenceThreshold(
     quality.score,
     lambdas.lambdaTotal,
@@ -312,7 +332,7 @@ export function analyzeMatch(
   );
   const totalsThreshold = confidenceThreshold(
     quality.score,
-    lambdas.lambdaTotal,
+    totalsLambdaTotal,
     totalsMarket.line,
     params.calibration.thresholdTotals,
     params,
@@ -483,8 +503,8 @@ export function analyzeMatch(
 
   // 3. Altas / Bajas con línea calibrada
   const totalsCalibration = calibrateTotals(
-    matrix,
-    lambdas.lambdaTotal,
+    totalsMatrix,
+    totalsLambdaTotal,
     totalsThreshold,
     totalsMarket.line,
     totalsMarket.over,
@@ -856,29 +876,33 @@ export function analyzeMatch(
   }
 
   const baseTotalLine = nearestHalfLine(lambdas.lambdaTotal);
-  const uncertainty = buildUncertainty(
-    {
-      lambdaHome: lambdas.lambdaHome,
-      lambdaAway: lambdas.lambdaAway,
-      quality: quality.score,
-      sigmaBoost: lambdas.sigmaBoost,
-      totalLine: baseTotalLine,
-    },
-    params,
-  );
+  const uncertainty = options.skipUncertainty
+    ? null
+    : buildUncertainty(
+        {
+          lambdaHome: lambdas.lambdaHome,
+          lambdaAway: lambdas.lambdaAway,
+          quality: quality.score,
+          sigmaBoost: lambdas.sigmaBoost,
+          totalLine: baseTotalLine,
+        },
+        params,
+      );
 
   // Solo se publican intervalos donde el Monte Carlo midió el mismo producto.
-  for (const market of markets) {
-    if (market.key === 'result') {
-      const code = market.selectionCode as 'home' | 'draw' | 'away';
-      market.interval = uncertainty.win[code] ?? null;
-    } else if (
-      market.key === 'totals' &&
-      market.line !== null &&
-      uncertainty.totalLine !== null &&
-      Math.abs(market.line - uncertainty.totalLine) < 1e-9
-    ) {
-      market.interval = uncertainty.total;
+  if (uncertainty) {
+    for (const market of markets) {
+      if (market.key === 'result') {
+        const code = market.selectionCode as 'home' | 'draw' | 'away';
+        market.interval = uncertainty.win[code] ?? null;
+      } else if (
+        market.key === 'totals' &&
+        market.line !== null &&
+        uncertainty.totalLine !== null &&
+        Math.abs(market.line - uncertainty.totalLine) < 1e-9
+      ) {
+        market.interval = uncertainty.total;
+      }
     }
   }
 
@@ -916,9 +940,9 @@ export function analyzeMatch(
       !live && totalsMarket.line !== null
         ? {
             line: totalsMarket.line,
-            over: round(totalOver(matrix, totalsMarket.line), 4),
-            under: round(totalUnder(matrix, totalsMarket.line), 4),
-            push: round(totalPush(matrix, totalsMarket.line), 4),
+            over: round(totalOver(totalsMatrix, totalsMarket.line), 4),
+            under: round(totalUnder(totalsMatrix, totalsMarket.line), 4),
+            push: round(totalPush(totalsMatrix, totalsMarket.line), 4),
           }
         : null,
     modelHandicapAtMarketLine:
@@ -984,11 +1008,17 @@ export function analyzeMatch(
       marketAnchor: {
         applied: anchor.applied,
         weight: anchor.weight,
+        totalsWeight: anchor.applied ? round(anchor.totalsWeight, 3) : 0,
         source: anchor.source,
         marketTotal: anchor.marketTotal,
         marketHome: anchor.marketHome,
         marketAway: anchor.marketAway,
         totalSource: anchor.totalSource,
+      },
+      totalsLambdas: {
+        home: round(totalsLambdas.home, 2),
+        away: round(totalsLambdas.away, 2),
+        total: round(totalsLambdas.home + totalsLambdas.away, 2),
       },
       marketSignal: signal ?? EMPTY_MARKET_SIGNAL,
       trace,

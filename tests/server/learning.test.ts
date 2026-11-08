@@ -342,6 +342,40 @@ test('pickBestScale elige el mejor Brier y desempata hacia 1', async () => {
   assert.deepEqual(ANCHOR_SCALES, [0.7, 0.8, 0.9, 1.0, 1.1]);
 });
 
+test('la grilla distingue el ancla global de la escala de totales', async () => {
+  const {
+    anchorScaleCandidates,
+    anchorScaleVersion,
+    withCandidateScale,
+    TOTALS_ANCHOR_SCALES,
+  } = await learning();
+  const { DEFAULT_ENGINE_PARAMS } = await import('../../src/lib/engine/params.ts');
+
+  assert.deepEqual(TOTALS_ANCHOR_SCALES, [0.6, 0.8, 1.0, 1.2]);
+  const grid = anchorScaleCandidates();
+  assert.equal(grid.length, 9);
+  assert.deepEqual(
+    grid.filter((option) => option.kind === 'totals').map((option) => option.scale),
+    [0.6, 0.8, 1.0, 1.2],
+  );
+  assert.equal(
+    anchorScaleVersion({ kind: 'anchor', scale: 1.1 }, '20261108'),
+    'auto-anchor-s110-20261108',
+  );
+  assert.equal(
+    anchorScaleVersion({ kind: 'totals', scale: 0.8 }, '20261108'),
+    'auto-anchor-t080-20261108',
+  );
+
+  // Cada familia mueve solo su perilla.
+  const totals = withCandidateScale(DEFAULT_ENGINE_PARAMS, { kind: 'totals', scale: 0.8 });
+  assert.equal(totals.anchor.totalsScale, 0.8);
+  assert.equal(totals.anchor.scaleMin, DEFAULT_ENGINE_PARAMS.anchor.scaleMin);
+  const anchor = withCandidateScale(DEFAULT_ENGINE_PARAMS, { kind: 'anchor', scale: 0.9 });
+  assert.equal(anchor.anchor.scaleMin, 0.9);
+  assert.equal(anchor.anchor.totalsScale, DEFAULT_ENGINE_PARAMS.anchor.totalsScale);
+});
+
 test('walkForwardWindows produce folds expansivos con validación disjunta', async () => {
   const { walkForwardWindows } = await learning();
   const windows = walkForwardWindows(100);
@@ -1192,7 +1226,7 @@ test('con 100 partidos recorre el ajuste walk-forward sin crear candidata si no 
     const { clearParamsCache } = await db();
     clearParamsCache();
 
-    // Sin cuotas el ancla no aplica: las cinco escalas empatan y el desempate
+    // Sin cuotas el ancla no aplica: las nueve escalas empatan y el desempate
     // elige 1,0, que no supera el margen exigido frente a la línea base.
     assert.deepEqual(await runLearning(NOW), {
       state: 'ok',

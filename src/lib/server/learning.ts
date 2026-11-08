@@ -30,9 +30,10 @@ import {
  * referencia. Todo falla en silencio hacia producción: si algo no cuadra, se
  * devuelve un estado y no se toca la fila promovida.
  *
- * El vector sigue siendo de una dimensión (escala del ancla). Con la muestra de
- * la compuerta (~100 partidos) más perillas memorizarían ruido; lo que crece es
- * la evidencia (folds, candidatas y referencia), no el número de parámetros.
+ * El ajuste mantiene dos dimensiones acotadas: la escala global del ancla y una
+ * escala propia de la matriz de totales. Ambas se comparan contra la misma base
+ * y pasan por la compuerta, los folds y la confirmación en sombra; con ~100
+ * partidos, más perillas memorizarían ruido.
  */
 
 const DAY_MS = 86_400_000;
@@ -93,6 +94,11 @@ export const SEQUENTIAL_ALPHA = 0.05;
 export const SEQUENTIAL_BETA = 0.1;
 export const SEQUENTIAL_MIN_MATCHES = 25;
 export const ANCHOR_SCALES = [0.7, 0.8, 0.9, 1.0, 1.1] as const;
+/**
+ * Escalas propias del ancla de totales. El 1X2 conserva su peso y solo cambia
+ * la matriz que alimenta el mercado de totales; 1 = ancla de producción.
+ */
+export const TOTALS_ANCHOR_SCALES = [0.6, 0.8, 1.0, 1.2] as const;
 export const FOLD_COUNT = 3;
 const VALIDATION_SHARE = 0.2;
 const MIN_VALIDATION = 20;
@@ -480,7 +486,9 @@ function totalsFromAnalysis(analysis: Analysis, entry: TuningEntry): number | nu
   if (line === null) return null;
   const total = entry.homeScore + entry.awayScore;
   if (Math.abs(total - line) < 1e-9) return null;
-  const matrix = buildScoreMatrix(analysis.lambdas.home, analysis.lambdas.away, {
+  // La escala de totales puede separar esta matriz de la del 1X2.
+  const totals = analysis.model.totalsLambdas ?? analysis.lambdas;
+  const matrix = buildScoreMatrix(totals.home, totals.away, {
     rho: analysis.model.rho,
     maxGoals: analysis.model.maxGoals,
   });
@@ -565,7 +573,7 @@ function scoreDetailed(
     if (!response) continue;
     let analysis: Analysis;
     try {
-      analysis = analyzeMatch(response, { params });
+      analysis = analyzeMatch(response, { params, skipUncertainty: true });
     } catch {
       continue;
     }
@@ -773,6 +781,37 @@ export function calibrationEce(
 
 function withAnchorScale(base: EngineParams, scale: number): EngineParams {
   return { ...base, anchor: { ...base.anchor, scaleMin: scale, scaleMax: scale } };
+}
+
+function withTotalsScale(base: EngineParams, scale: number): EngineParams {
+  return { ...base, anchor: { ...base.anchor, totalsScale: scale } };
+}
+
+export type AnchorScaleKind = 'anchor' | 'totals';
+
+export interface AnchorScaleCandidate {
+  kind: AnchorScaleKind;
+  scale: number;
+}
+
+/** Grilla del ajuste: escala global del ancla y escala específica de totales. */
+export function anchorScaleCandidates(): AnchorScaleCandidate[] {
+  return [
+    ...ANCHOR_SCALES.map((scale) => ({ kind: 'anchor' as const, scale })),
+    ...TOTALS_ANCHOR_SCALES.map((scale) => ({ kind: 'totals' as const, scale })),
+  ];
+}
+
+/** `auto-anchor-s###` para el ancla global; `auto-anchor-t###` para totales. */
+export function anchorScaleVersion(candidate: AnchorScaleCandidate, date: string): string {
+  const prefix = candidate.kind === 'totals' ? 't' : 's';
+  return `auto-anchor-${prefix}${formatScale(candidate.scale)}-${date}`;
+}
+
+export function withCandidateScale(base: EngineParams, candidate: AnchorScaleCandidate): EngineParams {
+  return candidate.kind === 'totals'
+    ? withTotalsScale(base, candidate.scale)
+    : withAnchorScale(base, candidate.scale);
 }
 
 function isAutoCandidate(version: string): boolean {
@@ -1078,11 +1117,12 @@ export interface LearningSummary {
   reference?: string | null;
   candidate?: {
     version: string;
+    kind?: AnchorScaleKind;
     scale: number;
     validationComposite: number;
     baselineComposite: number;
   } | null;
-  candidates?: Array<{ version: string; scale: number }>;
+  candidates?: Array<{ version: string; kind?: AnchorScaleKind; scale: number }>;
   promotion?: { version: string; retired: string | null } | null;
   rollback?: { version: string; retired: string | null } | null;
   drift?: { matches: number; mean: number; probability: number };
@@ -1409,6 +1449,7 @@ function failedGuard(
 }
 
 interface ScaleAudit {
+  kind: AnchorScaleKind;
   scale: number;
   votes: number;
   matches: number;
@@ -1484,10 +1525,16 @@ async function tuneCandidate(
     return { state: 'skipped', reason: 'budget', datasetMatches: entries.length };
   }
 
+  const grid = anchorScaleCandidates();
   const folds: Array<{
     window: WalkForwardWindow;
     baseline: DetailedScore;
-    scales: Array<{ scale: number; candidate: DetailedScore; beats: boolean }>;
+    scales: Array<{
+      kind: AnchorScaleKind;
+      scale: number;
+      candidate: DetailedScore;
+      beats: boolean;
+    }>;
   }> = [];
 
   for (const window of windows) {
@@ -1497,14 +1544,19 @@ async function tuneCandidate(
     const validation = entries.slice(window.validationStart, window.validationEnd);
     const baseline = scoreDetailed(validation, promoted.params, weightOf);
     if (!baseline) continue;
-    const scales: Array<{ scale: number; candidate: DetailedScore; beats: boolean }> = [];
-    for (const scale of ANCHOR_SCALES) {
-      const candidate = scoreDetailed(validation, withAnchorScale(promoted.params, scale), weightOf);
+    const scales: Array<{
+      kind: AnchorScaleKind;
+      scale: number;
+      candidate: DetailedScore;
+      beats: boolean;
+    }> = [];
+    for (const option of grid) {
+      const candidate = scoreDetailed(validation, withCandidateScale(promoted.params, option), weightOf);
       if (!candidate) continue;
       const beats =
         candidate.composite <= baseline.composite - PROMOTION_MARGIN &&
         candidate.logLoss <= baseline.logLoss + 0.002;
-      scales.push({ scale, candidate, beats });
+      scales.push({ ...option, candidate, beats });
     }
     folds.push({ window, baseline, scales });
   }
@@ -1529,14 +1581,23 @@ async function tuneCandidate(
 
   const votesNeeded = Math.ceil(folds.length / 2);
   const audits: ScaleAudit[] = [];
-  for (const scale of ANCHOR_SCALES) {
+  for (const option of grid) {
     const aggregate = combineScores(
-      folds.flatMap((fold) => fold.scales.filter((entry) => entry.scale === scale).map((entry) => entry.candidate)),
+      folds.flatMap((fold) =>
+        fold.scales
+          .filter((entry) => entry.kind === option.kind && entry.scale === option.scale)
+          .map((entry) => entry.candidate),
+      ),
     );
     if (!aggregate) continue;
     audits.push({
-      scale,
-      votes: folds.filter((fold) => fold.scales.some((entry) => entry.scale === scale && entry.beats)).length,
+      kind: option.kind,
+      scale: option.scale,
+      votes: folds.filter((fold) =>
+        fold.scales.some(
+          (entry) => entry.kind === option.kind && entry.scale === option.scale && entry.beats,
+        ),
+      ).length,
       matches: aggregate.matches,
       composite: aggregate.composite,
       brier: aggregate.brier,
@@ -1584,6 +1645,7 @@ async function tuneCandidate(
   const hash = datasetHash(entries.map((entry) => entry.matchId));
   const created: Array<{
     version: string;
+    kind: AnchorScaleKind;
     scale: number;
     validationComposite: number;
     baselineComposite: number;
@@ -1598,13 +1660,16 @@ async function tuneCandidate(
         candidate: created[0] ?? null,
       };
     }
-    const version = `auto-anchor-s${formatScale(audit.scale)}-${date}`;
+    const version = anchorScaleVersion(audit, date);
     const write = await insertEngineCandidate({
       version,
-      params: withAnchorScale(promoted.params, audit.scale) as unknown as Record<string, unknown>,
+      params: withCandidateScale(promoted.params, audit) as unknown as Record<string, unknown>,
       metrics: {
         objective: 'walk_forward_composite',
         weights: { result: 0.5, totals: 0.5 },
+        kind: audit.kind,
+        scale: audit.scale,
+        totalsScale: audit.kind === 'totals' ? audit.scale : promoted.params.anchor.totalsScale,
         reference: REFERENCE_PARAMS_VERSION,
         promoted: promoted.version,
         seed: BOOTSTRAP_SEED,
@@ -1614,7 +1679,9 @@ async function tuneCandidate(
           validation: `${fold.window.validationStart}-${fold.window.validationEnd}`,
           matches: fold.window.validationEnd - fold.window.validationStart,
           baseline: fold.baseline.composite,
-          beats: fold.scales.filter((entry) => entry.beats).map((entry) => entry.scale),
+          beats: fold.scales
+            .filter((entry) => entry.beats)
+            .map((entry) => ({ kind: entry.kind, scale: entry.scale })),
         })),
         grid: audits,
         baseline: baselineAggregate,
@@ -1633,11 +1700,15 @@ async function tuneCandidate(
           hash,
         },
       },
-      notes: `Ajuste walk-forward multi-fold del ancla con objetivo compuesto 1X2+totales y guardarraíles (escala ${audit.scale.toFixed(2)}; ${audit.votes}/${folds.length} folds). Solo se promueve si gana en sombra.`,
+      notes:
+        audit.kind === 'totals'
+          ? `Ajuste walk-forward de la escala de ancla específica de totales (${audit.scale.toFixed(2)}×; ${audit.votes}/${folds.length} folds). El 1X2 conserva su ancla; solo se promueve si gana en sombra.`
+          : `Ajuste walk-forward multi-fold del ancla con objetivo compuesto 1X2+totales y guardarraíles (escala ${audit.scale.toFixed(2)}; ${audit.votes}/${folds.length} folds). Solo se promueve si gana en sombra.`,
     });
     if (!write.ok) return { state: 'error', reason: write.errorCode ?? 'insert-failed' };
     created.push({
       version,
+      kind: audit.kind,
       scale: audit.scale,
       validationComposite: audit.composite,
       baselineComposite: baselineAggregate.composite,
@@ -1649,7 +1720,11 @@ async function tuneCandidate(
     reason: 'candidate-created',
     datasetMatches: entries.length,
     candidate: created[0] ?? null,
-    candidates: created.map((entry) => ({ version: entry.version, scale: entry.scale })),
+    candidates: created.map((entry) => ({
+      version: entry.version,
+      kind: entry.kind,
+      scale: entry.scale,
+    })),
   };
 }
 
