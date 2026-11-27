@@ -15,8 +15,10 @@ import MarketCard from './MarketCard';
 import ParlayCard from './ParlayCard';
 import ContextPanel from './ContextPanel';
 import AiPanel, { type AiState } from './AiPanel';
+import GoalComparisonPanel, { type GoalCompareState } from './GoalComparisonPanel';
 import ErrorState from './ErrorState';
 import Skeleton from './Skeleton';
+import type { GoalComparison, GoalComparisonResult } from '@/lib/types/goal-comparison';
 
 type Phase = 'idle' | 'loading' | 'ready' | 'error';
 
@@ -29,6 +31,23 @@ interface UiError {
 
 interface ApiErrorShape {
   error?: { code?: string; message?: string; details?: unknown };
+}
+
+function pause(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    function done() {
+      if (timer) clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    }
+    timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+  });
 }
 
 function requestFromParams(params: URLSearchParams): SearchPayload | null {
@@ -140,6 +159,11 @@ export default function ParleyApp({ shadow }: ParleyAppProps) {
   const aiControllerRef = useRef<AbortController | null>(null);
   const searchKeyRef = useRef(searchKey);
 
+  const [goalState, setGoalState] = useState<GoalCompareState>('idle');
+  const [goalComparison, setGoalComparison] = useState<GoalComparison | null>(null);
+  const [goalAttempt, setGoalAttempt] = useState(0);
+  const goalMatchId = envelope?.analysis.match.id ?? null;
+
   // Al cambiar de partido se cancela cualquier informe en vuelo para que una
   // respuesta tardía no se aplique sobre el análisis nuevo.
   useEffect(() => {
@@ -212,6 +236,70 @@ export default function ParleyApp({ shadow }: ParleyAppProps) {
       document.querySelector<HTMLElement>('.match-header h1')?.focus();
     }
   }, [phase]);
+
+  // El comparativo se pide aparte para no retrasar el análisis principal; el
+  // pre se persiste en `after()`, así que la lectura va después de la respuesta.
+  useEffect(() => {
+    if (phase !== 'ready' || !goalMatchId) {
+      setGoalState('idle');
+      setGoalComparison(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    let cancelled = false;
+    setGoalState('loading');
+    setGoalComparison(null);
+
+    (async () => {
+      try {
+        // `after()` persiste el pre después de responder: un 404 inmediato puede
+        // ser una carrera en el primer análisis. Se reintenta sin bloquear el resto.
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const response = await fetch('/api/goal-comparison', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ matchId: goalMatchId }),
+            signal: controller.signal,
+            cache: 'no-store',
+          });
+          if (cancelled) return;
+          if (response.status === 404) {
+            if (attempt === 2) {
+              setGoalState('empty');
+              return;
+            }
+            await pause(attempt === 0 ? 600 : 1500, controller.signal);
+            if (cancelled) return;
+            continue;
+          }
+          if (!response.ok) {
+            setGoalState('error');
+            return;
+          }
+          const payload = (await response.json().catch(() => null)) as GoalComparisonResult | null;
+          if (cancelled) return;
+          if (payload?.state === 'ok') {
+            setGoalComparison(payload.comparison);
+            setGoalState('ready');
+            return;
+          }
+          setGoalState(payload?.state === 'not_found' ? 'empty' : 'error');
+          return;
+        }
+      } catch (caught) {
+        if (cancelled || (caught instanceof Error && caught.name === 'AbortError')) return;
+        setGoalState('error');
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [phase, goalMatchId, goalAttempt]);
+
+  const retryGoalComparison = useCallback(() => setGoalAttempt((value) => value + 1), []);
 
   const handleSearch = useCallback(
     (payload: SearchPayload) => {
@@ -386,6 +474,9 @@ export default function ParleyApp({ shadow }: ParleyAppProps) {
               aiError={aiError}
               onGenerate={generateAi}
               onNewSearch={goHome}
+              goalState={goalState}
+              goalComparison={goalComparison}
+              onGoalRetry={retryGoalComparison}
             />
             {shadow}
           </>
@@ -404,9 +495,22 @@ interface DashboardProps {
   aiError: string | null;
   onGenerate: () => void;
   onNewSearch: () => void;
+  goalState: GoalCompareState;
+  goalComparison: GoalComparison | null;
+  onGoalRetry: () => void;
 }
 
-function Dashboard({ envelope, aiState, aiReport, aiError, onGenerate, onNewSearch }: DashboardProps) {
+function Dashboard({
+  envelope,
+  aiState,
+  aiReport,
+  aiError,
+  onGenerate,
+  onNewSearch,
+  goalState,
+  goalComparison,
+  onGoalRetry,
+}: DashboardProps) {
   const analysis: AnalysisResult = envelope.analysis;
   const { dataQuality, markets, parlay, context, model } = analysis;
   const objectiveMarkets = markets.filter((market) => market.key !== 'corners');
@@ -416,6 +520,7 @@ function Dashboard({ envelope, aiState, aiReport, aiError, onGenerate, onNewSear
     <div className="container dashboard">
       <div className="dash-top">
         <nav className="dash-nav" aria-label="Secciones del análisis">
+          <a href="#goles">Goles</a>
           <a href="#mercados">Mercados</a>
           <a href="#combinada">Combinada</a>
           <a href="#ia">Análisis IA</a>
@@ -442,6 +547,14 @@ function Dashboard({ envelope, aiState, aiReport, aiError, onGenerate, onNewSear
           <a href="#contexto">Ver datos</a>
         </div>
       ) : null}
+
+      <GoalComparisonPanel
+        state={goalState}
+        comparison={goalComparison}
+        homeName={analysis.match.homeName}
+        awayName={analysis.match.awayName}
+        onRetry={onGoalRetry}
+      />
 
       <div className="layout">
         <div className="area-markets">

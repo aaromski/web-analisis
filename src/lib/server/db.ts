@@ -23,6 +23,15 @@ import {
   type ReliabilityBin,
 } from '../audit/metrics';
 import { canonicalPreSnapshot, hashCanonical } from './canonical';
+import type { GoalEventRow } from './goal-events';
+import {
+  GOAL_BANDS,
+  type GoalBands,
+  type GoalComparison,
+  type GoalComparisonResult,
+  type GoalMetrics,
+  type TeamGoalProfile,
+} from '../types/goal-comparison';
 
 /**
  * Persistencia del ciclo de aprendizaje contra Supabase (PostgREST) sin
@@ -2388,4 +2397,149 @@ export async function recordPostMatch(input: PostMatchInput): Promise<RecordPost
     });
     return { status: 'error', errorCode: 'unexpected' };
   }
+}
+
+export interface RecordGoalEventsResult {
+  status: 'ok' | 'skipped' | 'error';
+  inserted: number;
+  errorCode?: string;
+}
+
+/**
+ * Inserta goles ya extraídos. Idempotente por `(snapshot_id, seq)`: repetir la
+ * ingesta o el backfill no duplica filas. Es best-effort: el snapshot post ya
+ * está a salvo y el backfill puede completar lo que falle aquí.
+ */
+export async function recordGoalEvents(rows: GoalEventRow[]): Promise<RecordGoalEventsResult> {
+  if (rows.length === 0) return { status: 'skipped', inserted: 0 };
+  const config = readConfig();
+  if (!config) return { status: 'skipped', inserted: 0 };
+
+  const res = await rest(config, {
+    method: 'POST',
+    path: '/rest/v1/match_goal_events',
+    query: 'on_conflict=snapshot_id,seq',
+    prefer: 'resolution=ignore-duplicates,return=representation',
+    body: rows,
+  });
+  if (res.errorCode) return { status: 'error', inserted: 0, errorCode: res.errorCode };
+  return { status: 'ok', inserted: Array.isArray(res.data) ? res.data.length : 0 };
+}
+
+function countOf(value: unknown): number {
+  const parsed = finiteNumber(value);
+  return parsed === null ? 0 : Math.max(0, Math.round(parsed));
+}
+
+function goalBandsOf(value: unknown): GoalBands {
+  const source = objectField(value) ?? {};
+  const bands = {} as GoalBands;
+  for (const band of GOAL_BANDS) bands[band] = countOf(source[band]);
+  return bands;
+}
+
+function goalMetricsOf(source: Record<string, unknown>): GoalMetrics {
+  return {
+    matches: countOf(source.matches),
+    goalsFor: countOf(source.goals_for),
+    goalsAgainst: countOf(source.goals_against),
+    goalsForAvg: finiteNumber(source.goals_for_avg),
+    goalsAgainstAvg: finiteNumber(source.goals_against_avg),
+    minutesPerGoalFor: finiteNumber(source.minutes_per_goal_for),
+    minutesPerGoalAgainst: finiteNumber(source.minutes_per_goal_against),
+    firstHalfGoalsFor: countOf(source.first_half_goals_for),
+    secondHalfGoalsFor: countOf(source.second_half_goals_for),
+    firstHalfPctFor: finiteNumber(source.first_half_pct_for),
+    secondHalfPctFor: finiteNumber(source.second_half_pct_for),
+    firstHalfGoalsAgainst: countOf(source.first_half_goals_against),
+    secondHalfGoalsAgainst: countOf(source.second_half_goals_against),
+    firstHalfPctAgainst: finiteNumber(source.first_half_pct_against),
+    secondHalfPctAgainst: finiteNumber(source.second_half_pct_against),
+    firstGoals: countOf(source.first_goals),
+    firstGoalsConceded: countOf(source.first_goals_conceded),
+    firstGoalPct: finiteNumber(source.first_goal_pct),
+    firstGoalMinuteAvg: finiteNumber(source.first_goal_minute_avg),
+    firstGoalMinuteMedian: finiteNumber(source.first_goal_minute_median),
+    cleanSheets: countOf(source.clean_sheets),
+    failedToScore: countOf(source.failed_to_score),
+    bttsPct: finiteNumber(source.btts_pct),
+    over25Pct: finiteNumber(source.over_2_5_pct),
+    bandsFor: goalBandsOf(source.bands_for),
+    bandsAgainst: goalBandsOf(source.bands_against),
+  };
+}
+
+function teamProfileOf(row: Record<string, unknown>, prefix: 'home' | 'away'): TeamGoalProfile {
+  const metrics = goalMetricsOf({
+    matches: row[`${prefix}_prior_matches`],
+    goals_for: row[`${prefix}_goals_for`],
+    goals_against: row[`${prefix}_goals_against`],
+    goals_for_avg: row[`${prefix}_goals_for_avg`],
+    goals_against_avg: row[`${prefix}_goals_against_avg`],
+    minutes_per_goal_for: row[`${prefix}_minutes_per_goal_for`],
+    minutes_per_goal_against: row[`${prefix}_minutes_per_goal_against`],
+    first_half_goals_for: row[`${prefix}_first_half_goals_for`],
+    second_half_goals_for: row[`${prefix}_second_half_goals_for`],
+    first_half_pct_for: row[`${prefix}_first_half_pct_for`],
+    second_half_pct_for: row[`${prefix}_second_half_pct_for`],
+    first_half_goals_against: row[`${prefix}_first_half_goals_against`],
+    second_half_goals_against: row[`${prefix}_second_half_goals_against`],
+    first_half_pct_against: row[`${prefix}_first_half_pct_against`],
+    second_half_pct_against: row[`${prefix}_second_half_pct_against`],
+    first_goals: row[`${prefix}_first_goals`],
+    first_goals_conceded: row[`${prefix}_first_goals_conceded`],
+    first_goal_pct: row[`${prefix}_first_goal_pct`],
+    first_goal_minute_avg: row[`${prefix}_first_goal_minute_avg`],
+    first_goal_minute_median: row[`${prefix}_first_goal_minute_median`],
+    clean_sheets: row[`${prefix}_clean_sheets`],
+    failed_to_score: row[`${prefix}_failed_to_score`],
+    btts_pct: row[`${prefix}_btts_pct`],
+    over_2_5_pct: row[`${prefix}_over_2_5_pct`],
+    bands_for: row[`${prefix}_bands_for`],
+    bands_against: row[`${prefix}_bands_against`],
+  });
+  const venue = objectField(row[`${prefix}_venue`]);
+  return {
+    ...metrics,
+    teamId: text(row[`${prefix}_team_id`]),
+    teamName: text(row[`${prefix}_team_name`]) ?? (prefix === 'home' ? 'Local' : 'Visitante'),
+    venueMatches: countOf(row[`${prefix}_venue_matches`]),
+    venue: venue ? goalMetricsOf(venue) : null,
+  };
+}
+
+/**
+ * Perfil de gol previo de ambos equipos para un partido. Las vistas solo son
+ * legibles con `service_role`, así que la lectura vive en el servidor. Devuelve
+ * un estado discriminado y nunca lanza: la UI puede seguir sin este bloque.
+ */
+export async function getGoalComparison(matchId: string): Promise<GoalComparisonResult> {
+  const id = matchId.trim();
+  if (!id) return { state: 'not_found' };
+  const config = readConfig();
+  if (!config) return { state: 'disabled' };
+
+  const res = await rest(config, {
+    method: 'GET',
+    path: '/rest/v1/v_match_goal_comparison',
+    query: `select=*&match_id=eq.${encodeURIComponent(id)}&limit=1`,
+    timeoutMs: 2_500,
+  });
+  if (res.errorCode) return { state: 'error', errorCode: res.errorCode };
+
+  const rows = Array.isArray(res.data) ? res.data : [];
+  if (rows.length === 0) return { state: 'not_found' };
+  const row = objectField(rows[0]);
+  const resolvedId = row ? text(row.match_id) : null;
+  if (!row || !resolvedId) return { state: 'error', errorCode: 'invalid_row' };
+
+  const comparison: GoalComparison = {
+    matchId: resolvedId,
+    kickoffAt: text(row.kickoff_at) ?? '',
+    homeTeamName: text(row.home_team_name) ?? 'Local',
+    awayTeamName: text(row.away_team_name) ?? 'Visitante',
+    home: teamProfileOf(row, 'home'),
+    away: teamProfileOf(row, 'away'),
+  };
+  return { state: 'ok', comparison };
 }

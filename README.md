@@ -49,23 +49,25 @@ npm run dev        # Next.js en 3100
 npm run build      # build de producción
 npm start          # servidor de producción en 3100
 npm run typecheck  # TypeScript estricto
-npm test           # 147 pruebas del motor, el arnés, la persistencia, el aprendizaje y el servidor con node:test
+npm test           # 165 pruebas del motor, el arnés, la persistencia, el aprendizaje y el servidor con node:test
 npm run snapshot -- --home "AC Milan" --away "Internazionale" --date 2026-10-31 --league ita.1
 npm run audit      # métricas de los snapshots (y de data/results.json si existe)
 npm run tune       # barrido del peso del ancla por Brier medio
 npm run purge -- --keep 90   # vacía payloads post más antiguos que la ventana (acepta --dry-run)
+npm run backfill:goals       # rellena match_goal_events desde los post guardados (acepta --dry-run)
 ```
 
 ## Cómo se usa
 
 1. En `/`, busca por equipos (local, visitante; fecha y liga opcionales) o por ID (`espn:401874795`).
 2. El panel muestra λ por equipo, probabilidad 1X2, calidad de datos, umbral y los mercados: 1X2, doble oportunidad, altas/bajas, hándicap, primer gol, impar/par, HT/FT, marcador exacto y BTTS; córners como mercado extendido.
-3. Cada tarjeta expone la selección, la línea publicada, la probabilidad, la cuota justa, la confianza, el riesgo, el rango 10–90 cuando aplica y el valor frente al mercado. Al expandir aparece la curva de calibración, el umbral, la línea base, la línea de mercado y una tabla de líneas.
-4. La combinada se calcula sobre la matriz (correlación incorporada), no multiplicando probabilidades.
-5. «Generar informe» envía el análisis a Gemini y muestra el markdown en el panel IA.
-6. Al final del panel aparece **Sombra vs. producción**: la compuerta de 100 partidos con resultado y, cuando exista, la comparación por mercado entre el motor de producción y las variantes experimentales. La comparación se alimenta de la referencia fija (defaults de 1.2.0 como sombra permanente) y de hasta dos candidatas automáticas. Los chips muestran la versión **activa** (fila promovida de `engine_params`), las **candidatas** y la **referencia**. El ciclo es automático: no hay pesos que configurar a mano.
+3. Bajo el resumen aparece **Perfil goleador · previo**: el historial guardado de ambos equipos antes del kickoff en una tabla (goles, medias, minutos por gol, reparto por mitades, primer gol, porterías a cero, BTTS y over 2.5) y dos gráficos de barras con las franjas de 15 minutos. «Desglose en su localía» repite la tabla con los partidos del local en casa y del visitante fuera.
+4. Cada tarjeta expone la selección, la línea publicada, la probabilidad, la cuota justa, la confianza, el riesgo, el rango 10–90 cuando aplica y el valor frente al mercado. Al expandir aparece la curva de calibración, el umbral, la línea base, la línea de mercado y una tabla de líneas.
+5. La combinada se calcula sobre la matriz (correlación incorporada), no multiplicando probabilidades.
+6. «Generar informe» envía el análisis a Gemini y muestra el markdown en el panel IA.
+7. Al final del panel aparece **Sombra vs. producción**: la compuerta de 100 partidos con resultado y, cuando exista, la comparación por mercado entre el motor de producción y las variantes experimentales. La comparación se alimenta de la referencia fija (defaults de 1.2.0 como sombra permanente) y de hasta dos candidatas automáticas. Los chips muestran la versión **activa** (fila promovida de `engine_params`), las **candidatas** y la **referencia**. El ciclo es automático: no hay pesos que configurar a mano.
 
-Cada análisis pre-partido se guarda en Supabase al terminar la respuesta (sin bloquear ni romper la UI): partido, snapshot pre por hash de contenido y varias predicciones con `engine_version`/`params_version` — `production` y hasta tres `shadow` (referencia fija + candidatas). Reanalizar un partido solo añade snapshot si los datos cambiaron; el resto se detecta como duplicado. `/api/lab` empareja la última captura pre de cada partido finalizado que tenga ambas variantes y publica, por mercado, medias, delta en puntos porcentuales, muestra y un IC 95 % cuando hay al menos dos partidos; además calcula un backtest por variante (media del Brier multiclase y del log-loss, menor es mejor) que la sección muestra sobre los partidos cerrados. La ingesta post solo acepta partidos con captura pre: si no existe, responde 409 `POST_MATCH_WITHOUT_PRE` y no crea filas, y un trigger en la base bloquea la misma escritura por RPC. En Vercel, `vercel.json` programa un cron diario (06:00 UTC) en `GET /api/cron/ingest`: busca los partidos con captura pre y sin post, pide el marcador a la API y lo registra, de modo que la compuerta avanza sin intervención manual; es idempotente y no repite snapshots. `npm run purge` conserva filas y predicciones y solo vacía el JSON de los snapshots post antiguos.
+Cada análisis pre-partido se guarda en Supabase al terminar la respuesta (sin bloquear ni romper la UI): partido, snapshot pre por hash de contenido y varias predicciones con `engine_version`/`params_version` — `production` y hasta tres `shadow` (referencia fija + candidatas). Reanalizar un partido solo añade snapshot si los datos cambiaron; el resto se detecta como duplicado. `/api/lab` empareja la última captura pre de cada partido finalizado que tenga ambas variantes y publica, por mercado, medias, delta en puntos porcentuales, muestra y un IC 95 % cuando hay al menos dos partidos; además calcula un backtest por variante (media del Brier multiclase y del log-loss, menor es mejor) que la sección muestra sobre los partidos cerrados. La ingesta post solo acepta partidos con captura pre: si no existe, responde 409 `POST_MATCH_WITHOUT_PRE` y no crea filas, y un trigger en la base bloquea la misma escritura por RPC. En Vercel, `vercel.json` programa un cron diario (06:00 UTC) en `GET /api/cron/ingest`: busca los partidos con captura pre y sin post, pide el marcador a la API y lo registra, de modo que la compuerta avanza sin intervención manual; es idempotente y no repite snapshots. `npm run purge` conserva filas y predicciones y solo vacía el JSON de los snapshots post antiguos. Los goles del timeline se proyectan a `match_goal_events` (una fila por gol con minuto, periodo y equipo acreditado) y se consultan con las vistas `v_match_first_goal`, `v_team_goal_profile` y `v_team_goal_buckets`; el backfill del histórico se ejecuta con `npm run backfill:goals`. El comparativo `v_match_goal_comparison` pone lado a lado, para cada partido, el perfil previo del local y del visitante (goles, medias, minutos por gol, reparto por mitades y franjas de 15 minutos, primer gol, porterías a cero, BTTS y over 2.5), siempre con partidos anteriores al kickoff y goles reglamentarios; `home_venue` y `away_venue` repiten el perfil en su localía y `v_match_team_prior_form` expone el detalle largo por equipo y condición. El panel del partido lo muestra en **Perfil goleador · previo** mediante `POST /api/goal-comparison` con el `matchId`: la ruta lee la vista con `service_role` en el servidor, responde 404 si aún no hay fila (el cliente reintenta mientras termina la persistencia del pre) y no bloquea ni condiciona el análisis principal.
 
 ### Medición
 
@@ -86,11 +88,12 @@ src/
     api/ai        POST  genera el informe con Gemini (rate limit 6/5 min)
     api/health    GET   salud de la API de estadísticas y configuración de Gemini
     api/lab       GET   comparación producción/sombra, compuerta, backtest, scoring en línea de mercado, calibración, baseline/CLV, salud, historial, versiones y diario del ciclo
+    api/goal-comparison POST perfil de gol previo de ambos equipos para un partido (service_role)
     api/ingest/post POST registra el resultado post-partido (x-ingest-token)
     api/cron/ingest GET  cierra partidos pendientes y ejecuta el ciclo de mejora (Bearer CRON_SECRET)
     page.tsx            busca o muestra el dashboard según la URL
     globals.css         tokens, layout y componentes visuales
-  components/          buscador, cabecera, resumen, mercados, curva, combinada, contexto, IA, sombra
+  components/          buscador, cabecera, resumen, mercados, curva, combinada, contexto, IA, sombra y comparativo de goles
   lib/
     engine/            motor puro: poisson, mercados, calibración, λ, liga, ancla, ajustes, incertidumbre, vivo, calidad, combinada, EngineParams y variante sombra
     server/            cliente HTTP, caché, validación, errores, Gemini, Supabase/PostgREST, ingesta post y aprendizaje
@@ -100,14 +103,14 @@ docs/
   MOTOR_LINEAS.md      contrato del motor y decisiones de calibración
   MEDICION.md          arnés de snapshots y criterios de precisión
   PROTOTIPO_UX.md      diseño UX/UI y criterios de aceptación
-  PROGRESS.md          bitácora de fases, QA y auditoría
 scripts/
   snapshot.ts          captura una respuesta real de la API
   measure.ts           mide snapshots contra el mercado y los resultados
   tune.ts              barre el peso del ancla y guarda data/tuning.json
   purge.ts             retención: vacía payloads post antiguos vía RPC
+  backfill-goals.ts    proyecta los goles del timeline a match_goal_events
 supabase/
-  migrations/          tablas, RLS, funciones y vista del ciclo de aprendizaje
+  migrations/          tablas, RLS, funciones, ciclo de aprendizaje y vistas de goles
   rollback/            desmontaje ordenado del esquema
 vercel.json            cron diario de ingesta post (06:00 UTC)
 data/snapshots/        capturas locales (ignoradas por git)

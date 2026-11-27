@@ -4,14 +4,23 @@ out/
 build/
 dist/
 coverage/
-.env
-.env.local
-.env.*.local
+# Variables de entorno reales (la plantilla .env.example sí se versiona)
+.env*
+!.env.example
 *.log
 .DS_Store
 Thumbs.db
-tsconfig.tsbuildinfo
+desktop.ini
+*.tsbuildinfo
 next-env.d.ts
+.eslintcache
+*.pid
+
+# Documentación interna: bitácora y notas de trabajo no se publican
+# (README y los contratos de front/back en docs/ sí se versionan)
+docs/PROGRESS.md
+docs/notas/
+NOTAS.md
 
 # Datos locales del arnés (capturas, resultados, tuning)
 data/
@@ -76,5 +85,7 @@ skills-lock.json
 
 # Herramientas locales
 .vercel/
+supabase/.temp/
+supabase/.branches/
 .idea/
 .vscode/

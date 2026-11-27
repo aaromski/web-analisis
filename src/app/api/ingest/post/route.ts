@@ -74,6 +74,7 @@ export async function POST(request: Request): Promise<Response> {
         snapshotId: outcome.snapshotId,
         score: outcome.score,
         coverage: outcome.coverage,
+        goalEvents: outcome.goalEvents,
         warnings: outcome.warnings,
       },
       { headers: { 'Cache-Control': 'no-store' } },

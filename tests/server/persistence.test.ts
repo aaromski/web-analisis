@@ -907,3 +907,288 @@ test('el historial de versiones incluye notas y fechas', async () => {
     clearEnv();
   }
 });
+
+function goalRow(): import('../../src/lib/server/goal-events.ts').GoalEventRow {
+  return {
+    snapshot_id: '33333333-3333-4333-8333-333333333333',
+    match_id: 'test:900001',
+    seq: 0,
+    minute: 23,
+    added_time: null,
+    period: 'first_half',
+    event_type: 'goal',
+    side: 'home',
+    credited_side: 'home',
+    team_id: 'team-home',
+    opponent_team_id: 'team-away',
+    team_name: 'Home Test',
+    player_id: null,
+    player_name: 'Ana',
+    assist_name: null,
+    score_home_after: 1,
+    score_away_after: 0,
+  };
+}
+
+test('los goles se insertan de forma idempotente en match_goal_events', async () => {
+  setEnv(ENABLED_ENV);
+  const stub = stubFetch(() => Response.json([goalRow()], { status: 201 }));
+
+  try {
+    const { recordGoalEvents } = await db();
+    assert.deepEqual(await recordGoalEvents([goalRow()]), { status: 'ok', inserted: 1 });
+    assert.equal(stub.calls.length, 1);
+
+    const [call] = stub.calls;
+    assert.equal(call.method, 'POST');
+    assert.ok(call.url.includes('/rest/v1/match_goal_events'));
+    assert.ok(call.url.includes('on_conflict=snapshot_id,seq'));
+    assert.match(call.headers.prefer ?? '', /resolution=ignore-duplicates/);
+    assert.ok(call.body);
+    assert.equal((JSON.parse(call.body) as unknown[]).length, 1);
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('sin goles o sin configuración no se usa la red', async () => {
+  setEnv(ENABLED_ENV);
+  const withGoles = stubFetch(() => {
+    throw new Error('no debe usarse la red');
+  });
+  try {
+    const { recordGoalEvents } = await db();
+    assert.deepEqual(await recordGoalEvents([]), { status: 'skipped', inserted: 0 });
+    assert.equal(withGoles.calls.length, 0);
+  } finally {
+    withGoles.restore();
+    clearEnv();
+  }
+
+  const offline = stubFetch(() => {
+    throw new Error('no debe usarse la red');
+  });
+  try {
+    const { recordGoalEvents } = await db();
+    assert.deepEqual(await recordGoalEvents([goalRow()]), { status: 'skipped', inserted: 0 });
+    assert.equal(offline.calls.length, 0);
+  } finally {
+    offline.restore();
+  }
+});
+
+test('un fallo al insertar goles se devuelve como estado y no lanza', async () => {
+  setEnv(ENABLED_ENV);
+  const stub = stubFetch(() => new Response('{"message":"boom"}', { status: 503 }));
+
+  try {
+    const { recordGoalEvents } = await db();
+    assert.deepEqual(await recordGoalEvents([goalRow()]), {
+      status: 'error',
+      inserted: 0,
+      errorCode: 'http_503',
+    });
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+function goalComparisonRow(): Record<string, unknown> {
+  return {
+    match_id: 'espn:401874795',
+    kickoff_at: '2026-11-26T20:00:00Z',
+    home_team_id: 'team-home',
+    home_team_name: 'Home Test',
+    away_team_id: 'team-away',
+    away_team_name: 'Away Test',
+    home_prior_matches: 4,
+    home_goals_for: 7,
+    home_goals_against: 4,
+    home_goals_for_avg: 1.75,
+    home_goals_against_avg: 1,
+    home_minutes_per_goal_for: 51.4,
+    home_minutes_per_goal_against: 90,
+    home_first_half_goals_for: 4,
+    home_second_half_goals_for: 3,
+    home_first_half_pct_for: 57.1,
+    home_second_half_pct_for: 42.9,
+    home_first_half_goals_against: 2,
+    home_second_half_goals_against: 2,
+    home_first_half_pct_against: 50,
+    home_second_half_pct_against: 50,
+    home_first_goals: 3,
+    home_first_goals_conceded: 1,
+    home_first_goal_pct: 75,
+    home_first_goal_minute_avg: 26.3,
+    home_first_goal_minute_median: 24.5,
+    home_clean_sheets: 1,
+    home_failed_to_score: 1,
+    home_btts_pct: 50,
+    home_over_2_5_pct: 75,
+    home_bands_for: { '1_15': 2, '16_30': 1, '31_45': 1, '46_60': 0, '61_75': 2, '76_90': 1 },
+    home_bands_against: { '1_15': 0, '16_30': 1, '31_45': 1, '46_60': 1, '61_75': 0, '76_90': 1 },
+    home_venue_matches: 2,
+    home_venue: {
+      matches: 2,
+      goals_for: 3,
+      goals_against: 0,
+      goals_for_avg: 1.5,
+      goals_against_avg: 0,
+      minutes_per_goal_for: 60,
+      minutes_per_goal_against: null,
+      first_half_goals_for: 1,
+      second_half_goals_for: 2,
+      first_half_pct_for: 33.3,
+      second_half_pct_for: 66.7,
+      first_half_goals_against: 0,
+      second_half_goals_against: 0,
+      first_half_pct_against: null,
+      second_half_pct_against: null,
+      first_goals: 2,
+      first_goals_conceded: 0,
+      first_goal_pct: 100,
+      first_goal_minute_avg: 30,
+      first_goal_minute_median: 30,
+      clean_sheets: 2,
+      failed_to_score: 0,
+      btts_pct: 0,
+      over_2_5_pct: 50,
+      bands_for: { '1_15': 1, '16_30': 0, '31_45': 0, '46_60': 0, '61_75': 1, '76_90': 1 },
+      bands_against: { '1_15': 0, '16_30': 0, '31_45': 0, '46_60': 0, '61_75': 0, '76_90': 0 },
+    },
+    away_prior_matches: 3,
+    away_goals_for: 2,
+    away_goals_against: 5,
+    away_goals_for_avg: 0.67,
+    away_goals_against_avg: 1.67,
+    away_minutes_per_goal_for: 135,
+    away_minutes_per_goal_against: 54,
+    away_first_half_goals_for: 1,
+    away_second_half_goals_for: 1,
+    away_first_half_pct_for: 50,
+    away_second_half_pct_for: 50,
+    away_first_half_goals_against: 3,
+    away_second_half_goals_against: 2,
+    away_first_half_pct_against: 60,
+    away_second_half_pct_against: 40,
+    away_first_goals: 0,
+    away_first_goals_conceded: 3,
+    away_first_goal_pct: 0,
+    away_first_goal_minute_avg: null,
+    away_first_goal_minute_median: null,
+    away_clean_sheets: 0,
+    away_failed_to_score: 1,
+    away_btts_pct: 33.3,
+    away_over_2_5_pct: 66.7,
+    away_bands_for: { '1_15': 0, '16_30': 0, '31_45': 1, '46_60': 0, '61_75': 0, '76_90': 1 },
+    away_bands_against: { '1_15': 1, '16_30': 1, '31_45': 1, '46_60': 1, '61_75': 1, '76_90': 0 },
+    away_venue_matches: 2,
+    away_venue: null,
+  };
+}
+
+test('el comparativo mapea el perfil de ambos equipos y codifica el ID', async () => {
+  setEnv(ENABLED_ENV);
+  const stub = stubFetch(() => Response.json([goalComparisonRow()]));
+
+  try {
+    const { getGoalComparison } = await db();
+    const result = await getGoalComparison('espn:401874795');
+    assert.equal(result.state, 'ok');
+    if (result.state !== 'ok') return;
+
+    const { comparison } = result;
+    assert.equal(comparison.matchId, 'espn:401874795');
+    assert.equal(comparison.homeTeamName, 'Home Test');
+    assert.equal(comparison.awayTeamName, 'Away Test');
+    assert.equal(comparison.home.matches, 4);
+    assert.equal(comparison.home.goalsFor, 7);
+    assert.equal(comparison.home.minutesPerGoalFor, 51.4);
+    assert.equal(comparison.home.firstHalfPctFor, 57.1);
+    assert.equal(comparison.home.firstGoalMinuteMedian, 24.5);
+    assert.equal(comparison.home.bandsFor['1_15'], 2);
+    assert.equal(comparison.home.bandsAgainst['76_90'], 1);
+    assert.equal(comparison.home.venueMatches, 2);
+    assert.equal(comparison.home.venue?.matches, 2);
+    assert.equal(comparison.home.venue?.bttsPct, 0);
+    assert.equal(comparison.home.venue?.bandsFor['76_90'], 1);
+    assert.equal(comparison.away.matches, 3);
+    assert.equal(comparison.away.firstGoalMinuteMedian, null);
+    assert.equal(comparison.away.bandsFor['76_90'], 1);
+    assert.equal(comparison.away.venue, null);
+
+    assert.equal(stub.calls.length, 1);
+    const [call] = stub.calls;
+    assert.equal(call.method, 'GET');
+    assert.ok(call.url.includes('/rest/v1/v_match_goal_comparison'));
+    assert.ok(call.url.includes('match_id=eq.espn%3A401874795'));
+    assert.ok(call.url.includes('limit=1'));
+    assert.equal(call.headers.apikey, 'test-service-role-key');
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('sin fila el comparativo devuelve not_found', async () => {
+  setEnv(ENABLED_ENV);
+  const stub = stubFetch(() => Response.json([]));
+
+  try {
+    const { getGoalComparison } = await db();
+    assert.deepEqual(await getGoalComparison('test:900001'), { state: 'not_found' });
+    assert.equal(stub.calls.length, 1);
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('sin configuración el comparativo queda desactivado y no usa la red', async () => {
+  clearEnv();
+  const stub = stubFetch(() => {
+    throw new Error('fetch no debe llamarse');
+  });
+
+  try {
+    const { getGoalComparison } = await db();
+    assert.deepEqual(await getGoalComparison('test:900001'), { state: 'disabled' });
+    assert.equal(stub.calls.length, 0);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('un fallo de Supabase se publica como estado de error con código', async () => {
+  setEnv(ENABLED_ENV);
+  const stub = stubFetch(() => new Response('{"message":"sin privilegios"}', { status: 403 }));
+
+  try {
+    const { getGoalComparison } = await db();
+    assert.deepEqual(await getGoalComparison('test:900001'), {
+      state: 'error',
+      errorCode: 'http_403',
+    });
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});
+
+test('una fila sin match_id se rechaza como error de formato', async () => {
+  setEnv(ENABLED_ENV);
+  const stub = stubFetch(() => Response.json([{ home_team_name: 'Home Test' }]));
+
+  try {
+    const { getGoalComparison } = await db();
+    assert.deepEqual(await getGoalComparison('test:900001'), {
+      state: 'error',
+      errorCode: 'invalid_row',
+    });
+  } finally {
+    stub.restore();
+    clearEnv();
+  }
+});

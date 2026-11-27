@@ -15,7 +15,8 @@
     "snapshot": "node --env-file-if-exists=.env.local --import tsx scripts/snapshot.ts",
     "audit": "node --env-file-if-exists=.env.local --import tsx scripts/measure.ts",
     "tune": "node --env-file-if-exists=.env.local --import tsx scripts/tune.ts",
-    "purge": "node --env-file-if-exists=.env.local --import tsx scripts/purge.ts"
+    "purge": "node --env-file-if-exists=.env.local --import tsx scripts/purge.ts",
+    "backfill:goals": "node --env-file-if-exists=.env.local --import tsx scripts/backfill-goals.ts"
   },
   "dependencies": {
     "next": "15.5.28",

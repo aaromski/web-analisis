@@ -1,7 +1,8 @@
 import 'server-only';
 
 import type { PostMatchStatus } from '../types/api';
-import { recordPostMatch } from './db';
+import { recordGoalEvents, recordPostMatch } from './db';
+import { goalEventRows } from './goal-events';
 import {
   acceptance,
   canonicalPostPayload,
@@ -29,6 +30,8 @@ export interface PostIngestSuccess {
   snapshotId: string;
   score: { home: number; away: number; result: 'home' | 'draw' | 'away'; total: number };
   coverage: { available: number; total: number };
+  /** Filas nuevas en `match_goal_events` (0 si no hubo goles o ya existían). */
+  goalEvents: number;
   warnings: string[];
 }
 
@@ -151,6 +154,23 @@ export async function ingestPostMatch(matchId: string): Promise<PostIngestOutcom
   }
 
   const coverage = postMatch.meta?.coverage;
+  const goals = await recordGoalEvents(
+    goalEventRows({
+      snapshotId: saved.snapshotId,
+      matchId: canonicalId,
+      timeline: sanitized.post.timeline,
+      homeTeamId: data.teams.home.team_id ?? null,
+      awayTeamId: data.teams.away.team_id ?? null,
+      homeName: data.teams.home.name,
+      awayName: data.teams.away.name,
+    }),
+  );
+  if (goals.status === 'error') {
+    warnings.push(
+      'Los goles quedaron en el snapshot post pero no en match_goal_events; el backfill puede completarlos.',
+    );
+  }
+
   return {
     status: 'ok',
     matchId: canonicalId,
@@ -162,6 +182,7 @@ export async function ingestPostMatch(matchId: string): Promise<PostIngestOutcom
       available: coverage?.available ?? 0,
       total: coverage?.total ?? 6,
     },
+    goalEvents: goals.inserted,
     warnings,
   };
 }

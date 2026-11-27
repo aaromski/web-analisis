@@ -2679,3 +2679,288 @@ button {
     grid-area: date;
   }
 }
+
+/* Comparativo de gol previo: tabla de métricas y franjas de 15 minutos. */
+.goal-compare {
+  margin-top: 32px;
+  scroll-margin-top: 24px;
+}
+
+.goal-compare .section-head {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+.goal-compare-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  padding: 20px;
+}
+
+.goal-compare-table-wrap {
+  overflow-x: auto;
+}
+
+.goal-compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.goal-compare-table th,
+.goal-compare-table td {
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  text-align: left;
+}
+
+.goal-compare-table thead th {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.goal-compare-table thead th:not(:first-child),
+.goal-compare-table tbody td {
+  text-align: right;
+}
+
+.goal-compare-table tbody th {
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.goal-compare-table tbody td {
+  font-variant-numeric: tabular-nums;
+}
+
+.goal-compare-table tbody tr:last-child th,
+.goal-compare-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.goal-metric-main {
+  display: block;
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.goal-metric-sub {
+  display: block;
+  margin-top: 2px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.goal-team-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  vertical-align: 1px;
+}
+
+.goal-team-dot-home {
+  background: var(--lime);
+}
+
+.goal-team-dot-away {
+  background: var(--cyan);
+}
+
+.goal-bands {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 24px;
+  margin-top: 22px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
+
+.goal-band-chart {
+  min-width: 0;
+}
+
+.goal-band-title {
+  margin: 0 0 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.goal-band-head,
+.goal-band-row {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+}
+
+.goal-band-head {
+  margin-bottom: 6px;
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-dim);
+}
+
+.goal-band-head span:not(:first-child) {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.goal-band-row + .goal-band-row {
+  margin-top: 5px;
+}
+
+.goal-band-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.goal-band-bar-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.goal-band-track {
+  flex: 1;
+  min-width: 0;
+  height: 9px;
+  background: var(--surface-3);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.goal-band-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+}
+
+.goal-band-fill-home {
+  background: var(--lime);
+}
+
+.goal-band-fill-away {
+  background: var(--cyan);
+}
+
+.goal-band-value {
+  flex: none;
+  width: 16px;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.goal-venue {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.goal-venue summary {
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.goal-venue summary:hover {
+  color: var(--text);
+}
+
+.goal-venue-caption {
+  margin: 8px 0 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.goal-compare-message {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+div.goal-compare-message {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+
+@media (max-width: 899px) {
+  .goal-bands {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 20px;
+  }
+}
+
+@media (max-width: 639px) {
+  .goal-compare {
+    margin-top: 28px;
+  }
+
+  .goal-compare-card {
+    padding: 16px;
+  }
+
+  .goal-compare .section-count {
+    flex-basis: 100%;
+  }
+
+  .goal-compare-table {
+    font-size: 12px;
+  }
+
+  .goal-compare-table th,
+  .goal-compare-table td {
+    padding: 9px 6px;
+  }
+
+  .goal-compare-table thead th {
+    font-size: 9px;
+    white-space: normal;
+  }
+
+  .goal-metric-main {
+    font-size: 12px;
+  }
+
+  .goal-metric-sub {
+    font-size: 9px;
+  }
+
+  .goal-band-head,
+  .goal-band-row {
+    grid-template-columns: 38px minmax(0, 1fr) minmax(0, 1fr);
+    gap: 6px;
+  }
+
+  .goal-band-head {
+    font-size: 8px;
+  }
+}
